@@ -1,0 +1,1564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 05 · Networking, Configuration, Storage &amp; Access Control — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 05 · Networking, Configuration, Storage &amp; Access Control</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="05"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 05 · Networking, Configuration, Storage &amp; Access Control</h1>
+    <p class="lede">Module 04 made reliability-api Pods healthy, resourced and safely rolled out. But a Pod on its own is unreachable in any stable way, has its settings baked into the image, loses its files when it dies and runs with whatever identity it is given by default. This module covers the four things that turn running Pods into a usable service: <strong>networking</strong> (Pod IPs, Services, EndpointSlices, DNS, Ingress/Gateway, NetworkPolicy), <strong>configuration</strong> (ConfigMap, Secret), <strong>storage</strong> (volumes, PV/PVC/StorageClass) and <strong>access control</strong> (ServiceAccount, RBAC). Every idea is applied to reliability-api in the <code>reliability-lab</code> namespace.</p>
+    <div class="meta"><span class="pill accent">Prereq: Module 04</span><span class="pill">≈ 5 h study + 3 h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+
+    <h2>Learning objectives</h2>
+    <p>After this module you should be able to:</p>
+    <ul>
+      <li>State the Kubernetes network model (one IP per Pod, Pod-to-Pod without NAT) and explain what a CNI plugin is responsible for.</li>
+      <li>Write a Service for reliability-api and explain exactly how <code>selector</code> → EndpointSlice → ready Pod IPs works, and why an unready Pod receives no Service traffic.</li>
+      <li>Distinguish <code>containerPort</code>, <code>targetPort</code>, <code>port</code> and <code>nodePort</code> without hesitation, and pick the right Service type (ClusterIP, NodePort, LoadBalancer, ExternalName, headless).</li>
+      <li>Explain what kube-proxy does (and does not do) on each node.</li>
+      <li>Build the DNS name of any Service and predict which short names resolve from which namespace.</li>
+      <li>Use <code>kubectl port-forward</code> correctly and know its limits.</li>
+      <li>Compare Ingress and Gateway API (GatewayClass / Gateway / HTTPRoute) and know which one new work should use.</li>
+      <li>Write a default-deny NetworkPolicy plus a targeted allow rule, and know that enforcement depends on the network plugin.</li>
+      <li>Inject configuration from a ConfigMap as env vars or files, and predict what happens when the ConfigMap changes.</li>
+      <li>Explain why base64 in a Secret is not encryption and list the controls that actually protect Secrets.</li>
+      <li>Explain PV, PVC, StorageClass, access modes and dynamic provisioning.</li>
+      <li>Create a least-privilege ServiceAccount + Role + RoleBinding and verify it with <code>kubectl auth can-i</code>.</li>
+    </ul>
+
+    <div class="callout note"><span class="label">Where we are in the running example</span>
+      <p>From Module 03/04 you have, in namespace <code>reliability-lab</code> on the kind cluster <code>reliability-lab</code>: <code>Deployment/reliability-api</code> with 2 replicas, Pods labelled <code>app.kubernetes.io/name: reliability-api</code>, container listening on <code>0.0.0.0:8000</code>, readiness probe on <code>GET /ready</code>, liveness probe on <code>GET /health</code>, requests <code>cpu 100m / memory 128Mi</code>, limit <code>memory 256Mi</code>. In this module we add <code>Service/reliability-api</code> (ClusterIP, port 80 → targetPort 8000), <code>ConfigMap/reliability-api-config</code>, a NetworkPolicy, a dedicated ServiceAccount and an RBAC Role for an experiment runner.</p>
+    </div>
+
+    <!-- ===================================================== -->
+    <h2>1. The big picture: five layers between a client and your code</h2>
+    <p>Before details, hold this ladder in your head. Every networking question you will ever debug on Kubernetes is "which rung is broken?". The study guide (§9.9) lists the same order; this module walks down it.</p>
+    <div class="table-wrap"><table>
+      <tr><th>#</th><th>Layer</th><th>Kubernetes object / component</th><th>reliability-api value</th><th>Question it answers</th></tr>
+      <tr><td>1</td><td>Process listens on a port</td><td>container + <code>containerPort</code> (informational)</td><td>Uvicorn on <code>0.0.0.0:8000</code></td><td>Is the app accepting connections at all?</td></tr>
+      <tr><td>2</td><td>Pod has an IP</td><td>Pod network (CNI plugin)</td><td>e.g. <code>10.244.1.5:8000</code></td><td>Can I reach this one replica directly?</td></tr>
+      <tr><td>3</td><td>Stable virtual IP + name for a set of Pods</td><td>Service, EndpointSlice, kube-proxy, cluster DNS</td><td><code>reliability-api.reliability-lab.svc.cluster.local:80</code></td><td>Can other Pods reach "the API" regardless of which replicas exist?</td></tr>
+      <tr><td>4</td><td>Entry from outside the cluster</td><td>NodePort / LoadBalancer / Ingress / Gateway API, or <code>kubectl port-forward</code> for dev</td><td>port-forward to <code>localhost:8080</code> in labs</td><td>Can my laptop / users reach it?</td></tr>
+      <tr><td>5</td><td>Who is allowed to talk to whom</td><td>NetworkPolicy (+ cloud firewalls)</td><td>only same-namespace clients and Prometheus</td><td>Is traffic being deliberately blocked?</td></tr>
+    </table></div>
+    <p>Configuration (ConfigMap/Secret), storage (volumes) and identity (ServiceAccount/RBAC) are not on the request path, but they decide <em>how the process behaves</em> once a request arrives and <em>what the Pod may do</em> against the Kubernetes API.</p>
+
+    <!-- ===================================================== -->
+    <h2>2. The Kubernetes network model</h2>
+    <h3>Definition</h3>
+    <p>Kubernetes defines a small set of rules every cluster's network must satisfy, and leaves the implementation to a pluggable component. From the official Services &amp; Networking overview:</p>
+    <ul>
+      <li><strong>Each Pod gets its own unique, cluster-wide IP address.</strong> All containers in a Pod share one network namespace, so they talk to each other over <code>localhost</code>.</li>
+      <li><strong>All Pods can communicate with all other Pods</strong>, on the same node or different nodes, <em>directly, without proxies or address translation (NAT)</em> — "barring intentional network segmentation" (that is what NetworkPolicy adds later).</li>
+      <li><strong>Agents on a node</strong> (system daemons, kubelet) can communicate with all Pods on that node — this is how the kubelet runs your HTTP probes against <code>/ready</code> and <code>/health</code>.</li>
+    </ul>
+    <h3>The problem it solves</h3>
+    <p>In plain Docker (Module 02) containers sit behind NAT on a bridge network and you publish ports with <code>-p 8000:8000</code>. Port collisions and NAT make multi-host networking painful: two containers can't both publish 8000 on the same host, and the address a container sees for itself isn't the address others use. Kubernetes avoids this by treating each Pod like a small VM with a real, routable (inside the cluster) IP. Every replica of reliability-api can listen on port 8000 because each has its own IP.</p>
+    <h3>Who implements it: CRI + CNI</h3>
+    <p>Two pieces of node software cooperate:</p>
+    <ul>
+      <li>The <strong>container runtime</strong> (via the Container Runtime Interface) creates the Pod's network namespace.</li>
+      <li>The <strong>pod network implementation</strong> wires that namespace into the cluster network and assigns the IP. On Linux most runtimes talk to it through the <strong>Container Network Interface (CNI)</strong>, so these implementations are called <em>CNI plugins</em> (Calico, Cilium, kindnet, cloud-provider plugins…).</li>
+    </ul>
+    <p>On a kind cluster the default CNI is <strong>kindnetd</strong>, the default Pod subnet is <code>10.244.0.0/16</code> and the default Service subnet is <code>10.96.0.0/16</code> (kind configuration docs). So reliability-api Pods get <code>10.244.x.y</code> addresses and the Service gets a <code>10.96.x.y</code> ClusterIP.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 360" role="img" aria-label="Kubernetes network model: two nodes, each with Pods that have their own IPs, connected by the CNI-managed pod network without NAT">
+        <defs><marker id="arr1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="8" y="8" width="844" height="344" rx="12"/>
+        <text x="22" y="30" class="t-bold">kind cluster "reliability-lab" — Pod subnet 10.244.0.0/16</text>
+        <!-- node A -->
+        <rect class="box" x="24" y="44" width="390" height="230" rx="10"/>
+        <text x="40" y="66" class="t-bold">Node: reliability-lab-worker</text>
+        <rect class="box2" x="40" y="80" width="170" height="120" rx="8"/>
+        <text x="52" y="100" class="t-bold">Pod reliability-api-a</text>
+        <text x="52" y="118" class="t-mono">IP 10.244.1.5</text>
+        <rect class="box" x="52" y="128" width="146" height="28" rx="5"/>
+        <text x="60" y="147" class="t-mono">uvicorn :8000</text>
+        <text x="52" y="184" class="t-muted">1 network namespace</text>
+        <rect class="box2" x="228" y="80" width="170" height="120" rx="8"/>
+        <text x="240" y="100" class="t-bold">Pod other-app</text>
+        <text x="240" y="118" class="t-mono">IP 10.244.1.6</text>
+        <rect class="box" x="240" y="128" width="146" height="28" rx="5"/>
+        <text x="248" y="147" class="t-mono">app :8000</text>
+        <text x="240" y="184" class="t-muted">same port, no clash</text>
+        <rect class="box3" x="40" y="226" width="358" height="40" rx="6"/>
+        <text x="52" y="243" class="t-bold">kubelet</text>
+        <text x="52" y="259" class="t-muted">probes GET 10.244.1.5:8000/ready directly</text>
+        <!-- node B -->
+        <rect class="box" x="446" y="44" width="390" height="230" rx="10"/>
+        <text x="462" y="66" class="t-bold">Node: reliability-lab-worker2</text>
+        <rect class="box2" x="462" y="80" width="170" height="120" rx="8"/>
+        <text x="474" y="100" class="t-bold">Pod reliability-api-b</text>
+        <text x="474" y="118" class="t-mono">IP 10.244.2.7</text>
+        <rect class="box" x="474" y="128" width="146" height="28" rx="5"/>
+        <text x="482" y="147" class="t-mono">uvicorn :8000</text>
+        <text x="474" y="184" class="t-muted">different node, same port</text>
+        <rect class="box2" x="650" y="80" width="170" height="120" rx="8"/>
+        <text x="662" y="100" class="t-bold">Pod load-gen</text>
+        <text x="662" y="118" class="t-mono">IP 10.244.2.9</text>
+        <text x="662" y="150" class="t-muted">client of the API</text>
+        <rect class="box3" x="462" y="226" width="358" height="40" rx="6"/>
+        <text x="474" y="243" class="t-bold">kubelet</text>
+        <text x="474" y="259" class="t-muted">probes 10.244.2.7:8000 on its own node</text>
+        <!-- CNI bar -->
+        <rect class="box4" x="24" y="290" width="812" height="48" rx="8"/>
+        <text x="40" y="311" class="t-bold">Pod network managed by the CNI plugin (kindnetd on kind; Calico/Cilium/cloud CNI elsewhere)</text>
+        <text x="40" y="329" class="t-muted">assigns Pod IPs, creates routes between nodes; NetworkPolicy enforcement also lives here (if supported)</text>
+        <!-- arrow pod-to-pod across nodes -->
+        <path class="line accent" d="M735 200 L735 213 L125 213 L125 202" marker-end="url(#arr1)"/>
+        <text x="470" y="30" class="t-mono">highlighted path: 10.244.2.9 → 10.244.1.5:8000, no NAT</text>
+      </svg>
+      <figcaption>Figure 1 — Every Pod has its own IP; any Pod can reach any other Pod directly. Example IPs; yours will differ.</figcaption>
+    </figure>
+
+    <h3>How it works, step by step (Pod creation)</h3>
+    <ol>
+      <li>The scheduler binds a reliability-api Pod to <code>reliability-lab-worker</code>.</li>
+      <li>The kubelet asks the container runtime (containerd) to create the Pod sandbox; the runtime creates a new network namespace.</li>
+      <li>The runtime invokes the CNI plugin, which creates a virtual interface in that namespace, assigns an IP from the node's share of <code>10.244.0.0/16</code> and sets up routes.</li>
+      <li>The app container starts inside that namespace and binds <code>0.0.0.0:8000</code>. The IP is recorded in <code>status.podIP</code>.</li>
+      <li>When the Pod is deleted the IP is released and may be reused by a different Pod later. <strong>Pod IPs are not stable</strong> — this is the reason Services exist.</li>
+    </ol>
+
+    <h3>Failure cases &amp; diagnosis</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Likely cause</th><th>Check</th></tr>
+      <tr><td>Pod stuck <code>ContainerCreating</code>, event mentions network/CNI</td><td>CNI plugin not installed or crashing (e.g. kind with <code>disableDefaultCNI: true</code> and nothing installed)</td><td><code>kubectl describe pod</code> Events; <code>kubectl -n kube-system get pods</code></td></tr>
+      <tr><td>Pod IP reachable but port refused</td><td>App bound to <code>127.0.0.1</code> instead of <code>0.0.0.0</code> (Module 01) or wrong port</td><td><code>kubectl logs</code>; <code>kubectl exec</code> + check listening sockets; compare with probe port</td></tr>
+      <tr><td>Clients hard-coded a Pod IP and broke after a rollout</td><td>Pod IPs change on every replacement</td><td>Use the Service name instead (next section)</td></tr>
+    </table></div>
+    <details class="q"><summary>Self-check: two containers in the same Pod both try to bind port 8000. What happens?</summary><div class="a">They share one network namespace, so the second bind fails with "address already in use". Containers in one Pod must use different ports; different Pods can reuse the same port freely because each has its own IP.</div></details>
+    <details class="q"><summary>Self-check: is NAT involved when Pod A on node 1 calls Pod B on node 2 by Pod IP?</summary><div class="a">No — the network model requires Pod-to-Pod traffic without NAT, so Pod B sees Pod A's real Pod IP as the source address. (Traffic sent to a <em>Service</em> IP is a different story: the destination is translated to a Pod IP — see kube-proxy.)</div></details>
+
+    <!-- ===================================================== -->
+    <h2>3. Services: a stable front door for changing Pods</h2>
+    <h3>Definition</h3>
+    <p>A <strong>Service</strong> is an API object that gives a set of Pods a stable, long-lived IP address and DNS name, while the individual Pods behind it come and go. The set of Pods is chosen with a <strong>label selector</strong>. Clients talk to the Service; Kubernetes spreads connections across the Pods that are currently ready.</p>
+    <h3>The problem it solves</h3>
+    <p>reliability-api has two replicas today, six under HPA load tomorrow, and every rollout replaces all of them with new IPs. A load generator or another microservice cannot track that churn. The Service decouples "who serves the API" from "how you reach the API".</p>
+    <h3>The reliability-api Service</h3>
+<pre data-title="deploy/kubernetes/service.yaml"><code>apiVersion: v1
+kind: Service
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+  labels:
+    app.kubernetes.io/name: reliability-api
+spec:
+  type: ClusterIP                  <span class="c"># default; internal-only virtual IP</span>
+  selector:
+    app.kubernetes.io/name: reliability-api   <span class="c"># must match the Pod template labels</span>
+  ports:
+    - name: http                   <span class="c"># named ports enable SRV records + clearer config</span>
+      protocol: TCP
+      port: 80                     <span class="c"># what clients connect to on the Service IP</span>
+      targetPort: 8000             <span class="c"># where the container listens (could also be the name "http")</span></code></pre>
+    <p>And the matching part of the Deployment from Module 04 (only the fields that matter here):</p>
+<pre data-title="deploy/kubernetes/deployment.yaml (excerpt)"><code>spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reliability-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reliability-api   <span class="c"># ← the Service selector matches THIS</span>
+    spec:
+      containers:
+        - name: reliability-api
+          image: reliability-api:0.1.0
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet: { path: /ready, port: http }</code></pre>
+
+    <h3>3.1 Selectors → EndpointSlices → Pod IPs</h3>
+    <p>The Service object itself contains no Pod IPs. The control plane computes them continuously. The official Service page puts it this way: the controller for the Service "continuously scans for Pods that match its selector, and then makes any necessary updates to the set of EndpointSlices for the Service."</p>
+    <p>An <strong>EndpointSlice</strong> is a separate API object that lists backend addresses (IP + port + conditions) for a Service. It is labelled <code>kubernetes.io/service-name: reliability-api</code> so you can find it. By default the control plane keeps each slice to at most 100 endpoints (configurable up to 1000), so a Service with many Pods has several slices — this is what lets Services scale to large backends and lets the cluster update the list efficiently. The older <code>Endpoints</code> API still exists but was deprecated in Kubernetes v1.33 in favour of EndpointSlices.</p>
+    <p>Each endpoint carries three conditions (EndpointSlices docs):</p>
+    <ul>
+      <li><strong>serving</strong> — for Pod-backed endpoints this maps to the Pod's <code>Ready</code> condition;</li>
+      <li><strong>terminating</strong> — set when the Pod is first deleted;</li>
+      <li><strong>ready</strong> — shortcut for "serving and not terminating". Proxies normally send new traffic only to <code>ready</code> endpoints.</li>
+    </ul>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="Service selector matches Pod labels; the EndpointSlice controller writes ready Pod IPs into an EndpointSlice">
+        <defs><marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="20" width="250" height="96" rx="10"/>
+        <text x="34" y="44" class="t-bold">Service reliability-api</text>
+        <text x="34" y="66" class="t-mono">selector:</text>
+        <text x="34" y="84" class="t-mono">  app.kubernetes.io/name=</text>
+        <text x="34" y="102" class="t-mono">  reliability-api</text>
+        <rect class="box3" x="20" y="200" width="250" height="110" rx="10"/>
+        <text x="34" y="224" class="t-bold">EndpointSlice controller</text>
+        <text x="34" y="246" class="t-muted">(in kube-controller-manager)</text>
+        <text x="34" y="268" class="t-muted">watches Services + Pods,</text>
+        <text x="34" y="286" class="t-muted">rewrites slices on every change</text>
+        <path class="line" d="M145 116 L145 200" marker-end="url(#arr2)"/>
+        <text x="152" y="162" class="t-muted">reads selector</text>
+        <!-- pods -->
+        <rect class="box" x="330" y="20" width="230" height="64" rx="8"/>
+        <circle class="dot-ok" cx="346" cy="40" r="6"/>
+        <text x="358" y="44" class="t-bold">Pod a · Ready</text>
+        <text x="346" y="68" class="t-mono">10.244.1.5 · label ✓</text>
+        <rect class="box" x="330" y="96" width="230" height="64" rx="8"/>
+        <circle class="dot-ok" cx="346" cy="116" r="6"/>
+        <text x="358" y="120" class="t-bold">Pod b · Ready</text>
+        <text x="346" y="144" class="t-mono">10.244.2.7 · label ✓</text>
+        <rect class="box" x="330" y="172" width="230" height="64" rx="8"/>
+        <circle class="dot-warn" cx="346" cy="192" r="6"/>
+        <text x="358" y="196" class="t-bold">Pod c · NOT ready</text>
+        <text x="346" y="220" class="t-mono">10.244.2.8 · label ✓</text>
+        <rect class="box" x="330" y="248" width="230" height="64" rx="8"/>
+        <circle class="dot-bad" cx="346" cy="268" r="6"/>
+        <text x="358" y="272" class="t-bold">Pod other-app</text>
+        <text x="346" y="296" class="t-mono">10.244.1.6 · label ✗</text>
+        <path class="line dash" d="M270 255 L330 52" marker-end="url(#arr2)"/>
+        <path class="line dash" d="M270 260 L330 128" marker-end="url(#arr2)"/>
+        <path class="line dash" d="M270 265 L330 204" marker-end="url(#arr2)"/>
+        <!-- slice -->
+        <rect class="box4" x="610" y="60" width="230" height="200" rx="10"/>
+        <text x="624" y="84" class="t-bold">EndpointSlice</text>
+        <text x="624" y="102" class="t-mono">reliability-api-x7k2p</text>
+        <text x="624" y="124" class="t-muted">service-name=reliability-api</text>
+        <text x="624" y="150" class="t-mono">10.244.1.5:8000 ready</text>
+        <text x="624" y="172" class="t-mono">10.244.2.7:8000 ready</text>
+        <text x="624" y="194" class="t-mono">10.244.2.8:8000</text>
+        <text x="624" y="212" class="t-mono">  ready=false</text>
+        <text x="624" y="240" class="t-muted">other-app: not listed</text>
+        <path class="line" d="M270 300 C 450 330, 600 320, 700 260" marker-end="url(#arr2)"/>
+        <text x="470" y="326" class="t-muted">writes</text>
+      </svg>
+      <figcaption>Figure 2 — Label match decides <em>membership</em>; readiness decides whether the endpoint is <em>used</em>. The unready Pod is listed with ready=false and gets no new Service traffic.</figcaption>
+    </figure>
+
+    <h3>3.2 Readiness → endpoint membership (why Module 04's probe matters here)</h3>
+    <p>This is the link between Module 04 and this module. reliability-api's <code>/ready</code> returns 503 for <code>READY_DELAY_SECONDS</code> after start. During that window:</p>
+    <ol>
+      <li>The kubelet's readiness probe fails → the Pod's <code>Ready</code> condition is <code>False</code>.</li>
+      <li>The EndpointSlice controller sees the Pod change and marks its endpoint <code>serving=false</code>, <code>ready=false</code>.</li>
+      <li>kube-proxy on every node sees the slice change and removes that IP from the Service's forwarding rules.</li>
+      <li>When <code>/ready</code> starts returning 200 the chain runs in reverse and the Pod starts receiving traffic.</li>
+      <li>On deletion the endpoint becomes <code>terminating</code> and stops getting new connections, which is why graceful termination (Module 04) plus readiness gives zero-dropped-request rollouts.</li>
+    </ol>
+    <div class="callout warn"><span class="label">Each hop is asynchronous</span><p>Probe period → API update → controller → kube-proxy on each node. These are separate watch loops, so there is always a short window where a just-unready or just-deleted Pod can still receive a connection. That is why Module 04 recommends a small <code>preStop</code> delay and a graceful shutdown in the app.</p></div>
+
+    <h3>3.3 Ports: containerPort vs targetPort vs port vs nodePort</h3>
+    <p>Four numbers, four different places. Confusing them is the single most common Service bug.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Field</th><th>Lives in</th><th>Meaning</th><th>reliability-api</th></tr>
+      <tr><td><code>containerPort</code></td><td>Pod spec</td><td>The port the process listens on. Mostly informational (documentation + gives the port a <em>name</em>); the app's bind is what really matters.</td><td><code>8000</code>, named <code>http</code></td></tr>
+      <tr><td><code>targetPort</code></td><td>Service spec</td><td>Port on the Pod that traffic is forwarded to. Number <em>or</em> a named container port. <strong>Defaults to the same value as <code>port</code></strong> if omitted.</td><td><code>8000</code> (or <code>http</code>)</td></tr>
+      <tr><td><code>port</code></td><td>Service spec</td><td>Port clients use on the Service's ClusterIP / DNS name.</td><td><code>80</code></td></tr>
+      <tr><td><code>nodePort</code></td><td>Service spec (NodePort/LoadBalancer)</td><td>Port opened on every node's IP. Allocated from <code>30000-32767</code> by default (<code>--service-node-port-range</code>); you can request a specific one.</td><td>e.g. <code>30080</code> if exposed via NodePort</td></tr>
+    </table></div>
+
+    <div class="widget" id="w-ports">
+      <div class="w-title">Widget — Port path explorer</div>
+      <div class="w-sub">Change the numbers and see the full path a packet takes, plus warnings for the classic mistakes.</div>
+      <div class="row">
+        <label>App listens on (containerPort)<br><input type="number" id="wp-cport" value="8000" min="1" max="65535"></label>
+        <label>Service port<br><input type="number" id="wp-port" value="80" min="1" max="65535"></label>
+        <label>targetPort (number, name, or blank)<br><input type="text" id="wp-tport" value="8000" size="8"></label>
+      </div>
+      <div class="row">
+        <label>Container port name<br><input type="text" id="wp-pname" value="http" size="8"></label>
+        <label>Service type<br><select id="wp-type"><option>ClusterIP</option><option>NodePort</option><option>LoadBalancer</option></select></label>
+        <label>nodePort (blank = auto)<br><input type="text" id="wp-nport" value="" size="8"></label>
+      </div>
+      <div class="out" id="wp-out"></div>
+    </div>
+
+    <h3>3.4 Service types</h3>
+    <p>The types build on each other: a NodePort Service also gets a ClusterIP; a LoadBalancer Service (by default) also gets node ports and a ClusterIP. ExternalName and headless are different animals.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 340" role="img" aria-label="Nested Service types: ClusterIP inside NodePort inside LoadBalancer">
+        <defs><marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box3" x="20" y="20" width="560" height="300" rx="14"/>
+        <text x="36" y="44" class="t-bold">LoadBalancer — external LB (cloud / cloud-provider-kind)</text>
+        <text x="36" y="62" class="t-muted">EXTERNAL-IP:80 → nodes (via nodePorts by default)</text>
+        <rect class="box2" x="50" y="80" width="500" height="220" rx="12"/>
+        <text x="66" y="104" class="t-bold">NodePort — every node's IP : 30000-32767</text>
+        <text x="66" y="122" class="t-muted">nodeIP:30080 → ClusterIP rules</text>
+        <rect class="box" x="80" y="140" width="440" height="140" rx="10"/>
+        <text x="96" y="164" class="t-bold">ClusterIP (default) — virtual IP inside the cluster</text>
+        <text x="96" y="186" class="t-mono">10.96.143.20:80 → ready Pod IPs :8000</text>
+        <rect class="box4" x="110" y="204" width="120" height="56" rx="8"/>
+        <text x="124" y="228" class="t-bold">Pod a</text>
+        <text x="124" y="246" class="t-mono">:8000</text>
+        <rect class="box4" x="250" y="204" width="120" height="56" rx="8"/>
+        <text x="264" y="228" class="t-bold">Pod b</text>
+        <text x="264" y="246" class="t-mono">:8000</text>
+        <text x="390" y="236" class="t-muted">selector-matched</text>
+        <!-- right column -->
+        <rect class="box" x="610" y="20" width="230" height="140" rx="10"/>
+        <text x="624" y="44" class="t-bold">ExternalName</text>
+        <text x="624" y="66" class="t-muted">no selector, no proxying</text>
+        <text x="624" y="88" class="t-muted">DNS CNAME to externalName</text>
+        <text x="624" y="112" class="t-mono">db.reliability-lab.svc</text>
+        <text x="624" y="130" class="t-mono">  → my.database</text>
+        <text x="624" y="146" class="t-mono">     .example.com</text>
+        <rect class="box" x="610" y="180" width="230" height="140" rx="10"/>
+        <text x="624" y="204" class="t-bold">Headless</text>
+        <text x="624" y="224" class="t-mono">clusterIP: None</text>
+        <text x="624" y="246" class="t-muted">no virtual IP, no kube-proxy</text>
+        <text x="624" y="266" class="t-muted">DNS returns Pod IPs directly</text>
+        <text x="624" y="288" class="t-muted">(StatefulSets, client-side LB)</text>
+      </svg>
+      <figcaption>Figure 3 — ClusterIP ⊂ NodePort ⊂ LoadBalancer. ExternalName and headless Services skip the virtual IP entirely.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <tr><th>Type</th><th>Reachable from</th><th>What you get</th><th>Use for reliability-api</th><th>Watch out for</th></tr>
+      <tr><td><code>ClusterIP</code> (default)</td><td>Inside the cluster only</td><td>Virtual IP + DNS name</td><td><strong>Yes</strong> — the default for this project; load generator and Prometheus run in-cluster</td><td>Not reachable from your laptop without port-forward / Ingress / Gateway</td></tr>
+      <tr><td><code>NodePort</code></td><td>Anything that can reach a node IP</td><td>ClusterIP + a port on <em>every</em> node</td><td>Occasionally on kind with <code>extraPortMappings</code> (Module 06)</td><td>High, odd port numbers; exposes on all nodes; node IPs change</td></tr>
+      <tr><td><code>LoadBalancer</code></td><td>Outside the cluster (cloud LB)</td><td>External IP managed by a cloud controller</td><td>On GKE (Module 11), or kind with cloud-provider-kind</td><td><strong>Each one costs money in the cloud</strong>; one LB per Service</td></tr>
+      <tr><td><code>ExternalName</code></td><td>In-cluster DNS</td><td>CNAME to an external hostname</td><td>Pointing an in-cluster name at an external dependency</td><td>No ports/proxying; HTTP Host header and TLS names still use the external name, which can break HTTP/HTTPS clients</td></tr>
+      <tr><td>Headless (<code>clusterIP: None</code>)</td><td>In-cluster DNS</td><td>DNS A/AAAA records for each ready Pod</td><td>Not needed (stateless app)</td><td>Client does its own balancing; caches can pin to one Pod</td></tr>
+    </table></div>
+
+    <h4>Headless vs normal: what DNS returns</h4>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 220" role="img" aria-label="DNS lookup of a normal Service returns one ClusterIP; lookup of a headless Service returns every ready Pod IP">
+        <defs><marker id="arr4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="20" width="390" height="180" rx="10"/>
+        <text x="36" y="44" class="t-bold">Normal (ClusterIP) Service</text>
+        <text x="36" y="70" class="t-mono">lookup reliability-api</text>
+        <path class="line" d="M36 84 L36 110 L60 110" marker-end="url(#arr4)"/>
+        <text x="66" y="114" class="t-mono">A 10.96.143.20 (one VIP)</text>
+        <text x="36" y="146" class="t-muted">kube-proxy rules spread connections</text>
+        <text x="36" y="166" class="t-muted">across ready Pods behind the VIP</text>
+        <rect class="box3" x="450" y="20" width="390" height="180" rx="10"/>
+        <text x="466" y="44" class="t-bold">Headless Service (clusterIP: None)</text>
+        <text x="466" y="70" class="t-mono">lookup reliability-api-headless</text>
+        <path class="line" d="M466 84 L466 110 L490 110" marker-end="url(#arr4)"/>
+        <text x="496" y="114" class="t-mono">A 10.244.1.5</text>
+        <text x="496" y="134" class="t-mono">A 10.244.2.7</text>
+        <text x="466" y="166" class="t-muted">client picks a Pod itself;</text>
+        <text x="466" y="184" class="t-muted">kube-proxy does not handle it</text>
+      </svg>
+      <figcaption>Figure 4 — Same selector, different DNS answers. Headless Services are how StatefulSet Pods get stable per-Pod names.</figcaption>
+    </figure>
+
+    <h3>3.5 kube-proxy: who makes the virtual IP work?</h3>
+    <p>A ClusterIP is not bound to any network interface. Nothing "listens" on <code>10.96.143.20:80</code>. Instead, on every node, <strong>kube-proxy</strong> watches Service and EndpointSlice objects and programs the node's packet-processing rules so that a connection to <code>ClusterIP:port</code> is rewritten (DNAT) to one of the ready endpoints. From the virtual-IPs reference: "Each instance of kube-proxy watches the Kubernetes control plane for the addition and removal of Service and EndpointSlice objects. For each Service, kube-proxy calls appropriate APIs (depending on the kube-proxy mode) to configure the node to capture traffic to the Service's <code>clusterIP</code> and <code>port</code>, and redirect that traffic to one of the Service's endpoints."</p>
+    <ul>
+      <li><strong>Modes on Linux:</strong> <code>iptables</code>, <code>ipvs</code>, <code>nftables</code>. The docs state that in Kubernetes 1.37 the default is <code>iptables</code> and that a future version will switch the default to <code>nftables</code>, so you should set the mode explicitly.</li>
+      <li><strong>kube-proxy is the programmer, not the data path</strong> in iptables/nftables mode: the kernel rewrites packets; in iptables mode a backend is chosen randomly (or by session affinity) and "packets are redirected to the backends without rewriting the client IP address".</li>
+      <li>Some CNIs (for example Cilium) can replace kube-proxy entirely; the concept — "Service VIP translated to a ready Pod IP on the client's node" — stays the same.</li>
+      <li><code>sessionAffinity: ClientIP</code> makes connections from one client IP stick to one Pod. Leave it off for reliability-api; stickiness skews load tests.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="kube-proxy watches the API server for Services and EndpointSlices and programs kernel rules on each node; the kernel translates ClusterIP traffic to a Pod IP">
+        <defs><marker id="arr5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="20" width="220" height="70" rx="10"/>
+        <text x="36" y="46" class="t-bold">kube-apiserver</text>
+        <text x="36" y="68" class="t-muted">Services, EndpointSlices</text>
+        <rect class="zone" x="280" y="10" width="560" height="280" rx="12"/>
+        <text x="296" y="32" class="t-bold">One node (repeated on every node)</text>
+        <rect class="box3" x="300" y="46" width="220" height="64" rx="8"/>
+        <text x="316" y="72" class="t-bold">kube-proxy</text>
+        <text x="316" y="94" class="t-muted">watch → compute rules</text>
+        <path class="line dash" d="M240 60 L300 70" marker-end="url(#arr5)"/>
+        <text x="244" y="52" class="t-muted">watch</text>
+        <rect class="box" x="300" y="140" width="520" height="62" rx="8"/>
+        <text x="316" y="164" class="t-bold">Kernel rules (iptables / nftables / ipvs)</text>
+        <text x="316" y="186" class="t-mono">dst 10.96.143.20:80 → DNAT 10.244.1.5:8000 | 10.244.2.7:8000</text>
+        <path class="line" d="M410 110 L410 140" marker-end="url(#arr5)"/>
+        <text x="418" y="130" class="t-muted">programs</text>
+        <rect class="box4" x="560" y="46" width="260" height="64" rx="8"/>
+        <text x="576" y="72" class="t-bold">client Pod (load-gen)</text>
+        <text x="576" y="94" class="t-mono">GET reliability-api:80</text>
+        <path class="line accent" d="M690 110 L690 140" marker-end="url(#arr5)"/>
+        <rect class="box4" x="300" y="226" width="240" height="50" rx="8"/>
+        <text x="316" y="256" class="t-mono">Pod 10.244.1.5:8000</text>
+        <path class="line accent" d="M500 202 L440 226" marker-end="url(#arr5)"/>
+        <text x="560" y="250" class="t-muted">packet leaves with Pod IP as destination;</text>
+        <text x="560" y="268" class="t-muted">kube-proxy itself never touches it</text>
+      </svg>
+      <figcaption>Figure 5 — kube-proxy programs rules; the kernel does the per-packet work.</figcaption>
+    </figure>
+
+    <h3>3.6 Traffic policies (brief)</h3>
+    <p>The Service page also documents traffic policies. Two you will meet: <code>externalTrafficPolicy</code> (for NodePort/LoadBalancer traffic arriving from outside: <code>Cluster</code> spreads to any node's Pods; <code>Local</code> only uses Pods on the receiving node and keeps the client source IP) and <code>internalTrafficPolicy</code> (the same idea for in-cluster traffic). Defaults are <code>Cluster</code>; leave them unless you have a specific reason such as needing real client IPs.</p>
+
+    <h3>3.7 Request path, step by step</h3>
+    <div class="widget stepper" data-steps='[
+      {"title":"Client resolves the name","html":"The load-generator Pod calls &lt;code&gt;http://reliability-api/work?ms=50&lt;/code&gt;. Its resolver appends the search domain &lt;code&gt;reliability-lab.svc.cluster.local&lt;/code&gt; and asks CoreDNS (the cluster DNS Service)."},
+      {"title":"DNS answers with the ClusterIP","html":"CoreDNS returns an A record for the Service: the virtual IP &lt;code&gt;10.96.143.20&lt;/code&gt;. No Pod IP is returned for a normal Service."},
+      {"title":"Client opens TCP to 10.96.143.20:80","html":"The packet leaves the client Pod and hits the node kernel. Nothing listens on this VIP; kube-proxy has pre-programmed rules for it."},
+      {"title":"Kernel rules pick a ready endpoint (DNAT)","html":"The rule chosen by kube-proxy rewrites the destination to one &lt;strong&gt;ready&lt;/strong&gt; endpoint from the EndpointSlice, e.g. &lt;code&gt;10.244.2.7:8000&lt;/code&gt; (port 80 → targetPort 8000). Unready Pods are not candidates."},
+      {"title":"Pod network delivers the packet","html":"The CNI-managed Pod network routes the packet to the node hosting Pod b. Pod-to-Pod, no further NAT."},
+      {"title":"NetworkPolicy check (if any)","html":"If a policy selects the reliability-api Pods for Ingress, the CNI allows the connection only if a rule matches the source (namespace/labels) and port 8000. Otherwise it is dropped silently — a timeout, not a refusal."},
+      {"title":"Uvicorn handles the request","html":"FastAPI runs &lt;code&gt;/work&lt;/code&gt;, burns ~50 ms CPU, records the latency histogram and replies. The reply follows the connection back; the kernel reverses the translation so the client sees the answer from the ClusterIP."}
+    ]'>
+      <div class="w-title">Stepper — one request from load generator to reliability-api</div>
+      <svg viewBox="0 0 860 200" role="img" aria-label="Request path: client Pod, CoreDNS, Service VIP rules, EndpointSlice, Pod network, NetworkPolicy, app">
+        <defs><marker id="arr6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <g data-step="0,2"><rect class="box4" x="10" y="70" width="120" height="60" rx="8"/><text x="22" y="96" class="t-bold">load-gen Pod</text><text x="22" y="116" class="t-mono">client</text></g>
+        <g data-step="0,1"><rect class="box2" x="150" y="10" width="140" height="50" rx="8"/><text x="162" y="32" class="t-bold">CoreDNS</text><text x="162" y="50" class="t-mono">→ 10.96.143.20</text></g>
+        <g data-step="2,3"><rect class="box3" x="170" y="80" width="170" height="60" rx="8"/><text x="182" y="104" class="t-bold">node kernel rules</text><text x="182" y="124" class="t-mono">VIP:80 → Pod:8000</text></g>
+        <g data-step="3"><rect class="box" x="360" y="10" width="170" height="50" rx="8"/><text x="372" y="32" class="t-bold">EndpointSlice</text><text x="372" y="50" class="t-mono">ready IPs only</text></g>
+        <g data-step="4"><rect class="box" x="360" y="80" width="150" height="60" rx="8"/><text x="372" y="104" class="t-bold">Pod network</text><text x="372" y="124" class="t-mono">CNI routes</text></g>
+        <g data-step="5"><rect class="box3" x="530" y="80" width="140" height="60" rx="8"/><text x="542" y="104" class="t-bold">NetworkPolicy</text><text x="542" y="124" class="t-mono">allow :8000?</text></g>
+        <g data-step="6"><rect class="box4" x="690" y="70" width="160" height="80" rx="8"/><text x="702" y="96" class="t-bold">Pod b</text><text x="702" y="116" class="t-mono">10.244.2.7:8000</text><text x="702" y="136" class="t-mono">GET /work</text></g>
+        <g data-step="0,1"><path class="line accent" d="M90 70 L170 60" marker-end="url(#arr6)"/></g>
+        <g data-step="2"><path class="line accent" d="M130 110 L170 110" marker-end="url(#arr6)"/></g>
+        <g data-step="3"><path class="line dash" d="M420 60 L300 80" marker-end="url(#arr6)"/></g>
+        <g data-step="4"><path class="line accent" d="M340 110 L360 110" marker-end="url(#arr6)"/></g>
+        <g data-step="5"><path class="line accent" d="M510 110 L530 110" marker-end="url(#arr6)"/></g>
+        <g data-step="6"><path class="line accent" d="M670 110 L690 110" marker-end="url(#arr6)"/></g>
+        <text x="10" y="186" class="t-muted">Step through to highlight each hop. Names/IPs are examples.</text>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+    <h3>3.8 Failure cases &amp; diagnosis</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Cause</th><th>How to confirm</th><th>Fix</th></tr>
+      <tr><td><code>curl reliability-api</code> hangs or "connection refused"; slice has no endpoints</td><td>Selector doesn't match Pod labels (typo, different key)</td><td><code>kubectl get svc reliability-api -o jsonpath='{.spec.selector}'</code> vs <code>kubectl get pods --show-labels</code>; <code>kubectl get endpointslices -l kubernetes.io/service-name=reliability-api</code></td><td>Align labels; prefer a shared label template (Helm helper, Module 06)</td></tr>
+      <tr><td>Endpoints listed but all <code>ready=false</code></td><td>Readiness probe failing (warm-up, wrong path/port, dependency down)</td><td><code>kubectl describe pod</code> → Events "Readiness probe failed"</td><td>Fix probe or app; don't "fix" by removing the probe</td></tr>
+      <tr><td>Connection refused from Service, but port-forward to Pod works on 8000</td><td><code>targetPort</code> wrong (e.g. 80 because it defaulted to <code>port</code>)</td><td><code>kubectl get svc -o yaml</code>, compare to <code>containerPort</code></td><td>Set <code>targetPort: 8000</code> or <code>targetPort: http</code></td></tr>
+      <tr><td>Name resolves only in some namespaces</td><td>Using short name from another namespace</td><td><code>nslookup</code> from the calling Pod</td><td>Use <code>reliability-api.reliability-lab</code> or the FQDN</td></tr>
+      <tr><td>Load test shows one Pod hot, another idle</td><td>Long-lived keep-alive connections are balanced per <em>connection</em>, not per request; or <code>sessionAffinity: ClientIP</code></td><td>Compare per-Pod request rate in Prometheus (Module 07)</td><td>More client connections; disable affinity</td></tr>
+      <tr><td>LoadBalancer stuck <code>&lt;pending&gt;</code> EXTERNAL-IP</td><td>No cloud controller (bare kind)</td><td><code>kubectl describe svc</code></td><td>Use port-forward, NodePort + port mapping, or run cloud-provider-kind (Module 06)</td></tr>
+    </table></div>
+    <h3>3.9 Trade-offs</h3>
+    <ul>
+      <li><strong>ClusterIP + Gateway/Ingress</strong> vs <strong>many LoadBalancers</strong>: one shared entry point is cheaper and centralises TLS/routing; per-Service LBs are simpler but cost money each.</li>
+      <li><strong>Connection-level balancing</strong> is cheap and transparent, but HTTP/2 or keep-alive clients may not spread evenly. Request-level balancing needs an L7 proxy (Gateway implementation or service mesh).</li>
+      <li><strong>Named targetPort</strong> (<code>http</code>) lets you change the container port without touching the Service; numeric is more obvious to readers. Use names in charts.</li>
+    </ul>
+    <details class="q"><summary>Self-check: you omit <code>targetPort</code> in the reliability-api Service. What port does traffic go to on the Pod, and what happens?</summary><div class="a"><code>targetPort</code> defaults to the value of <code>port</code>, so traffic is sent to Pod port 80. Uvicorn listens on 8000, so connections are refused. Set <code>targetPort: 8000</code> (or the name <code>http</code>).</div></details>
+    <details class="q"><summary>Self-check: a Pod matches the selector but its readiness probe fails. Is it in the EndpointSlice?</summary><div class="a">Yes, it is listed, but with <code>serving=false</code>/<code>ready=false</code>. Proxies don't send it new Service traffic. Membership comes from labels; usability comes from readiness.</div></details>
+    <details class="q"><summary>Self-check: why can't you <code>ping</code> a ClusterIP and expect a reply?</summary><div class="a">The ClusterIP is virtual — no interface owns it. kube-proxy only programs rules for the Service's declared protocol/ports (e.g. TCP 80). ICMP to the VIP has no matching rule, so a lack of ping reply tells you nothing. Test with <code>curl</code> to the actual port.</div></details>
+
+    <!-- ===================================================== -->
+    <h2>4. Cluster DNS: names instead of IPs</h2>
+    <h3>Definition</h3>
+    <p>Every cluster runs a DNS service (CoreDNS on kind and most clusters) and the kubelet configures each Pod's <code>/etc/resolv.conf</code> to use it. Services get DNS records automatically, so code can call <code>http://reliability-api</code> instead of an IP.</p>
+    <h3>Record forms (from "DNS for Services and Pods")</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Record</th><th>Form</th><th>reliability-api example</th><th>Resolves to</th></tr>
+      <tr><td>Service A/AAAA (normal)</td><td><code>my-svc.my-namespace.svc.cluster-domain.example</code></td><td><code>reliability-api.reliability-lab.svc.cluster.local</code></td><td>The ClusterIP</td></tr>
+      <tr><td>Service A/AAAA (headless)</td><td>same form</td><td><code>reliability-api-headless.reliability-lab.svc.cluster.local</code></td><td>IPs of all selected (ready) Pods</td></tr>
+      <tr><td>SRV (named ports)</td><td><code>_port-name._port-protocol.my-svc.my-namespace.svc.cluster-domain.example</code></td><td><code>_http._tcp.reliability-api.reliability-lab.svc.cluster.local</code></td><td>Port number + the Service's domain name</td></tr>
+      <tr><td>Pod A/AAAA</td><td><code>&lt;pod-ip-with-dashes&gt;.&lt;namespace&gt;.pod.&lt;cluster-domain&gt;</code></td><td><code>10-244-1-5.reliability-lab.pod.cluster.local</code></td><td>That Pod IP</td></tr>
+    </table></div>
+    <h3>Search domains: why the short name works</h3>
+    <p>The kubelet writes something like this into each Pod (example from the docs; your nameserver IP will differ):</p>
+<pre data-title="/etc/resolv.conf inside a Pod in namespace reliability-lab"><code>nameserver 10.96.0.10
+search reliability-lab.svc.cluster.local svc.cluster.local cluster.local
+options ndots:5</code></pre>
+    <ul>
+      <li>A lookup for <code>reliability-api</code> is tried as <code>reliability-api.reliability-lab.svc.cluster.local</code> first → hit. That's why the short name works <strong>only from the same namespace</strong>.</li>
+      <li>From the <code>monitoring</code> namespace, <code>reliability-api</code> would be tried as <code>reliability-api.monitoring.svc.cluster.local</code> → miss. Use <code>reliability-api.reliability-lab</code> (the next search entry <code>svc.cluster.local</code> completes it) or the full name.</li>
+      <li><code>ndots:5</code> means a name with fewer than 5 dots is tried against the search list before being tried as-is. External names like <code>api.github.com</code> therefore cause a few extra failed lookups first; a trailing dot (<code>api.github.com.</code>) marks a name as fully qualified.</li>
+    </ul>
+
+    <div class="widget" id="w-dns">
+      <div class="w-title">Widget — DNS name builder</div>
+      <div class="w-sub">Build the records for a Service and see which spellings resolve from a caller's namespace (search-list logic as configured by the kubelet).</div>
+      <div class="row">
+        <label>Service name<br><input type="text" id="dn-svc" value="reliability-api" size="16"></label>
+        <label>Service namespace<br><input type="text" id="dn-ns" value="reliability-lab" size="14"></label>
+        <label>Caller Pod namespace<br><input type="text" id="dn-caller" value="monitoring" size="14"></label>
+      </div>
+      <div class="row">
+        <label>Cluster domain<br><input type="text" id="dn-dom" value="cluster.local" size="14"></label>
+        <label>Named port / protocol<br><input type="text" id="dn-port" value="http" size="6"> <select id="dn-proto"><option>tcp</option><option>udp</option></select></label>
+        <label>Service kind<br><select id="dn-kind"><option value="normal">normal (ClusterIP)</option><option value="headless">headless</option></select></label>
+      </div>
+      <div class="out" id="dn-out"></div>
+    </div>
+
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>NXDOMAIN for the short name</strong> from another namespace → add <code>.reliability-lab</code>.</li>
+      <li><strong>All lookups time out</strong> after you applied an egress NetworkPolicy → you forgot to allow DNS (UDP/TCP 53 to the DNS Pods). See §7.</li>
+      <li><strong>CoreDNS Pods not running</strong> → <code>kubectl -n kube-system get pods -l k8s-app=kube-dns</code> (the conventional label; check yours with <code>--show-labels</code>).</li>
+      <li><strong>Pod uses <code>hostNetwork</code></strong> and gets the node's resolver → check <code>dnsPolicy</code> on the Pod.</li>
+    </ul>
+    <details class="q"><summary>Self-check: Prometheus in namespace <code>monitoring</code> must scrape reliability-api. Which name should its config use and why?</summary><div class="a"><code>reliability-api.reliability-lab.svc</code> (or the full <code>...svc.cluster.local</code>). The bare <code>reliability-api</code> expands with the caller's namespace (<code>monitoring</code>) first and fails. In practice the Prometheus Operator discovers Pod endpoints via the API rather than DNS (Module 07), but the rule matters for every hand-written URL.</div></details>
+
+    <!-- ===================================================== -->
+    <h2>5. kubectl port-forward: the developer's tunnel</h2>
+    <p><code>kubectl port-forward</code> opens a tunnel from a port on your machine, through the API server and kubelet, to a port on one Pod. It is how you reach a ClusterIP-only service from a laptop during labs.</p>
+<pre><code>kubectl -n reliability-lab port-forward svc/reliability-api 8080:80     <span class="c"># local:remote (remote = Service port)</span>
+kubectl -n reliability-lab port-forward deployment/reliability-api 8080:8000
+kubectl -n reliability-lab port-forward pod/&lt;pod-name&gt; 8080:8000
+kubectl -n reliability-lab port-forward svc/reliability-api :80         <span class="c"># let kubectl pick a free local port</span></code></pre>
+    <p>Example output (yours will differ): </p>
+<pre><code><span class="o">Forwarding from 127.0.0.1:8080 -&gt; 8000
+Forwarding from [::1]:8080 -&gt; 8000</span></code></pre>
+    <p>Note that the right-hand side shows the <em>Pod</em> port (8000) even when you forwarded to the Service port 80 — kubectl resolved the Service to a Pod and translated the port.</p>
+    <div class="callout danger"><span class="label">port-forward is not a load test path</span>
+      <p>The task docs are explicit: when you port-forward to a Service, kubectl <strong>selects a single Pod and does not load balance</strong>. It is TCP-only, blocks the terminal, and the tunnel dies if that Pod dies. Never measure scaling or failover through port-forward; run the load generator inside the cluster against the Service (Module 08).</p>
+    </div>
+
+    <!-- ===================================================== -->
+    <section class="lab"><header>Lab 1 — Service, EndpointSlices, DNS and readiness for reliability-api</header><div class="body">
+      <p><strong>Goal:</strong> create the Service, watch EndpointSlices react to readiness and label changes, and resolve the Service by name from inside the cluster.</p>
+      <p><strong>Prereqs:</strong> kind cluster <code>reliability-lab</code>, namespace <code>reliability-lab</code>, <code>Deployment/reliability-api</code> from Module 04 running with 2 replicas.</p>
+      <ol class="steps">
+        <li>Point kubectl at the namespace (saves typing <code>-n</code>):
+<pre><code>kubectl config set-context --current --namespace=reliability-lab</code></pre></li>
+        <li>Apply the Service from §3 and inspect it:
+<pre><code>kubectl apply -f deploy/kubernetes/service.yaml
+kubectl get svc reliability-api</code></pre>
+          <p>Example output (yours will differ in IPs/ages):</p>
+<pre><code><span class="o">NAME              TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+reliability-api   ClusterIP   10.96.143.20   &lt;none&gt;        80/TCP    5s</span></code></pre></li>
+        <li>Find the EndpointSlice by its label and look at the conditions:
+<pre><code>kubectl get endpointslices -l kubernetes.io/service-name=reliability-api
+kubectl describe endpointslices -l kubernetes.io/service-name=reliability-api</code></pre>
+          <p>Example output (abridged):</p>
+<pre><code><span class="o">NAME                    ADDRESSTYPE   PORTS   ENDPOINTS               AGE
+reliability-api-x7k2p   IPv4          8000    10.244.1.5,10.244.2.7   10s
+...
+Endpoints:
+  - Addresses:  10.244.1.5
+    Conditions:
+      Ready:    true
+    TargetRef:  Pod/reliability-api-6d9f8b7c4-abcde</span></code></pre>
+          <p>Note the slice's port is <strong>8000</strong> (the targetPort), not 80.</p></li>
+        <li>Resolve and call the Service from a throwaway Pod:
+<pre><code>kubectl run net-debug --rm -it --image=busybox:1.36 --restart=Never -- sh
+<span class="c"># inside the Pod:</span>
+cat /etc/resolv.conf
+nslookup reliability-api.reliability-lab.svc.cluster.local
+wget -qO- http://reliability-api/ready
+wget -qO- http://reliability-api.reliability-lab.svc.cluster.local/health
+exit</code></pre>
+          <p>Expected: the search line includes <code>reliability-lab.svc.cluster.local</code>; nslookup returns the ClusterIP from step 2 (some busybox builds of nslookup don't apply the search list reliably, so give it the full name; <code>wget</code> uses the normal resolver and the search list, so the short name works there); <code>/ready</code> returns <code>{"ready":true}</code>; <code>/health</code> returns <code>{"status":"ok"}</code>.</p></li>
+        <li>Watch readiness drive endpoint membership. In terminal A:
+<pre><code>kubectl get endpointslices -l kubernetes.io/service-name=reliability-api -o wide -w</code></pre>
+          In terminal B, make new Pods take 30 s to become ready (this triggers a rollout):
+<pre><code>kubectl set env deployment/reliability-api READY_DELAY_SECONDS=30
+kubectl get pods -l app.kubernetes.io/name=reliability-api -w</code></pre>
+          <p>Expected: new Pods show <code>READY 0/1</code> for ~30 s; their IPs appear in the slice but only become usable once ready; old Pods leave the slice as they terminate. The Service never has zero ready endpoints because the rolling update waits for readiness (Module 04).</p></li>
+        <li>Break the selector on purpose and observe:
+<pre><code>kubectl patch svc reliability-api --type=merge \
+  -p '{"spec":{"selector":{"app.kubernetes.io/name":"reliability-apii"}}}'
+kubectl get endpointslices -l kubernetes.io/service-name=reliability-api</code></pre>
+          <p>Expected: ENDPOINTS shows <code>&lt;unset&gt;</code> (no matching Pods). Calls from <code>net-debug</code> now fail even though all Pods are healthy. Restore with <code>kubectl apply -f deploy/kubernetes/service.yaml</code>.</p></li>
+        <li>Port-forward from your laptop:
+<pre><code>kubectl port-forward svc/reliability-api 8080:80
+<span class="c"># other terminal</span>
+curl -s localhost:8080/ready
+curl -s "localhost:8080/work?ms=50"</code></pre></li>
+      </ol>
+      <p><strong>Evidence to keep:</strong> the <code>describe endpointslices</code> output before/after the readiness change, and the empty slice from the broken selector. These are exactly the checks in the study guide's troubleshooting row "Service has no working endpoint".</p>
+    </div></section>
+
+    <!-- ===================================================== -->
+    <h2>6. Getting traffic in from outside: Ingress vs Gateway API</h2>
+    <h3>The problem</h3>
+    <p>A LoadBalancer Service per app gives you one external IP per Service, with no HTTP awareness (no host/path routing, no shared TLS). For HTTP services you want <em>one</em> entry point that routes <code>api.example.test/</code> to reliability-api and <code>grafana.example.test/</code> to Grafana. Kubernetes has two APIs for this.</p>
+
+    <h3>6.1 Ingress (stable, frozen)</h3>
+    <p>An <strong>Ingress</strong> "exposes HTTP and HTTPS routes from outside the cluster to services within the cluster". It can do host/path routing, TLS termination and name-based virtual hosting. Two facts from the official page that trip people up:</p>
+    <ul>
+      <li>"You must have an Ingress controller to satisfy an Ingress. Only creating an Ingress resource has no effect." The controller (for example a proxy deployed in the cluster) watches Ingress objects and configures itself.</li>
+      <li>"The Kubernetes project recommends using Gateway instead of Ingress. The Ingress API has been frozen." It still works and is everywhere, but gets no new features.</li>
+    </ul>
+<pre data-title="ingress.yaml (for reliability-api; class name depends on your controller)"><code>apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+spec:
+  ingressClassName: &lt;your-ingress-class&gt;   <span class="c"># kubectl get ingressclass</span>
+  rules:
+    - host: api.reliability.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix                  <span class="c"># Exact | Prefix | ImplementationSpecific</span>
+            backend:
+              service:
+                name: reliability-api
+                port:
+                  number: 80</code></pre>
+
+    <h3>6.2 Gateway API (the recommended successor)</h3>
+    <p><strong>Gateway API</strong> is an add-on set of API kinds (installed as CRDs, implemented by many controllers) that splits the job by <em>role</em>:</p>
+    <div class="table-wrap"><table>
+      <tr><th>Kind (gateway.networking.k8s.io/v1)</th><th>Official definition (abridged)</th><th>Owned by</th></tr>
+      <tr><td><code>GatewayClass</code></td><td>A set of gateways with common configuration, managed by a controller that implements the class</td><td>Infrastructure provider</td></tr>
+      <tr><td><code>Gateway</code></td><td>An instance of traffic-handling infrastructure, such as a cloud load balancer; declares <em>listeners</em> (protocol, port, hostname, which routes may attach)</td><td>Cluster operator</td></tr>
+      <tr><td><code>HTTPRoute</code></td><td>HTTP-specific rules mapping traffic from a Gateway listener to backends (usually Services)</td><td>Application developer</td></tr>
+      <tr><td><code>GRPCRoute</code></td><td>The same for gRPC</td><td>Application developer</td></tr>
+    </table></div>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 340" role="img" aria-label="Ingress versus Gateway API: Ingress is one object read by a controller; Gateway API splits into GatewayClass, Gateway and HTTPRoute owned by different roles">
+        <defs><marker id="arr7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="20" y="24" class="t-bold">Ingress (frozen)</text>
+        <rect class="box" x="20" y="40" width="172" height="56" rx="8"/>
+        <text x="34" y="64" class="t-bold">Client</text>
+        <text x="34" y="84" class="t-mono">api.reliability.test</text>
+        <rect class="box3" x="210" y="40" width="190" height="56" rx="8"/>
+        <text x="224" y="64" class="t-bold">Ingress controller</text>
+        <text x="224" y="84" class="t-muted">reads Ingress objects</text>
+        <rect class="box2" x="210" y="120" width="190" height="56" rx="8"/>
+        <text x="224" y="144" class="t-bold">Ingress</text>
+        <text x="224" y="164" class="t-muted">host/path → Service</text>
+        <rect class="box4" x="430" y="40" width="170" height="56" rx="8"/>
+        <text x="444" y="64" class="t-bold">Service</text>
+        <text x="444" y="84" class="t-mono">reliability-api:80</text>
+        <path class="line accent" d="M192 68 L210 68" marker-end="url(#arr7)"/>
+        <path class="line accent" d="M400 68 L430 68" marker-end="url(#arr7)"/>
+        <path class="line dash" d="M305 120 L305 96" marker-end="url(#arr7)"/>
+        <!-- gateway -->
+        <text x="20" y="214" class="t-bold">Gateway API (role-oriented)</text>
+        <rect class="box3" x="20" y="226" width="190" height="88" rx="8"/>
+        <text x="34" y="250" class="t-bold">GatewayClass</text>
+        <text x="34" y="270" class="t-muted">infra provider</text>
+        <text x="34" y="290" class="t-mono">controllerName: …</text>
+        <rect class="box2" x="240" y="226" width="190" height="88" rx="8"/>
+        <text x="254" y="250" class="t-bold">Gateway</text>
+        <text x="254" y="270" class="t-muted">cluster operator</text>
+        <text x="254" y="290" class="t-mono">listener HTTP :80</text>
+        <rect class="box" x="460" y="226" width="190" height="88" rx="8"/>
+        <text x="474" y="250" class="t-bold">HTTPRoute</text>
+        <text x="474" y="270" class="t-muted">app developer</text>
+        <text x="474" y="290" class="t-mono">PathPrefix / → svc</text>
+        <rect class="box4" x="680" y="226" width="160" height="88" rx="8"/>
+        <text x="694" y="250" class="t-bold">Service</text>
+        <text x="694" y="270" class="t-mono">reliability-api</text>
+        <text x="694" y="290" class="t-mono">port 80</text>
+        <path class="line" d="M240 270 L210 270" marker-end="url(#arr7)"/>
+        <text x="150" y="332" class="t-muted">gatewayClassName</text>
+        <path class="line" d="M460 270 L430 270" marker-end="url(#arr7)"/>
+        <text x="410" y="332" class="t-muted">parentRefs</text>
+        <path class="line accent" d="M650 270 L680 270" marker-end="url(#arr7)"/>
+        <text x="626" y="332" class="t-muted">backendRefs</text>
+      </svg>
+      <figcaption>Figure 6 — Ingress packs everything into one object; Gateway API separates "which implementation", "which entry point" and "which routes", so teams can own their own piece.</figcaption>
+    </figure>
+<pre data-title="gateway.yaml — Gateway owned by the cluster operator"><code>apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: lab-gateway
+  namespace: reliability-lab
+spec:
+  gatewayClassName: &lt;class-from-your-implementation&gt;   <span class="c"># kubectl get gatewayclass</span>
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "api.reliability.test"
+      allowedRoutes:
+        namespaces:
+          from: Same          <span class="c"># only routes in reliability-lab may attach</span></code></pre>
+<pre data-title="httproute.yaml — route owned by the reliability-api team"><code>apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+spec:
+  parentRefs:
+    - name: lab-gateway
+  hostnames:
+    - "api.reliability.test"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: reliability-api   <span class="c"># the Service</span>
+          port: 80</code></pre>
+    <h3>How it works</h3>
+    <ol>
+      <li>An implementation (controller) is installed; it registers a GatewayClass with its <code>controllerName</code>.</li>
+      <li>You create a Gateway referencing that class. The controller provisions the data plane (a cloud LB, or proxy Pods + a LoadBalancer Service) and reports an address in <code>status</code>.</li>
+      <li>You create an HTTPRoute whose <code>parentRefs</code> names the Gateway. The Gateway's <code>allowedRoutes</code> decides whether the attachment is accepted; check <code>kubectl describe httproute</code> conditions.</li>
+      <li>Requests to the Gateway address with <code>Host: api.reliability.test</code> are matched and proxied to the Service's ready endpoints.</li>
+    </ol>
+    <p>On kind, the kind docs state that cloud-provider-kind (v0.9.0+) natively supports Ingress and Gateway API; Module 06 covers that. For this project, <strong>port-forward is enough</strong> for v1; add Gateway API when you want a realistic entry point.</p>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Ingress</th><th>Gateway API</th></tr>
+      <tr><td>Status</td><td>Stable but frozen</td><td>Recommended; actively developed; installed as CRDs</td></tr>
+      <tr><td>Protocols</td><td>HTTP/HTTPS</td><td>HTTP, gRPC (stable kinds) and more via other route types</td></tr>
+      <tr><td>Ownership</td><td>One object mixes infra and app concerns</td><td>Split across roles; cross-namespace attachment is explicit</td></tr>
+      <tr><td>Portability</td><td>Many features hidden in controller-specific annotations</td><td>More expressive in the spec itself</td></tr>
+    </table></div>
+    <h3>Failure cases</h3>
+    <ul>
+      <li>Ingress created, nothing happens → no controller / wrong <code>ingressClassName</code>. <code>kubectl get ingressclass</code>.</li>
+      <li>HTTPRoute exists but 404s → route not accepted by the Gateway (namespace not allowed, hostname mismatch). <code>kubectl describe httproute reliability-api</code> → <code>Accepted</code>/<code>ResolvedRefs</code> conditions.</li>
+      <li><code>no matches for kind "Gateway"</code> → Gateway API CRDs not installed in the cluster.</li>
+      <li>503 from the proxy → backend Service has no ready endpoints (back to §3).</li>
+    </ul>
+    <details class="q"><summary>Self-check: you apply an Ingress to a fresh kind cluster and <code>kubectl get ingress</code> shows no ADDRESS. Is your YAML wrong?</summary><div class="a">Not necessarily. An Ingress has no effect without an Ingress controller; on plain kind there isn't one serving it until you install one (or run cloud-provider-kind). Check <code>kubectl get ingressclass</code> and the controller's logs before editing YAML.</div></details>
+
+    <!-- ===================================================== -->
+    <h2>7. NetworkPolicy: a firewall between Pods</h2>
+    <h3>Definition</h3>
+    <p>A <strong>NetworkPolicy</strong> is a built-in API object that controls which traffic may reach (ingress) or leave (egress) selected Pods, at the IP/port level (L3/L4). It selects Pods by label and describes allowed peers by Pod labels, namespace labels or IP blocks.</p>
+    <h3>The problem it solves</h3>
+    <p>The network model says every Pod can reach every Pod. That's convenient and dangerous: a compromised Pod in any namespace could call reliability-api, or the API could call anything. NetworkPolicy lets you move to "deny by default, allow what's needed".</p>
+    <div class="callout danger"><span class="label">Enforcement depends on the network plugin</span>
+      <p>From the official page: "Network policies are implemented by the network plugin. To use network policies, you must be using a networking solution which supports NetworkPolicy. Creating a NetworkPolicy resource without a controller that implements it will have no effect." The API server will happily accept your policy either way — so <strong>always test that a policy actually blocks something</strong>. kind's default CNI (kindnetd) has had out-of-the-box NetworkPolicy support since kind v0.24.0 (via sigs.k8s.io/kube-network-policies, per the kind release notes); older kind versions silently ignore policies.</p>
+    </div>
+    <h3>The rules, precisely</h3>
+    <ul>
+      <li><strong>Default:</strong> a Pod is non-isolated; all inbound and outbound connections are allowed.</li>
+      <li><strong>Isolation:</strong> a Pod becomes isolated for ingress as soon as <em>any</em> NetworkPolicy selects it and lists <code>Ingress</code> in <code>policyTypes</code> (same for egress).</li>
+      <li><strong>Additive:</strong> policies never conflict. The allowed set is the <em>union</em> of all policies that select the Pod. There are no "deny" rules — deny is what's left over.</li>
+      <li><strong>Both ends:</strong> a connection needs the source's egress <em>and</em> the destination's ingress to allow it.</li>
+      <li><strong>AND vs OR:</strong> a single <code>from</code> element containing both <code>namespaceSelector</code> and <code>podSelector</code> means "Pods with these labels <em>in</em> namespaces with these labels" (AND). Two separate list elements mean either one (OR). One misplaced <code>-</code> changes the meaning.</li>
+      <li><strong>Node traffic:</strong> traffic to and from the node where a Pod is running is always allowed — so kubelet probes keep working under default-deny.</li>
+      <li><strong>Existing connections:</strong> changes affect new connections; reply traffic for allowed connections is implicitly allowed.</li>
+      <li><strong>Namespace by name:</strong> every namespace carries the label <code>kubernetes.io/metadata.name: &lt;name&gt;</code>, which you can select on.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 320" role="img" aria-label="NetworkPolicy: default deny in reliability-lab, allow from same namespace and from monitoring namespace to port 8000, deny from default namespace">
+        <defs><marker id="arr8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="420" y="20" width="420" height="280" rx="12"/>
+        <text x="436" y="42" class="t-bold">namespace reliability-lab</text>
+        <text x="436" y="60" class="t-muted">default-deny-ingress + allow-reliability-api</text>
+        <rect class="box4" x="600" y="110" width="220" height="80" rx="10"/>
+        <text x="614" y="136" class="t-bold">reliability-api Pods</text>
+        <text x="614" y="158" class="t-mono">:8000 (TCP)</text>
+        <text x="614" y="178" class="t-muted">isolated for ingress</text>
+        <rect class="box" x="440" y="220" width="150" height="60" rx="8"/>
+        <text x="454" y="246" class="t-bold">load-gen Pod</text>
+        <text x="454" y="266" class="t-muted">same namespace</text>
+        <rect class="zone" x="20" y="20" width="360" height="120" rx="12"/>
+        <text x="36" y="42" class="t-bold">namespace monitoring</text>
+        <rect class="box" x="40" y="58" width="200" height="60" rx="8"/>
+        <text x="54" y="84" class="t-bold">Prometheus Pod</text>
+        <text x="54" y="104" class="t-muted">scrapes /metrics</text>
+        <rect class="zone" x="20" y="170" width="360" height="130" rx="12"/>
+        <text x="36" y="192" class="t-bold">namespace default</text>
+        <rect class="box" x="40" y="210" width="200" height="60" rx="8"/>
+        <text x="54" y="236" class="t-bold">random Pod</text>
+        <text x="54" y="256" class="t-muted">no allow rule</text>
+        <path class="line ok" d="M240 88 C 420 88, 520 120, 600 140" marker-end="url(#arr8)"/>
+        <text x="300" y="80" class="t-muted">allowed (namespaceSelector)</text>
+        <path class="line ok" d="M590 240 L640 190" marker-end="url(#arr8)"/>
+        <text x="596" y="232" class="t-muted">allowed</text>
+        <path class="line bad dash" d="M240 240 L410 200"/>
+        <text x="404" y="196" class="t-bold">✕</text>
+        <text x="40" y="292" class="t-muted">dropped (client sees a timeout)</text>
+      </svg>
+      <figcaption>Figure 7 — With default-deny, only explicitly allowed sources reach reliability-api. Dropped packets are silent: clients see timeouts, not "connection refused".</figcaption>
+    </figure>
+<pre data-title="deploy/kubernetes/netpol-default-deny.yaml (verbatim pattern from the docs, namespaced)"><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: reliability-lab
+spec:
+  podSelector: {}          <span class="c"># selects every Pod in the namespace</span>
+  policyTypes:
+    - Ingress              <span class="c"># no ingress rules listed =&gt; nothing allowed in</span></code></pre>
+<pre data-title="deploy/kubernetes/netpol-allow-reliability-api.yaml"><code>apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-reliability-api
+  namespace: reliability-lab
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: reliability-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}                      <span class="c"># OR: any Pod in reliability-lab</span>
+        - namespaceSelector:                   <span class="c"># OR: any Pod in namespace "monitoring"</span>
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000                           <span class="c"># Pod port, not the Service port 80!</span></code></pre>
+    <div class="callout warn"><span class="label">Policies see Pod ports, not Service ports</span><p>Service translation happens before the policy is evaluated at the destination Pod, so rules name the <strong>container port 8000</strong>. Writing <code>port: 80</code> here is a classic bug that blocks everything.</p></div>
+    <h4>If you also restrict egress, allow DNS</h4>
+    <p>An egress default-deny blocks DNS too, and then every name lookup fails. If you add egress policies, allow UDP and TCP port 53 to the cluster DNS Pods (in <code>kube-system</code>) explicitly. For v1 of this project, start with ingress policies only.</p>
+
+    <div class="widget" id="w-netpol">
+      <div class="w-title">Widget — Will this connection be allowed?</div>
+      <div class="w-sub">Toggle the two policies above and pick a source and port. The logic follows the documented rules: isolation if any policy selects the Pod for Ingress; allowed set is the union of rules.</div>
+      <div class="row">
+        <label><input type="checkbox" id="np-deny" checked> default-deny-ingress applied</label>
+        <label><input type="checkbox" id="np-allow" checked> allow-reliability-api applied</label>
+        <label><input type="checkbox" id="np-enforce" checked> CNI enforces NetworkPolicy</label>
+      </div>
+      <div class="row">
+        <label>Source<br><select id="np-src">
+          <option value="same">load-gen Pod in reliability-lab</option>
+          <option value="mon">Prometheus Pod in monitoring</option>
+          <option value="def">random Pod in default</option>
+          <option value="node">kubelet probe from the Pod's node</option>
+        </select></label>
+        <label>Destination port on Pod<br><select id="np-port"><option>8000</option><option>9999</option></select></label>
+      </div>
+      <div class="out" id="np-out"></div>
+    </div>
+
+    <h3>Failure cases &amp; trade-offs</h3>
+    <ul>
+      <li><strong>Policy applied, nothing changes</strong> → CNI doesn't enforce. Test from a Pod in <code>default</code>; it should time out.</li>
+      <li><strong>Everything broke after default-deny</strong> → you forgot an allow rule (Prometheus, ingress controller/gateway proxy namespace, load generator).</li>
+      <li><strong>Allow rule "doesn't work"</strong> → AND/OR indentation, wrong namespace label, or Service port instead of Pod port.</li>
+      <li><strong>Trade-off:</strong> tight policies reduce blast radius but add an inventory burden — every new caller needs a rule. Keep policies in the same chart/kustomization as the app so they evolve together.</li>
+    </ul>
+    <details class="q"><summary>Self-check: you have only <code>allow-reliability-api</code> (no default-deny). Can a Pod in <code>default</code> reach a <em>different</em> app in reliability-lab?</summary><div class="a">Yes. <code>allow-reliability-api</code> only selects reliability-api Pods, so only they become isolated. Other Pods in the namespace stay non-isolated until some policy selects them — that's what <code>podSelector: {}</code> in default-deny does.</div></details>
+
+    <section class="lab"><header>Lab 2 — Default-deny and a targeted allow for reliability-api</header><div class="body">
+      <p><strong>Goal:</strong> prove that policy enforcement is active, then open exactly the paths the project needs.</p>
+      <ol class="steps">
+        <li>Baseline — from another namespace, the Service is reachable:
+<pre><code>kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n default run probe-default --rm -it --image=busybox:1.36 --restart=Never -- \
+  wget -qO- -T 3 http://reliability-api.reliability-lab/ready</code></pre>
+          <p>Expected: <code>{"ready":true}</code>.</p></li>
+        <li>Apply default-deny and retry:
+<pre><code>kubectl apply -f deploy/kubernetes/netpol-default-deny.yaml
+kubectl -n default run probe-default --rm -it --image=busybox:1.36 --restart=Never -- \
+  wget -qO- -T 3 http://reliability-api.reliability-lab/ready</code></pre>
+          <p>Expected on a cluster that enforces policy: a timeout (busybox prints a "timed out" style error and the Pod exits non-zero). If you still get <code>{"ready":true}</code>, your CNI is not enforcing — check your kind version (<code>kind version</code>) before continuing.</p></li>
+        <li>Confirm the Pods are still <code>Ready</code> (probes come from the node, which is always allowed):
+<pre><code>kubectl -n reliability-lab get pods -l app.kubernetes.io/name=reliability-api</code></pre></li>
+        <li>Apply the allow policy and test three sources:
+<pre><code>kubectl apply -f deploy/kubernetes/netpol-allow-reliability-api.yaml
+<span class="c"># same namespace: allowed</span>
+kubectl -n reliability-lab run probe-same --rm -it --image=busybox:1.36 --restart=Never -- \
+  wget -qO- -T 3 http://reliability-api/ready
+<span class="c"># monitoring namespace: allowed</span>
+kubectl -n monitoring run probe-mon --rm -it --image=busybox:1.36 --restart=Never -- \
+  wget -qO- -T 3 http://reliability-api.reliability-lab/metrics
+<span class="c"># default namespace: still blocked</span>
+kubectl -n default run probe-default --rm -it --image=busybox:1.36 --restart=Never -- \
+  wget -qO- -T 3 http://reliability-api.reliability-lab/ready</code></pre></li>
+        <li>Inspect what you created:
+<pre><code>kubectl -n reliability-lab get networkpolicy
+kubectl -n reliability-lab describe networkpolicy allow-reliability-api</code></pre></li>
+        <li>Break it deliberately: edit the allow policy to <code>port: 80</code>, re-apply, and repeat the same-namespace test. Explain the timeout in one sentence in your notes, then revert.</li>
+      </ol>
+    </div></section>
+
+    <!-- ===================================================== -->
+    <h2>8. ConfigMap: configuration outside the image</h2>
+    <h3>Definition</h3>
+    <p>A <strong>ConfigMap</strong> is an API object that stores <em>non-confidential</em> data as key–value pairs (<code>data</code> for UTF-8 strings, <code>binaryData</code> for base64 binary). Pods consume it as environment variables, command-line arguments, or files in a read-only volume — or code can read it through the API. A ConfigMap cannot exceed <strong>1 MiB</strong> and must be in the same namespace as the Pod that uses it. It provides <strong>no secrecy or encryption</strong>.</p>
+    <h3>The problem it solves</h3>
+    <p>The twelve-factor rule from Module 02: build one image (<code>reliability-api:0.1.0</code>) and run it in many environments with different settings. <code>LOG_LEVEL=debug</code> in the lab, <code>info</code> in production, <code>READY_DELAY_SECONDS=10</code> for a failure experiment — without rebuilding.</p>
+<pre data-title="deploy/kubernetes/configmap.yaml"><code>apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reliability-api-config
+  namespace: reliability-lab
+data:
+  APP_MODE: "normal"
+  LOG_LEVEL: "info"
+  READY_DELAY_SECONDS: "5"       <span class="c"># values are strings; the app parses float()</span>
+  <span class="c"># file-like key, for the volume example below</span>
+  experiment.yaml: |
+    name: baseline
+    work_ms: 50</code></pre>
+
+    <h3>Two ways in: env vs volume</h3>
+<pre data-title="deployment.yaml (container excerpt) — both styles"><code>      containers:
+        - name: reliability-api
+          image: reliability-api:0.1.0
+          envFrom:                              <span class="c"># every key becomes an env var (valid names only)</span>
+            - configMapRef:
+                name: reliability-api-config
+          env:
+            - name: LOG_LEVEL                   <span class="c"># or pick single keys explicitly</span>
+              valueFrom:
+                configMapKeyRef:
+                  name: reliability-api-config
+                  key: LOG_LEVEL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/reliability-api
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: reliability-api-config
+            items:
+              - key: experiment.yaml
+                path: experiment.yaml          <span class="c"># → /etc/reliability-api/experiment.yaml</span></code></pre>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="ConfigMap consumed as environment variables (fixed at container start) versus as a mounted volume (eventually updated by kubelet)">
+        <defs><marker id="arr9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="100" width="230" height="110" rx="10"/>
+        <text x="36" y="126" class="t-bold">ConfigMap</text>
+        <text x="36" y="146" class="t-mono">reliability-api-config</text>
+        <text x="36" y="170" class="t-mono">LOG_LEVEL: info</text>
+        <text x="36" y="190" class="t-mono">experiment.yaml: …</text>
+        <rect class="box4" x="430" y="20" width="410" height="110" rx="10"/>
+        <text x="446" y="46" class="t-bold">As env vars (envFrom / valueFrom)</text>
+        <text x="446" y="68" class="t-mono">os.getenv("LOG_LEVEL")</text>
+        <text x="446" y="92" class="t-muted">read once when the container starts;</text>
+        <text x="446" y="112" class="t-muted">ConfigMap edits are NOT seen until restart</text>
+        <rect class="box3" x="430" y="170" width="410" height="110" rx="10"/>
+        <text x="446" y="196" class="t-bold">As a volume (files)</text>
+        <text x="446" y="218" class="t-mono">/etc/reliability-api/experiment.yaml</text>
+        <text x="446" y="242" class="t-muted">kubelet refreshes files eventually;</text>
+        <text x="446" y="262" class="t-muted">app must re-read; subPath mounts never update</text>
+        <path class="line" d="M250 140 L430 80" marker-end="url(#arr9)"/>
+        <text x="300" y="98" class="t-muted">at start</text>
+        <path class="line dash" d="M250 175 L430 220" marker-end="url(#arr9)"/>
+        <text x="300" y="214" class="t-muted">synced by kubelet</text>
+      </svg>
+      <figcaption>Figure 8 — The update behaviour is the big difference. reliability-api reads its settings with <code>os.getenv</code> at import time, so env vars fit, and a change requires a rollout.</figcaption>
+    </figure>
+    <h3>Update behaviour (the part people get wrong)</h3>
+    <ul>
+      <li><strong>Env vars do not update</strong> when the ConfigMap changes. The container keeps the values it started with.</li>
+      <li><strong>Mounted ConfigMap volumes are updated eventually</strong> by the kubelet (not instantly). Your app must notice and reload the file.</li>
+      <li><strong>Mounts using <code>subPath</code> never receive updates.</strong></li>
+      <li><strong><code>immutable: true</code></strong> (stable since v1.19) forbids changes after creation; it protects against accidental edits and reduces watch load on the API server. To change config you create a new ConfigMap (e.g. <code>reliability-api-config-v2</code>) and point the Deployment at it — which itself triggers a rollout.</li>
+    </ul>
+    <p>For reliability-api, the standard way to apply a changed ConfigMap is a rolling restart:</p>
+<pre><code>kubectl -n reliability-lab apply -f deploy/kubernetes/configmap.yaml
+kubectl -n reliability-lab rollout restart deployment/reliability-api
+kubectl -n reliability-lab rollout status deployment/reliability-api</code></pre>
+    <p>Module 06 shows how Helm automates this with a <code>checksum/config</code> annotation, so a values change produces a new Pod template hash and a normal rolling update.</p>
+    <h3>Failure cases</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Cause</th><th>Check</th></tr>
+      <tr><td>Pod stuck <code>CreateContainerConfigError</code></td><td>Referenced ConfigMap or key does not exist (typo, wrong namespace, not yet applied)</td><td><code>kubectl describe pod</code> Events</td></tr>
+      <tr><td>"I changed LOG_LEVEL but logs are still info"</td><td>Env vars don't update</td><td><code>kubectl exec … -- env | grep LOG_LEVEL</code>; then rollout restart</td></tr>
+      <tr><td>Env var missing from <code>envFrom</code></td><td>Key isn't a valid env var name (e.g. <code>experiment.yaml</code>) and is skipped</td><td>Pod events; use <code>valueFrom</code> or a volume</td></tr>
+      <tr><td>Different Pods behave differently after an edit</td><td>Mixed restart times: some Pods started before, some after the change</td><td>Always roll out config changes deliberately</td></tr>
+    </table></div>
+    <details class="q"><summary>Self-check: you mount the ConfigMap as a volume with <code>subPath: experiment.yaml</code>, then edit the ConfigMap. What does the Pod see?</summary><div class="a">Nothing changes — subPath mounts never receive ConfigMap updates. Without subPath the file would update eventually, and the app would still need to re-read it.</div></details>
+
+    <!-- ===================================================== -->
+    <h2>9. Secret: sensitive values, and what actually protects them</h2>
+    <h3>Definition</h3>
+    <p>A <strong>Secret</strong> is like a ConfigMap but intended for confidential data: passwords, tokens, keys. It separates sensitive values from Pod specs and images, and Kubernetes handles it somewhat differently (it is a separate resource type you can restrict with RBAC independently of ConfigMaps, and Secret volumes are backed by tmpfs, so they are not written to the node's disk). Same 1 MiB limit; can be <code>immutable</code>.</p>
+    <h3>base64 is encoding, not encryption</h3>
+    <p>In YAML, <code>data:</code> values must be base64-encoded; <code>stringData:</code> accepts plain text and the API server encodes it for you. Anyone who can read the object can decode it instantly. Try it:</p>
+    <div class="widget" id="w-b64">
+      <div class="w-title">Widget — "Encrypt" a secret with base64 (spoiler: you can't)</div>
+      <div class="w-sub">Type a value as it would appear under <code>stringData</code>, see what <code>data</code> stores, and decode it back with no key at all.</div>
+      <label>Plain value<br><input type="text" id="b64-in" value="s3cr3t-api-token" size="32"></label>
+      <div class="row" style="margin-top:8px"><button class="btn" id="b64-enc">Encode → data</button><button class="btn" id="b64-dec">Decode data → plain</button></div>
+      <label>data (base64)<br><input type="text" id="b64-mid" size="40"></label>
+      <div class="out" id="b64-out"></div>
+    </div>
+    <p>The official Secret page opens with a caution worth memorising: <strong>by default Secrets are stored unencrypted in the API server's datastore (etcd)</strong>; anyone with API access can retrieve or modify them, and <strong>anyone authorised to create a Pod in a namespace can read any Secret in that namespace</strong> (by mounting it). The docs then list the controls that actually protect them:</p>
+    <ol>
+      <li><strong>Enable encryption at rest</strong> for Secrets — the API server's <code>--encryption-provider-config</code> with an <code>EncryptionConfiguration</code>. The first provider in the list encrypts new writes; <code>identity</code> means plain text. Providers include <code>aescbc</code>, <code>aesgcm</code>, <code>secretbox</code> and <code>kms</code>. (On kind you don't configure this; on GKE etcd/application-layer encryption is a platform setting — Module 11.)</li>
+      <li><strong>RBAC with least privilege</strong> on Secrets: few subjects get <code>get/list/watch</code> on <code>secrets</code>; consider <code>resourceNames</code> to restrict to specific Secrets. Note that <code>list</code> and <code>watch</code> return Secret contents too.</li>
+      <li><strong>Restrict Secret access to specific containers</strong> — only mount it where needed.</li>
+      <li><strong>Consider external secret stores</strong> (e.g. via the Secrets Store CSI Driver) so the source of truth isn't etcd.</li>
+    </ol>
+    <p>And outside Kubernetes: never commit Secret manifests with real values to Git (study guide §24: "secrets are not committed"). Create them from the CLI or a secret manager.</p>
+    <h3>reliability-api example</h3>
+    <p>The app in this course has no real secret. To practise, give it a fake token for a future upstream dependency:</p>
+<pre><code><span class="c"># imperative creation — nothing sensitive lands in a file in your repo</span>
+kubectl -n reliability-lab create secret generic reliability-api-secrets \
+  --from-literal=UPSTREAM_TOKEN='change-me-lab-only'
+
+kubectl -n reliability-lab get secret reliability-api-secrets -o yaml   <span class="c"># note: data is base64</span>
+kubectl -n reliability-lab get secret reliability-api-secrets \
+  -o jsonpath='{.data.UPSTREAM_TOKEN}' | base64 --decode; echo            <span class="c"># proves it isn't encrypted</span></code></pre>
+<pre data-title="deployment.yaml (container excerpt)"><code>          env:
+            - name: UPSTREAM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: reliability-api-secrets
+                  key: UPSTREAM_TOKEN</code></pre>
+    <p>Secret types you'll see: <code>Opaque</code> (default, arbitrary data), <code>kubernetes.io/dockerconfigjson</code> (registry credentials for <code>imagePullSecrets</code> — used for private GHCR images in Module 09), <code>kubernetes.io/tls</code> (cert + key for Ingress/Gateway TLS), <code>kubernetes.io/service-account-token</code> (legacy long-lived SA tokens), plus <code>basic-auth</code>, <code>ssh-auth</code> and bootstrap tokens.</p>
+    <h3>Env var or file?</h3>
+    <ul>
+      <li><strong>Env vars</strong>: simplest, but leak easily (crash dumps, <code>/proc/&lt;pid&gt;/environ</code>, debug endpoints that print config, child processes inherit them), and don't update.</li>
+      <li><strong>Files</strong>: can be updated (eventually), harder to leak by accident, permission bits can be set. Preferred for anything long-lived and sensitive.</li>
+    </ul>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><code>CreateContainerConfigError</code> — missing Secret/key, same as ConfigMap.</li>
+      <li>Value has a trailing newline — you base64-encoded <code>echo value</code> instead of <code>echo -n value</code>; use <code>--from-literal</code> or <code>stringData</code>.</li>
+      <li>Secret printed in CI logs or <code>kubectl describe</code> pasted into a ticket — <code>describe</code> shows only byte counts, but <code>get -o yaml</code> shows the (decodable) data.</li>
+    </ul>
+    <details class="q"><summary>Self-check: a teammate says "our Secrets are safe, they're base64". Give two concrete counter-arguments.</summary><div class="a">(1) base64 is reversible without any key — <code>base64 --decode</code> recovers the value. (2) By default Secrets sit unencrypted in etcd, and anyone who can create a Pod in the namespace can mount and read them. Real protection is encryption at rest, least-privilege RBAC on <code>secrets</code> and Pod creation, limited mounting, and optionally an external secret store.</div></details>
+
+    <!-- ===================================================== -->
+    <h2>10. Storage: volumes, PV, PVC and StorageClass</h2>
+    <h3>Definition</h3>
+    <p>A container's filesystem is ephemeral: when the container is replaced, files written to it are gone. A <strong>volume</strong> is a directory, declared in the Pod spec (<code>spec.volumes</code>) and mounted into containers (<code>volumeMounts</code>), whose lifetime is not tied to the container. The official volumes page distinguishes:</p>
+    <ul>
+      <li><strong>Ephemeral volumes</strong> — live as long as the Pod (e.g. <code>emptyDir</code>, <code>configMap</code>, <code>secret</code>, <code>projected</code>, <code>downwardAPI</code>). An <code>emptyDir</code> is created when the Pod is assigned to a node and deleted permanently when the Pod is removed; a container crash does <em>not</em> remove it. <code>medium: Memory</code> puts it in RAM; <code>sizeLimit</code> caps it.</li>
+      <li><strong>Persistent volumes</strong> — exist beyond any individual Pod. Kubernetes doesn't destroy them when a Pod ends.</li>
+    </ul>
+    <p>In both cases data survives <em>container</em> restarts.</p>
+    <h3>The persistent storage API: three objects</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Object</th><th>Scope</th><th>Who creates it</th><th>Meaning</th></tr>
+      <tr><td><strong>PersistentVolume (PV)</strong></td><td>Cluster</td><td>Admin (static) or a provisioner (dynamic)</td><td>A piece of real storage (cloud disk, NFS share, local path) represented in the API, with a lifecycle independent of Pods</td></tr>
+      <tr><td><strong>PersistentVolumeClaim (PVC)</strong></td><td>Namespace</td><td>App developer</td><td>A <em>request</em>: "I need 1Gi, ReadWriteOnce, of class X". Pods mount claims, not PVs.</td></tr>
+      <tr><td><strong>StorageClass</strong></td><td>Cluster</td><td>Admin / platform</td><td>A "type" of storage: which <code>provisioner</code> creates volumes, with what <code>parameters</code>, <code>reclaimPolicy</code> (default <code>Delete</code>), <code>volumeBindingMode</code> and <code>allowVolumeExpansion</code></td></tr>
+    </table></div>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 310" role="img" aria-label="Dynamic provisioning: Pod references PVC; PVC names a StorageClass; the provisioner creates a PV backed by real storage; PVC binds to PV">
+        <defs><marker id="arr10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="10" y="10" width="420" height="160" rx="12"/>
+        <text x="24" y="32" class="t-bold">namespace reliability-lab (developer)</text>
+        <rect class="box4" x="30" y="48" width="170" height="100" rx="8"/>
+        <text x="44" y="72" class="t-bold">Pod</text>
+        <text x="44" y="94" class="t-mono">volumes:</text>
+        <text x="44" y="112" class="t-mono"> claimName:</text>
+        <text x="44" y="130" class="t-mono">  results</text>
+        <rect class="box2" x="236" y="48" width="180" height="100" rx="8"/>
+        <text x="250" y="72" class="t-bold">PVC "results"</text>
+        <text x="250" y="94" class="t-mono">1Gi · RWO</text>
+        <text x="250" y="112" class="t-mono">class: standard</text>
+        <text x="250" y="132" class="t-muted">Pending → Bound</text>
+        <path class="line" d="M200 98 L236 98" marker-end="url(#arr10)"/>
+        <rect class="zone" x="450" y="10" width="400" height="290" rx="12"/>
+        <text x="464" y="32" class="t-bold">cluster-scoped (platform)</text>
+        <rect class="box3" x="470" y="48" width="360" height="70" rx="8"/>
+        <text x="484" y="72" class="t-bold">StorageClass "standard" (default)</text>
+        <text x="484" y="94" class="t-mono">provisioner: rancher.io/local-path</text>
+        <text x="484" y="110" class="t-muted">binding: WaitForFirstConsumer</text>
+        <rect class="box" x="470" y="140" width="360" height="56" rx="8"/>
+        <text x="484" y="164" class="t-bold">Provisioner (controller)</text>
+        <text x="484" y="184" class="t-muted">sees claim + class → creates volume + PV</text>
+        <rect class="box2" x="470" y="218" width="170" height="64" rx="8"/>
+        <text x="484" y="242" class="t-bold">PV pvc-…</text>
+        <text x="484" y="262" class="t-mono">1Gi · Delete</text>
+        <rect class="box" x="660" y="218" width="170" height="64" rx="8"/>
+        <text x="674" y="242" class="t-bold">Real storage</text>
+        <text x="674" y="262" class="t-muted">dir on node / cloud disk</text>
+        <path class="line dash" d="M416 80 L470 80" marker-end="url(#arr10)"/>
+        <text x="420" y="74" class="t-muted">class</text>
+        <path class="line" d="M650 118 L650 140" marker-end="url(#arr10)"/>
+        <path class="line" d="M555 196 L555 218" marker-end="url(#arr10)"/>
+        <path class="line" d="M640 250 L660 250" marker-end="url(#arr10)"/>
+        <path class="line accent" d="M470 250 C 380 250, 340 200, 330 148" marker-end="url(#arr10)"/>
+        <text x="300" y="200" class="t-muted">binds 1:1</text>
+      </svg>
+      <figcaption>Figure 9 — Dynamic provisioning. Developers only write the PVC; the StorageClass's provisioner creates the PV. Values shown are kind's default class.</figcaption>
+    </figure>
+    <h3>How it works, step by step</h3>
+    <ol>
+      <li><strong>Static provisioning:</strong> an admin pre-creates PVs; a control loop binds a new PVC to a matching PV. <strong>Dynamic provisioning:</strong> if no static PV matches and the PVC names a StorageClass (or omits it and a default class exists), the class's provisioner creates a volume on demand.</li>
+      <li>Binding is exclusive and one-to-one: a PV is bound to exactly one PVC. You get at least what you asked for.</li>
+      <li>With <code>volumeBindingMode: Immediate</code> (the default) provisioning happens when the PVC is created. With <code>WaitForFirstConsumer</code> it is delayed until a Pod using the claim is scheduled — so a local or zonal volume ends up where the Pod runs. Until then the PVC is <code>Pending</code>, which is <em>normal</em>.</li>
+      <li>"Storage object in use protection" prevents deleting a PVC that a Pod is using, or a PV bound to a claim, from destroying data underneath a running Pod.</li>
+      <li>When the PVC is deleted, the PV's <strong>reclaim policy</strong> applies: <code>Delete</code> (default for dynamic PVs) removes the PV and the backing storage; <code>Retain</code> keeps it for manual cleanup; <code>Recycle</code> is deprecated.</li>
+    </ol>
+    <h3>Access modes</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Mode</th><th>Short</th><th>Meaning (from the docs)</th></tr>
+      <tr><td><code>ReadWriteOnce</code></td><td>RWO</td><td>Read-write by a <strong>single node</strong>. Multiple Pods on that same node can still use it.</td></tr>
+      <tr><td><code>ReadOnlyMany</code></td><td>ROX</td><td>Read-only by many nodes</td></tr>
+      <tr><td><code>ReadWriteMany</code></td><td>RWX</td><td>Read-write by many nodes (needs a storage system that supports it, e.g. a network filesystem)</td></tr>
+      <tr><td><code>ReadWriteOncePod</code></td><td>RWOP</td><td>Read-write by a <strong>single Pod</strong> — stricter than RWO</td></tr>
+    </table></div>
+    <p>Access modes describe what the volume <em>supports and is mounted as</em>; they are not a lock you can rely on for application-level consistency.</p>
+    <h3>On kind</h3>
+    <p>kind installs a default StorageClass during cluster creation. Observed on a kind v0.33.0 cluster (age will differ):</p>
+<pre><code>kubectl get storageclass
+<span class="o">NAME                 PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+standard (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false                  22d</span></code></pre>
+    <p>That provisioner creates directories on the node's (container's) filesystem: fine for labs, gone when you delete the cluster, and tied to one node.</p>
+    <h3>Applied to reliability-api</h3>
+    <p>reliability-api is <strong>stateless</strong> — every replica is interchangeable, which is exactly what lets the HPA add and remove Pods freely. It should <em>not</em> get a PVC. Where storage does appear in this project:</p>
+    <ul>
+      <li><code>emptyDir</code> for scratch space (e.g. if you run with <code>readOnlyRootFilesystem: true</code> and Python needs a writable <code>/tmp</code>).</li>
+      <li>A PVC for Prometheus' TSDB in the monitoring stack (Module 07) so metrics survive Prometheus Pod restarts.</li>
+      <li>A PVC for an experiment Job that writes result files you want to collect afterwards (the lab below).</li>
+    </ul>
+<pre data-title="experiments/results-pvc.yaml"><code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: results
+  namespace: reliability-lab
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  <span class="c"># storageClassName omitted =&gt; the default class ("standard" on kind)</span>
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: results-writer
+  namespace: reliability-lab
+spec:
+  restartPolicy: Never
+  containers:
+    - name: writer
+      image: busybox:1.36
+      command: ["sh", "-c", "date &gt;&gt; /results/runs.log &amp;&amp; cat /results/runs.log"]
+      volumeMounts:
+        - name: results
+          mountPath: /results
+  volumes:
+    - name: results
+      persistentVolumeClaim:
+        claimName: results</code></pre>
+    <h3>Failure cases</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Cause</th><th>Check</th></tr>
+      <tr><td>PVC <code>Pending</code>, no Pod uses it yet</td><td><code>WaitForFirstConsumer</code> — expected</td><td><code>kubectl describe pvc</code> event "waiting for first consumer"</td></tr>
+      <tr><td>PVC <code>Pending</code> forever with a Pod</td><td>No default StorageClass, class name typo, provisioner not running, unsupported access mode</td><td><code>kubectl get sc</code>; <code>kubectl describe pvc</code></td></tr>
+      <tr><td>Pod <code>Pending</code> with volume node affinity conflict</td><td>RWO/zonal volume lives on a node/zone the Pod can't use</td><td><code>kubectl describe pod</code> scheduling events</td></tr>
+      <tr><td>Data gone after <code>helm uninstall</code></td><td>Reclaim policy <code>Delete</code></td><td><code>kubectl get pv</code> RECLAIM POLICY</td></tr>
+      <tr><td>Second replica can't mount</td><td>RWO volume, Pods on different nodes</td><td>Use one volume per replica (StatefulSet volumeClaimTemplates) or RWX storage</td></tr>
+    </table></div>
+    <details class="q"><summary>Self-check: why is "add a PVC to reliability-api so it can cache results" a bad idea for this project?</summary><div class="a">It makes replicas non-interchangeable. With RWO, replicas on different nodes can't share the volume, so scaling (HPA) and rescheduling get constrained; rolling updates can deadlock waiting for a volume. Keep the API stateless; put state in a dedicated store or use a StatefulSet for genuinely stateful components.</div></details>
+
+    <!-- ===================================================== -->
+    <h2>11. Identity &amp; access: ServiceAccounts and RBAC</h2>
+    <h3>Definitions</h3>
+    <ul>
+      <li><strong>ServiceAccount (SA)</strong>: a namespaced, non-human identity used by Pods (and automation such as CI) to authenticate to the API server. Every namespace gets a <code>default</code> SA automatically; a Pod with no <code>serviceAccountName</code> uses it.</li>
+      <li><strong>RBAC</strong> (Role-Based Access Control): authorisation via four objects in <code>rbac.authorization.k8s.io</code>:
+        <ul>
+          <li><code>Role</code> — permissions within one namespace;</li>
+          <li><code>ClusterRole</code> — cluster-wide or cluster-scoped resources, or a reusable set of namespaced permissions;</li>
+          <li><code>RoleBinding</code> — grants a Role <em>or</em> a ClusterRole to subjects, <em>within one namespace</em>;</li>
+          <li><code>ClusterRoleBinding</code> — grants a ClusterRole across the whole cluster.</li>
+        </ul></li>
+    </ul>
+    <p>Key properties: rules are <strong>purely additive</strong> (no deny rules); a binding's <code>roleRef</code> is <strong>immutable</strong> (delete and recreate to change it); you can't grant permissions you don't hold yourself (escalation prevention).</p>
+    <h3>The problem it solves</h3>
+    <p>Two different questions for this project:</p>
+    <ol>
+      <li><strong>reliability-api itself</strong> never calls the Kubernetes API. It needs <em>no</em> permissions and ideally no token mounted at all.</li>
+      <li><strong>An experiment runner</strong> (a Job that kills a Pod and watches recovery, Module 08) does need to list, watch and delete Pods — but only in <code>reliability-lab</code>, and never read Secrets or touch other namespaces.</li>
+    </ol>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 260" role="img" aria-label="RBAC: subject ServiceAccount experiment-runner bound by a RoleBinding to a Role that allows verbs on resources in namespace reliability-lab">
+        <defs><marker id="arr11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="10" y="10" width="840" height="240" rx="12"/>
+        <text x="24" y="32" class="t-bold">namespace reliability-lab</text>
+        <rect class="box4" x="30" y="60" width="210" height="110" rx="10"/>
+        <text x="44" y="84" class="t-bold">Subject</text>
+        <text x="44" y="106" class="t-mono">ServiceAccount</text>
+        <text x="44" y="124" class="t-mono">experiment-runner</text>
+        <text x="44" y="150" class="t-muted">"who"</text>
+        <rect class="box3" x="320" y="60" width="210" height="110" rx="10"/>
+        <text x="334" y="84" class="t-bold">RoleBinding</text>
+        <text x="334" y="106" class="t-mono">experiment-runner</text>
+        <text x="334" y="128" class="t-muted">subjects[] + roleRef</text>
+        <text x="334" y="150" class="t-muted">"grants"</text>
+        <rect class="box2" x="610" y="40" width="220" height="150" rx="10"/>
+        <text x="624" y="64" class="t-bold">Role</text>
+        <text x="624" y="84" class="t-mono">pod-chaos</text>
+        <text x="624" y="108" class="t-mono">pods: get list</text>
+        <text x="624" y="126" class="t-mono">  watch delete</text>
+        <text x="624" y="146" class="t-mono">apps/deployments:</text>
+        <text x="624" y="164" class="t-mono">  get list watch</text>
+        <path class="line" d="M320 115 L240 115" marker-end="url(#arr11)"/>
+        <path class="line" d="M530 115 L610 115" marker-end="url(#arr11)"/>
+        <text x="30" y="206" class="t-muted">Anything not listed is denied: secrets, configmaps, other namespaces, nodes …</text>
+        <text x="30" y="228" class="t-muted">Pods authenticate with a short-lived, auto-rotated projected token (TokenRequest API).</text>
+      </svg>
+      <figcaption>Figure 10 — Who (subject) ← binding → what (role rules). The binding's namespace limits where the grant applies.</figcaption>
+    </figure>
+    <h3>Tokens</h3>
+    <p>Since Kubernetes v1.22, Pods get a short-lived, automatically rotating token obtained via the TokenRequest API and mounted as a projected volume at <code>/var/run/secrets/kubernetes.io/serviceaccount</code>. The <code>default</code> SA has no permissions beyond the API discovery permissions granted to all authenticated principals — but the token is still a credential. Set <code>automountServiceAccountToken: false</code> on workloads that don't need it. The docs also recommend a separate SA per workload rather than sharing <code>default</code>.</p>
+    <h3>Least-privilege manifests</h3>
+<pre data-title="deploy/kubernetes/serviceaccount.yaml — the app gets an identity with nothing attached"><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+automountServiceAccountToken: false     <span class="c"># the app never calls the API</span>
+<span class="c"># Deployment: spec.template.spec.serviceAccountName: reliability-api</span></code></pre>
+<pre data-title="deploy/kubernetes/rbac-experiment-runner.yaml"><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: experiment-runner
+  namespace: reliability-lab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-chaos
+  namespace: reliability-lab
+rules:
+  - apiGroups: [""]                       <span class="c"># "" = core API group (pods, services, secrets…)</span>
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: experiment-runner
+  namespace: reliability-lab
+subjects:
+  - kind: ServiceAccount
+    name: experiment-runner
+    namespace: reliability-lab
+roleRef:
+  kind: Role
+  name: pod-chaos
+  apiGroup: rbac.authorization.k8s.io</code></pre>
+    <h3>Verify with <code>kubectl auth can-i</code></h3>
+    <p>A ServiceAccount's username is <code>system:serviceaccount:&lt;namespace&gt;:&lt;name&gt;</code>. Impersonate it with <code>--as</code>:</p>
+<pre><code>SA=system:serviceaccount:reliability-lab:experiment-runner
+kubectl auth can-i delete pods          --as=$SA -n reliability-lab    <span class="c"># yes</span>
+kubectl auth can-i list deployments.apps --as=$SA -n reliability-lab   <span class="c"># yes</span>
+kubectl auth can-i delete deployments.apps --as=$SA -n reliability-lab <span class="c"># no</span>
+kubectl auth can-i get secrets          --as=$SA -n reliability-lab    <span class="c"># no</span>
+kubectl auth can-i delete pods          --as=$SA -n default            <span class="c"># no (binding is namespaced)</span>
+kubectl auth can-i --list               --as=$SA -n reliability-lab    <span class="c"># everything it can do</span></code></pre>
+    <div class="widget" id="w-rbac">
+      <div class="w-title">Widget — <code>kubectl auth can-i</code> simulator for experiment-runner</div>
+      <div class="w-sub">Evaluates the Role and RoleBinding above (additive rules, namespaced binding). Real clusters also grant some discovery permissions to all authenticated users; those aren't modelled.</div>
+      <div class="row">
+        <label>Verb<br><select id="rb-verb"><option>get</option><option>list</option><option>watch</option><option>create</option><option>update</option><option>patch</option><option selected>delete</option></select></label>
+        <label>Resource<br><select id="rb-res"><option value="pods">pods</option><option value="deployments.apps">deployments.apps</option><option value="secrets">secrets</option><option value="configmaps">configmaps</option><option value="services">services</option><option value="pods/exec">pods/exec</option></select></label>
+        <label>Namespace<br><select id="rb-ns"><option>reliability-lab</option><option>default</option><option>monitoring</option></select></label>
+      </div>
+      <div class="out" id="rb-out"></div>
+    </div>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><code>Error from server (Forbidden): pods is forbidden: User "system:serviceaccount:reliability-lab:experiment-runner" cannot delete resource "pods" ...</code> — the message names the exact user, verb, resource and namespace: add precisely that rule, nothing more.</li>
+      <li>Rule for <code>deployments</code> with <code>apiGroups: [""]</code> does nothing — Deployments are in the <code>apps</code> group.</li>
+      <li>Want <code>kubectl exec</code> or logs? Those are subresources: <code>pods/exec</code>, <code>pods/log</code>.</li>
+      <li>Changing <code>roleRef</code> fails — it's immutable; delete and recreate the binding.</li>
+      <li>Granting <code>edit</code> "to make it work": the default ClusterRoles <code>cluster-admin</code>, <code>admin</code>, <code>edit</code>, <code>view</code> are handy for humans but far broader than an automation needs (for example <code>edit</code> can read Secrets in the namespace).</li>
+    </ul>
+    <h3>Trade-offs</h3>
+    <ul>
+      <li>Fine-grained Roles are safer but need maintenance as tools evolve; start minimal and add rules driven by <code>Forbidden</code> errors.</li>
+      <li>Reusing a ClusterRole via a namespaced RoleBinding gives you one definition with per-namespace grants.</li>
+      <li>Remember RBAC protects the <em>API</em>. It does nothing for network traffic between Pods — that's NetworkPolicy's job.</li>
+    </ul>
+    <details class="q"><summary>Self-check: a RoleBinding in <code>reliability-lab</code> references the ClusterRole <code>view</code>. Can the subject list Pods in <code>monitoring</code>?</summary><div class="a">No. A RoleBinding grants the referenced role's permissions only within the binding's own namespace, even when the role is a ClusterRole. A ClusterRoleBinding would be needed for cluster-wide access.</div></details>
+
+    <section class="lab"><header>Lab 3 — Config, Secret, least-privilege RBAC and a PVC</header><div class="body">
+      <ol class="steps">
+        <li><strong>ConfigMap via env.</strong> Apply the ConfigMap and add <code>envFrom</code> to the Deployment (or use <code>kubectl set env</code> as a shortcut):
+<pre><code>kubectl -n reliability-lab apply -f deploy/kubernetes/configmap.yaml
+kubectl -n reliability-lab set env deployment/reliability-api --from=configmap/reliability-api-config
+kubectl -n reliability-lab rollout status deployment/reliability-api
+kubectl -n reliability-lab exec deploy/reliability-api -- env | grep -E 'APP_MODE|LOG_LEVEL|READY_DELAY'</code></pre>
+          <p>Expected: the three variables with the ConfigMap's values. Note: <code>set env --from</code> copies keys into the Pod template as <code>valueFrom</code> references; inspect with <code>kubectl get deploy reliability-api -o yaml</code>.</p></li>
+        <li><strong>Prove env vars don't update.</strong>
+<pre><code>kubectl -n reliability-lab patch configmap reliability-api-config --type=merge -p '{"data":{"LOG_LEVEL":"debug"}}'
+kubectl -n reliability-lab exec deploy/reliability-api -- env | grep LOG_LEVEL     <span class="c"># still info</span>
+kubectl -n reliability-lab rollout restart deployment/reliability-api
+kubectl -n reliability-lab rollout status deployment/reliability-api
+kubectl -n reliability-lab exec deploy/reliability-api -- env | grep LOG_LEVEL     <span class="c"># now debug</span></code></pre></li>
+        <li><strong>Secret is only base64.</strong>
+<pre><code>kubectl -n reliability-lab create secret generic reliability-api-secrets --from-literal=UPSTREAM_TOKEN='change-me-lab-only'
+kubectl -n reliability-lab get secret reliability-api-secrets -o jsonpath='{.data.UPSTREAM_TOKEN}'; echo
+kubectl -n reliability-lab get secret reliability-api-secrets -o jsonpath='{.data.UPSTREAM_TOKEN}' | base64 --decode; echo</code></pre></li>
+        <li><strong>Least privilege.</strong> Apply the RBAC file and run every <code>auth can-i</code> line from §11. Record the yes/no table in your notes.
+<pre><code>kubectl apply -f deploy/kubernetes/rbac-experiment-runner.yaml
+kubectl auth can-i --list --as=system:serviceaccount:reliability-lab:experiment-runner -n reliability-lab</code></pre></li>
+        <li><strong>Remove the app's token.</strong> Apply <code>serviceaccount.yaml</code>, set <code>serviceAccountName: reliability-api</code> in the Deployment, roll out, then:
+<pre><code>kubectl -n reliability-lab exec deploy/reliability-api -- ls /var/run/secrets/kubernetes.io/serviceaccount</code></pre>
+          <p>Expected: "No such file or directory" — the app now carries no API credential.</p></li>
+        <li><strong>PVC lifecycle.</strong>
+<pre><code>kubectl apply -f experiments/results-pvc.yaml
+kubectl -n reliability-lab get pvc results          <span class="c"># Pending until the Pod is scheduled, then Bound</span>
+kubectl -n reliability-lab logs results-writer
+kubectl -n reliability-lab delete pod results-writer
+kubectl apply -f experiments/results-pvc.yaml       <span class="c"># run again: two lines in runs.log</span>
+kubectl -n reliability-lab logs results-writer
+kubectl get pv                                      <span class="c"># RECLAIM POLICY Delete</span>
+kubectl -n reliability-lab delete -f experiments/results-pvc.yaml
+kubectl get pv                                      <span class="c"># PV gone (Delete policy)</span></code></pre></li>
+      </ol>
+    </div></section>
+
+    <!-- ===================================================== -->
+    <h2>12. Putting it together: the full reliability-api object set</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Object</th><th>Name</th><th>Key fields</th><th>Why</th></tr>
+      <tr><td>ServiceAccount</td><td><code>reliability-api</code></td><td><code>automountServiceAccountToken: false</code></td><td>Own identity, no API credential</td></tr>
+      <tr><td>ConfigMap</td><td><code>reliability-api-config</code></td><td>APP_MODE, LOG_LEVEL, READY_DELAY_SECONDS</td><td>Config without rebuild</td></tr>
+      <tr><td>Secret (optional)</td><td><code>reliability-api-secrets</code></td><td>created imperatively, not in Git</td><td>Sensitive values</td></tr>
+      <tr><td>Deployment</td><td><code>reliability-api</code></td><td>2 replicas, port <code>http</code>=8000, probes, <code>envFrom</code></td><td>Module 04</td></tr>
+      <tr><td>Service</td><td><code>reliability-api</code></td><td>ClusterIP, 80 → <code>http</code></td><td>Stable name + VIP</td></tr>
+      <tr><td>NetworkPolicy ×2</td><td><code>default-deny-ingress</code>, <code>allow-reliability-api</code></td><td>TCP 8000 from same ns + monitoring</td><td>Least network privilege</td></tr>
+      <tr><td>SA + Role + RoleBinding</td><td><code>experiment-runner</code>, <code>pod-chaos</code></td><td>pods get/list/watch/delete; deployments read</td><td>Failure experiments (Module 08)</td></tr>
+    </table></div>
+    <p>In Module 06 these become templates in <code>charts/reliability-api</code>, so names and labels stay consistent by construction.</p>
+
+    <!-- ===================================================== -->
+    <h2>Troubleshooting playbook for this module</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>First command</th><th>Then</th></tr>
+      <tr><td>Can't reach the API via the Service</td><td><code>kubectl get endpointslices -l kubernetes.io/service-name=reliability-api -o wide</code></td><td>Empty → selector/labels. Not ready → probes. Present → targetPort, NetworkPolicy, client DNS name.</td></tr>
+      <tr><td>Name doesn't resolve</td><td><code>kubectl run net-debug --rm -it --image=busybox:1.36 --restart=Never -- cat /etc/resolv.conf</code></td><td>Use <code>name.namespace</code>; check CoreDNS Pods; check egress policy allows DNS</td></tr>
+      <tr><td>Timeouts (not refused)</td><td><code>kubectl get networkpolicy -A</code></td><td>Timeout usually = dropped packets (policy). Refused = reached a host but nothing listening (port).</td></tr>
+      <tr><td>Port-forward works, Service doesn't</td><td><code>kubectl get svc reliability-api -o yaml</code></td><td>Compare <code>targetPort</code> and selector with the Pod</td></tr>
+      <tr><td><code>CreateContainerConfigError</code></td><td><code>kubectl describe pod &lt;pod&gt;</code></td><td>Missing ConfigMap/Secret/key or wrong namespace</td></tr>
+      <tr><td>Config change not applied</td><td><code>kubectl exec deploy/reliability-api -- env</code></td><td><code>kubectl rollout restart</code></td></tr>
+      <tr><td><code>Forbidden</code> from automation</td><td><code>kubectl auth can-i &lt;verb&gt; &lt;resource&gt; --as=system:serviceaccount:&lt;ns&gt;:&lt;sa&gt; -n &lt;ns&gt;</code></td><td>Add the minimal rule; check API group and subresource</td></tr>
+      <tr><td>PVC Pending</td><td><code>kubectl describe pvc &lt;name&gt;</code></td><td>WaitForFirstConsumer (normal) vs missing class/provisioner</td></tr>
+    </table></div>
+
+    <!-- ===================================================== -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Task</th><th>Command</th></tr>
+      <tr><td>List Services / slices</td><td><code>kubectl get svc,endpointslices -n reliability-lab</code></td></tr>
+      <tr><td>Slices for one Service</td><td><code>kubectl get endpointslices -l kubernetes.io/service-name=reliability-api</code></td></tr>
+      <tr><td>Show selector</td><td><code>kubectl get svc reliability-api -o jsonpath='{.spec.selector}'</code></td></tr>
+      <tr><td>Pods with labels</td><td><code>kubectl get pods --show-labels</code></td></tr>
+      <tr><td>Expose a Deployment quickly</td><td><code>kubectl expose deployment reliability-api --port=80 --target-port=8000</code></td></tr>
+      <tr><td>Debug Pod</td><td><code>kubectl run net-debug --rm -it --image=busybox:1.36 --restart=Never -- sh</code></td></tr>
+      <tr><td>Port-forward</td><td><code>kubectl port-forward svc/reliability-api 8080:80</code></td></tr>
+      <tr><td>Service FQDN</td><td><code>reliability-api.reliability-lab.svc.cluster.local</code></td></tr>
+      <tr><td>Ingress classes / Gateway classes</td><td><code>kubectl get ingressclass</code> · <code>kubectl get gatewayclass</code></td></tr>
+      <tr><td>NetworkPolicies</td><td><code>kubectl get networkpolicy -n reliability-lab</code></td></tr>
+      <tr><td>ConfigMap from literals</td><td><code>kubectl create configmap reliability-api-config --from-literal=LOG_LEVEL=info</code></td></tr>
+      <tr><td>Secret from literals</td><td><code>kubectl create secret generic reliability-api-secrets --from-literal=K=V</code></td></tr>
+      <tr><td>Decode a Secret key</td><td><code>kubectl get secret NAME -o jsonpath='{.data.K}' | base64 --decode</code></td></tr>
+      <tr><td>Restart to pick up config</td><td><code>kubectl rollout restart deployment/reliability-api</code></td></tr>
+      <tr><td>Storage</td><td><code>kubectl get sc,pv,pvc</code></td></tr>
+      <tr><td>Permission check</td><td><code>kubectl auth can-i delete pods --as=system:serviceaccount:reliability-lab:experiment-runner -n reliability-lab</code></td></tr>
+      <tr><td>All permissions of a subject</td><td><code>kubectl auth can-i --list --as=... -n reliability-lab</code></td></tr>
+      <tr><td>Create Role/binding imperatively</td><td><code>kubectl create role pod-chaos --verb=get,list,watch,delete --resource=pods</code> · <code>kubectl create rolebinding experiment-runner --role=pod-chaos --serviceaccount=reliability-lab:experiment-runner</code></td></tr>
+    </table></div>
+
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>CNI plugin</dt><dd>Pod network implementation that assigns Pod IPs and routes between nodes; may also enforce NetworkPolicy. kindnetd on kind.</dd>
+      <dt>ClusterIP</dt><dd>Virtual, in-cluster IP of a Service; not bound to any interface.</dd>
+      <dt>EndpointSlice</dt><dd>API object listing a Service's backend IPs/ports with ready/serving/terminating conditions; ≤100 endpoints per slice by default.</dd>
+      <dt>kube-proxy</dt><dd>Per-node agent that watches Services/EndpointSlices and programs iptables/nftables/ipvs rules to translate VIP traffic to Pod IPs.</dd>
+      <dt>targetPort</dt><dd>Pod port (number or name) a Service forwards to; defaults to <code>port</code>.</dd>
+      <dt>NodePort</dt><dd>Port (30000–32767 by default) opened on every node for a Service.</dd>
+      <dt>Headless Service</dt><dd><code>clusterIP: None</code>; DNS returns Pod IPs, no proxying.</dd>
+      <dt>ExternalName</dt><dd>Service that is just a DNS CNAME to an external name.</dd>
+      <dt>CoreDNS</dt><dd>The usual cluster DNS server; answers <code>*.svc.cluster.local</code>.</dd>
+      <dt>ndots</dt><dd>resolv.conf option: names with fewer dots are tried with search domains first (5 in Pods).</dd>
+      <dt>Ingress</dt><dd>Frozen HTTP routing API; needs an Ingress controller.</dd>
+      <dt>Gateway API</dt><dd>Role-oriented successor: GatewayClass, Gateway, HTTPRoute, GRPCRoute; installed as CRDs.</dd>
+      <dt>NetworkPolicy</dt><dd>L3/L4 allow-list for Pod ingress/egress; additive; enforced only by supporting CNIs.</dd>
+      <dt>ConfigMap</dt><dd>Non-confidential key–value config (≤1 MiB) consumed as env, args or files.</dd>
+      <dt>Secret</dt><dd>Confidential key–value data; base64-encoded, unencrypted in etcd unless encryption at rest is configured.</dd>
+      <dt>PV / PVC</dt><dd>Real storage in the API / a namespaced request for storage; bound one-to-one.</dd>
+      <dt>StorageClass</dt><dd>Describes a provisioner and parameters for dynamic provisioning.</dd>
+      <dt>Access modes</dt><dd>RWO (one node), ROX, RWX, RWOP (one Pod).</dd>
+      <dt>ServiceAccount</dt><dd>Namespaced workload identity; short-lived projected token.</dd>
+      <dt>Role / ClusterRole</dt><dd>Sets of allowed verbs on resources; namespaced / cluster-wide.</dd>
+      <dt>RoleBinding</dt><dd>Grants a Role or ClusterRole to subjects within a namespace.</dd>
+    </dl>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. Walk a request from the load-generator Pod to a reliability-api container, naming every component involved.</summary><div class="a">Client resolver → CoreDNS returns the ClusterIP for <code>reliability-api.reliability-lab.svc.cluster.local</code> → client connects to VIP:80 → kernel rules programmed by kube-proxy DNAT to a ready endpoint from the EndpointSlice (Pod IP:8000) → CNI Pod network delivers it → NetworkPolicy (if enforced) checks ingress → Uvicorn handles it → reply is reverse-translated.</div></details>
+    <details class="q"><summary>2. Your Service has endpoints, but all are <code>ready=false</code>. Name two likely causes and the command to tell them apart.</summary><div class="a">Readiness probe failing because the app is still warming up (<code>READY_DELAY_SECONDS</code>) or because the probe path/port is wrong. <code>kubectl describe pod</code> shows "Readiness probe failed" with the HTTP status (503 = app says not ready; connection refused = wrong port).</div></details>
+    <details class="q"><summary>3. Map these four numbers for reliability-api exposed as NodePort 30080: 8000, 80, 8000, 30080.</summary><div class="a"><code>containerPort: 8000</code> (app listens), <code>port: 80</code> (Service VIP port), <code>targetPort: 8000</code> (Pod port the Service forwards to), <code>nodePort: 30080</code> (port on every node). Path: nodeIP:30080 → ClusterIP rules → PodIP:8000.</div></details>
+    <details class="q"><summary>4. Why does a LoadBalancer Service stay <code>&lt;pending&gt;</code> on a bare local cluster?</summary><div class="a">The external IP is provisioned by a cloud controller. Without one (plain kind) nothing fulfils the request. Use port-forward, NodePort + kind port mappings, or cloud-provider-kind.</div></details>
+    <details class="q"><summary>5. You applied default-deny-ingress and the Pods stayed Ready. Why weren't probes blocked?</summary><div class="a">Traffic to and from the node where a Pod runs is always allowed by NetworkPolicy, and kubelet probes come from the node.</div></details>
+    <details class="q"><summary>6. In a NetworkPolicy, what's the difference between one <code>from</code> item with both <code>namespaceSelector</code> and <code>podSelector</code>, and two items each with one?</summary><div class="a">One item = AND (Pods with those labels in namespaces with those labels). Two items = OR (any Pod from those namespaces, or Pods with those labels in the policy's own namespace).</div></details>
+    <details class="q"><summary>7. You edit <code>LOG_LEVEL</code> in the ConfigMap. When does reliability-api pick it up?</summary><div class="a">Only when containers restart, because it's consumed as an env var. Do <code>kubectl rollout restart deployment/reliability-api</code> (or have Helm change a checksum annotation).</div></details>
+    <details class="q"><summary>8. List four controls that actually protect Kubernetes Secrets.</summary><div class="a">Encryption at rest in etcd; least-privilege RBAC on <code>secrets</code> (and on Pod creation, since Pod creators can mount Secrets); mounting Secrets only into containers that need them; an external secret store. Plus: never commit them to Git.</div></details>
+    <details class="q"><summary>9. A PVC is <code>Pending</code> on kind before any Pod uses it. Bug?</summary><div class="a">No — kind's default class uses <code>WaitForFirstConsumer</code>, so provisioning waits until a Pod using the claim is scheduled.</div></details>
+    <details class="q"><summary>10. What's the difference between RWO and RWOP?</summary><div class="a">RWO restricts read-write mounting to a single node (several Pods on that node may share it). RWOP restricts it to a single Pod.</div></details>
+    <details class="q"><summary>11. Write the <code>auth can-i</code> command that checks whether experiment-runner can read Secrets, and predict the answer.</summary><div class="a"><code>kubectl auth can-i get secrets --as=system:serviceaccount:reliability-lab:experiment-runner -n reliability-lab</code> → <code>no</code>; the Role only covers pods and apps/deployments, and RBAC is additive with nothing granting secrets.</div></details>
+    <details class="q"><summary>12. Ingress or Gateway API for a new project, and why?</summary><div class="a">Gateway API: the Kubernetes project recommends it and has frozen Ingress. It is role-oriented and more expressive. Ingress is still fine to understand and maintain where it already exists.</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/">Services, Load Balancing, and Networking (network model) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/service/">Service — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/">EndpointSlices — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/blog/2025/04/24/endpoints-deprecation/">Kubernetes v1.33: Continuing the transition from Endpoints to EndpointSlices — kubernetes.io blog</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/networking/virtual-ips/">Virtual IPs and Service Proxies (kube-proxy) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/">DNS for Services and Pods — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/access-application-cluster/port-forward-access-application-cluster/">Use Port Forwarding to Access Applications in a Cluster — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/ingress/">Ingress — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/gateway/">Gateway API — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/network-policies/">Network Policies — kubernetes.io</a></li>
+      <li><a href="https://github.com/kubernetes-sigs/kind/releases/tag/v0.24.0">kind v0.24.0 release notes (NetworkPolicy support in kindnetd) — kubernetes-sigs/kind</a></li>
+      <li><a href="https://kind.sigs.k8s.io/docs/user/configuration/">kind Configuration (default pod/service subnets, kindnetd) — kind.sigs.k8s.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/configuration/configmap/">ConfigMaps — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/configuration/secret/">Secrets — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/">Encrypting Confidential Data at Rest — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/storage/volumes/">Volumes — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/storage/persistent-volumes/">Persistent Volumes — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/storage/storage-classes/">Storage Classes — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/security/service-accounts/">Service Accounts — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/access-authn-authz/rbac/">Using RBAC Authorization — kubernetes.io</a></li>
+      <li><a href="https://kind.sigs.k8s.io/docs/user/ingress/">kind Ingress (cloud-provider-kind supports Ingress and Gateway API) — kind.sigs.k8s.io</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="04-kubernetes-workloads.html"><small>◀ Previous</small>Module 04 · Workloads: Probes, Resources, Scheduling &amp; Rollouts</a>
+      <a class="next" href="06-kind-helm.html"><small>Next ▶</small>Module 06 · Local Clusters with kind &amp; Packaging with Helm</a>
+    </nav>
+  </article></main>
+</div>
+<script>
+(function () {
+  function $(id) { return document.getElementById(id); }
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+  // ---------- Port path explorer ----------
+  function ports() {
+    var cport = parseInt($("wp-cport").value, 10);
+    var port = parseInt($("wp-port").value, 10);
+    var traw = $("wp-tport").value.trim();
+    var pname = $("wp-pname").value.trim();
+    var type = $("wp-type").value;
+    var nraw = $("wp-nport").value.trim();
+    var lines = [], warn = [];
+    var effTarget, targetDesc;
+    if (traw === "") { effTarget = port; targetDesc = "(omitted → defaults to port " + port + ")"; }
+    else if (/^\d+$/.test(traw)) { effTarget = parseInt(traw, 10); targetDesc = traw; }
+    else {
+      targetDesc = '"' + traw + '" (named)';
+      if (traw === pname) { effTarget = cport; targetDesc += " → resolves to containerPort " + cport; }
+      else { effTarget = null; warn.push('✗ targetPort name "' + traw + '" does not match the container port name "' + pname + '" — no traffic can be delivered.'); }
+    }
+    var nodePort = null;
+    if (type !== "ClusterIP") {
+      if (nraw === "") nodePort = "auto (30000-32767)";
+      else {
+        var n = parseInt(nraw, 10);
+        nodePort = n;
+        if (!(n >= 30000 && n <= 32767)) warn.push("✗ nodePort " + nraw + " is outside the default range 30000-32767 (--service-node-port-range); the API server rejects it.");
+      }
+    } else if (nraw !== "") warn.push("ℹ nodePort is ignored for ClusterIP Services.");
+    if (type === "LoadBalancer") lines.push("client → EXTERNAL-IP:" + port + "   (cloud LB / cloud-provider-kind)");
+    if (type !== "ClusterIP") lines.push("client → <any-node-IP>:" + nodePort);
+    lines.push("in-cluster client → reliability-api:" + port + "  (ClusterIP VIP)");
+    lines.push("kube-proxy rules → <ready-Pod-IP>:" + (effTarget === null ? "???" : effTarget) + "   targetPort " + targetDesc);
+    lines.push("Uvicorn bound on 0.0.0.0:" + cport);
+    if (effTarget !== null && effTarget !== cport) warn.push("✗ Traffic is sent to Pod port " + effTarget + " but the app listens on " + cport + " → connection refused.");
+    if (warn.length === 0) warn.push("✓ Path is consistent.");
+    var yaml = "ports:\n  - name: http\n    port: " + port + (traw === "" ? "" : "\n    targetPort: " + (/^\d+$/.test(traw) ? traw : traw)) +
+      (type !== "ClusterIP" && nraw !== "" ? "\n    nodePort: " + nraw : "");
+    $("wp-out").innerHTML = esc(lines.join("\n   ↓\n")) + "\n\n" + esc(warn.join("\n")) + "\n\nService spec (type: " + type + "):\n" + esc(yaml);
+  }
+  ["wp-cport", "wp-port", "wp-tport", "wp-pname", "wp-type", "wp-nport"].forEach(function (id) {
+    $(id).addEventListener("input", ports); $(id).addEventListener("change", ports);
+  });
+  ports();
+
+  // ---------- DNS builder ----------
+  function dns() {
+    var svc = $("dn-svc").value.trim() || "svc";
+    var ns = $("dn-ns").value.trim() || "default";
+    var caller = $("dn-caller").value.trim() || "default";
+    var dom = $("dn-dom").value.trim() || "cluster.local";
+    var pn = $("dn-port").value.trim();
+    var proto = $("dn-proto").value;
+    var kind = $("dn-kind").value;
+    var fqdn = svc + "." + ns + ".svc." + dom;
+    var search = [caller + ".svc." + dom, "svc." + dom, dom];
+    var out = [];
+    out.push("FQDN (A/AAAA): " + fqdn);
+    out.push("  answers with: " + (kind === "normal" ? "the Service ClusterIP (one virtual IP)" : "one record per ready Pod IP (no virtual IP)"));
+    if (pn) out.push("SRV:           _" + pn + "._" + proto + "." + fqdn);
+    out.push("");
+    out.push("Caller in namespace '" + caller + "' — resolv.conf search list:");
+    out.push("  " + search.join("  "));
+    out.push("");
+    var tries = [svc, svc + "." + ns, svc + "." + ns + ".svc", fqdn];
+    tries.forEach(function (t) {
+      var ok = false, via = "";
+      var cands = search.map(function (s) { return t + "." + s; });
+      if (t === fqdn) { ok = true; via = "already fully qualified"; }
+      else {
+        for (var i = 0; i < cands.length; i++) { if (cands[i] === fqdn) { ok = true; via = "via search '" + search[i] + "'"; break; } }
+      }
+      out.push((ok ? "✓ " : "✗ ") + (t + "                                   ").slice(0, 36) + (ok ? via : "tries " + cands[0] + " … (NXDOMAIN)"));
+    });
+    out.push("");
+    out.push("Pod record example: 10-244-1-5." + ns + ".pod." + dom);
+    $("dn-out").textContent = out.join("\n");
+  }
+  ["dn-svc", "dn-ns", "dn-caller", "dn-dom", "dn-port", "dn-proto", "dn-kind"].forEach(function (id) {
+    $(id).addEventListener("input", dns); $(id).addEventListener("change", dns);
+  });
+  dns();
+
+  // ---------- NetworkPolicy simulator ----------
+  function netpol() {
+    var deny = $("np-deny").checked, allow = $("np-allow").checked, enforce = $("np-enforce").checked;
+    var src = $("np-src").value, port = $("np-port").value;
+    var srcName = { same: "load-gen (reliability-lab)", mon: "Prometheus (monitoring)", def: "random Pod (default)", node: "kubelet on the Pod's node" }[src];
+    var why = [], allowed;
+    if (!enforce) { allowed = true; why.push("CNI does not enforce NetworkPolicy → objects exist but have no effect."); }
+    else if (src === "node") { allowed = true; why.push("Traffic to/from the node where the Pod runs is always allowed (probes keep working)."); }
+    else if (!deny && !allow) { allowed = true; why.push("No policy selects reliability-api → Pod is non-isolated → all ingress allowed."); }
+    else {
+      why.push("Pod is isolated for ingress (selected by: " + [deny ? "default-deny-ingress" : null, allow ? "allow-reliability-api" : null].filter(Boolean).join(", ") + ").");
+      if (!allow) { allowed = false; why.push("default-deny has no ingress rules; union of allowed traffic is empty."); }
+      else {
+        var peerOk = (src === "same" || src === "mon");
+        var portOk = port === "8000";
+        allowed = peerOk && portOk;
+        why.push("allow-reliability-api peers: any Pod in reliability-lab OR any Pod in namespace monitoring → " + (peerOk ? "source matches" : "source does NOT match"));
+        why.push("allowed ports: TCP 8000 → " + (portOk ? "port matches" : "port " + port + " not listed"));
+      }
+    }
+    $("np-out").textContent = srcName + " → reliability-api:" + port + "\n" + (allowed ? "✓ ALLOWED" : "✗ DROPPED (client sees a timeout)") + "\n\n" + why.join("\n");
+  }
+  ["np-deny", "np-allow", "np-enforce", "np-src", "np-port"].forEach(function (id) { $(id).addEventListener("change", netpol); });
+  netpol();
+
+  // ---------- base64 ----------
+  function b64enc(s) { return btoa(unescape(encodeURIComponent(s))); }
+  function b64dec(s) { return decodeURIComponent(escape(atob(s))); }
+  function enc() {
+    var v = $("b64-in").value; var e = b64enc(v);
+    $("b64-mid").value = e;
+    $("b64-out").textContent = "stringData:\n  UPSTREAM_TOKEN: " + v + "\n\nis stored as\n\ndata:\n  UPSTREAM_TOKEN: " + e + "\n\nNo key was used. Anyone with 'get secret' can reverse it.";
+  }
+  $("b64-enc").addEventListener("click", enc);
+  $("b64-dec").addEventListener("click", function () {
+    try { var d = b64dec($("b64-mid").value.trim()); $("b64-out").textContent = "echo '" + $("b64-mid").value.trim() + "' | base64 --decode\n→ " + d + "\n\nDecoded instantly, no secret needed. That's why encryption at rest + RBAC matter."; }
+    catch (e) { $("b64-out").textContent = "Not valid base64."; }
+  });
+  enc();
+
+  // ---------- RBAC can-i ----------
+  var rules = [
+    { res: "pods", verbs: ["get", "list", "watch", "delete"] },
+    { res: "deployments.apps", verbs: ["get", "list", "watch"] }
+  ];
+  function canI() {
+    var verb = $("rb-verb").value, res = $("rb-res").value, ns = $("rb-ns").value;
+    var sa = "system:serviceaccount:reliability-lab:experiment-runner";
+    var cmd = "kubectl auth can-i " + verb + " " + res + " --as=" + sa + " -n " + ns;
+    var ans, why;
+    if (ns !== "reliability-lab") { ans = "no"; why = "The RoleBinding lives in reliability-lab, so its grant applies only there."; }
+    else {
+      var r = rules.filter(function (x) { return x.res === res; })[0];
+      if (!r) { ans = "no"; why = res === "pods/exec" ? "pods/exec is a subresource; it needs its own rule (resources: [\"pods/exec\"])." : "No rule mentions " + res + ". RBAC is additive: unlisted = denied."; }
+      else if (r.verbs.indexOf(verb) < 0) { ans = "no"; why = "Rule for " + res + " allows only: " + r.verbs.join(", ") + "."; }
+      else { ans = "yes"; why = "Role pod-chaos → " + res + ": " + r.verbs.join(", ") + "."; }
+    }
+    $("rb-out").textContent = "$ " + cmd + "\n" + ans + "\n\n" + why;
+  }
+  ["rb-verb", "rb-res", "rb-ns"].forEach(function (id) { $(id).addEventListener("change", canI); });
+  canI();
+})();
+</script>
+</body>
+</html>

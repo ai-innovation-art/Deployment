@@ -1,0 +1,1234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 12 · AI Inference on Kubernetes — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/anim.css">
+<script src="assets/notes.js"></script>
+<script src="assets/anim.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 12 · AI Inference on Kubernetes</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="12"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 12 · AI Inference on Kubernetes</h1>
+    <p class="lede">You have built an inference engine and AI apps, so you know what happens <em>inside</em> a model server. This module is about everything <em>around</em> it: how a model server behaves as a Kubernetes workload, which numbers describe its health (TTFT, inter-token latency, tokens/s, queue depth, KV-cache usage), why batching changes everything, how GPUs are scheduled, why CPU-based autoscaling misleads you, and how to benchmark honestly with AIPerf. The running example stays the same: <code>reliability-api</code> gains an <strong>inference adapter</strong> that forwards to a model server, and the deploy → observe → scale → report workflow from Modules 06–09 is reused unchanged.</p>
+    <div class="meta"><span class="pill accent">Prereq: Modules 04, 07, 08 (11 for GPUs on GKE)</span><span class="pill">≈ 6 h study + 5 h lab</span><span class="verified">✓ Checked against official docs, 29 Oct 2026</span></div>
+    <section class="explainer" id="explainer-video"><header>🎬 Animated explainer <span class="pill accent">LLM inference: prefill, decode & batching</span></header><video controls preload="metadata" playsinline poster="videos/m12.jpg" src="videos/m12.mp4"></video><div class="ex-foot"><strong>Watch first, then read.</strong> TTFT and inter-token latency, the KV cache, continuous batching and scaling on queue depth. Rendered with Manim Community (MIT); source: <code>video-src/</code>. Facts match this page's verified sections.</div></section>
+
+
+    <div class="callout note"><span class="label">Hardware honesty</span>
+      <p>Everything in the labs runs on a laptop with <code>kind</code>: by default against a small <strong>mock model server</strong> (written below) that imitates the timing behaviour of an LLM server, and optionally against <strong>vLLM on CPU</strong> with a tiny model. GPU sections are explained in depth but not required. Numbers from a mock or a CPU run say nothing about GPU production performance — label them accordingly in every report.</p>
+    </div>
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Separate the <em>application</em> (reliability-api) from the <em>model server</em> and explain online vs batch inference.</li>
+      <li>Walk through an LLM request: queueing, prefill, first token, decode steps, KV cache, completion.</li>
+      <li>Define and compute TTFT, inter-token latency (ITL/TPOT), end-to-end latency, output tokens/s (system and per user), requests/s, queue depth, KV-cache usage and goodput.</li>
+      <li>Explain static, dynamic and continuous batching and the concurrency ↔ latency trade-off.</li>
+      <li>Schedule GPU workloads on Kubernetes: device plugins, <code>nvidia.com/gpu</code> limits, node selectors, taints/tolerations, GPU sharing options.</li>
+      <li>Design startup for large models: image size, weight loading, model cache PVCs, startup/readiness probes.</li>
+      <li>Deploy an OpenAI-compatible server (vLLM or a mock) as a Deployment and scrape its <code>/metrics</code>.</li>
+      <li>Describe KServe's InferenceService, ServingRuntime and deployment modes.</li>
+      <li>Autoscale on queue/concurrency signals with KEDA instead of CPU.</li>
+      <li>Benchmark with AIPerf using warm-up, fixed prompt sets and concurrency sweeps; keep quality evaluation separate; write a baseline-vs-candidate report.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="s-serving">Model server vs application; online vs batch</h2>
+    <p><strong>Definition.</strong> A <strong>model server</strong> is a long-running process that loads model weights into (GPU or CPU) memory once and answers inference requests over a network API — vLLM, Triton, TGI, or KServe's runtimes. The <strong>application</strong> is your business logic: auth, prompt templates, validation, retries, logging, rate limits. In this course, <code>reliability-api</code> is the application and the model server is a separate Deployment behind its own Service.</p>
+    <p><strong>Problem it solves.</strong> Model servers have a completely different resource profile: gigabytes of weights, minutes to start, accelerator-bound, and throughput that depends on batching. Keeping them separate lets you scale, upgrade and place them independently (cheap CPU nodes for the app, expensive GPU nodes for the model), and swap the model server without rewriting the app.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 330" role="img" aria-label="Inference adapter architecture: client to reliability-api to model server">
+        <defs><marker id="m12a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box" x="10" y="120" width="130" height="64" rx="8"/>
+        <text x="75" y="146" text-anchor="middle" class="t-bold">client / k6</text>
+        <text x="75" y="166" text-anchor="middle" class="t-muted">or AIPerf</text>
+        <rect class="zone" x="170" y="20" width="700" height="290" rx="12"/>
+        <text x="184" y="40" class="t-muted">namespace reliability-lab</text>
+        <rect class="box2" x="190" y="120" width="120" height="64" rx="8"/>
+        <text x="250" y="146" text-anchor="middle" class="t-bold">Service</text>
+        <text x="250" y="166" text-anchor="middle" class="t-mono">reliability-api</text>
+        <rect class="box3" x="340" y="96" width="200" height="112" rx="8"/>
+        <text x="440" y="118" text-anchor="middle" class="t-bold">reliability-api Pods</text>
+        <text x="440" y="140" text-anchor="middle" class="t-mono">/health /ready /work</text>
+        <text x="440" y="160" text-anchor="middle" class="t-mono">POST /generate (adapter)</text>
+        <text x="440" y="180" text-anchor="middle" class="t-muted">CPU nodes · HPA on CPU ok</text>
+        <text x="440" y="198" text-anchor="middle" class="t-muted">auth, validation, timeouts</text>
+        <rect class="box2" x="570" y="120" width="110" height="64" rx="8"/>
+        <text x="625" y="146" text-anchor="middle" class="t-bold">Service</text>
+        <text x="625" y="166" text-anchor="middle" class="t-mono">mock-llm</text>
+        <rect class="box4" x="710" y="80" width="145" height="144" rx="8"/>
+        <text x="782" y="102" text-anchor="middle" class="t-bold">model server</text>
+        <text x="782" y="122" text-anchor="middle" class="t-mono">vLLM / mock</text>
+        <text x="782" y="142" text-anchor="middle" class="t-muted">weights in memory</text>
+        <text x="782" y="160" text-anchor="middle" class="t-muted">KV cache · batching</text>
+        <text x="782" y="178" text-anchor="middle" class="t-muted">GPU or CPU node</text>
+        <text x="782" y="196" text-anchor="middle" class="t-mono">/v1/chat/completions</text>
+        <text x="782" y="214" text-anchor="middle" class="t-mono">/health /metrics</text>
+        <line class="line" x1="140" y1="152" x2="190" y2="152" marker-end="url(#m12a)"/>
+        <line class="line" x1="310" y1="152" x2="340" y2="152" marker-end="url(#m12a)"/>
+        <line class="line" x1="540" y1="152" x2="570" y2="152" marker-end="url(#m12a)"/>
+        <line class="line" x1="680" y1="152" x2="710" y2="152" marker-end="url(#m12a)"/>
+        <rect class="box" x="440" y="248" width="220" height="48" rx="8"/>
+        <text x="550" y="270" text-anchor="middle" class="t-bold">Prometheus (monitoring)</text>
+        <text x="550" y="288" text-anchor="middle" class="t-muted">scrapes both /metrics</text>
+        <line class="line dash" x1="470" y1="248" x2="440" y2="208" marker-end="url(#m12a)"/>
+        <line class="line dash" x1="630" y1="248" x2="740" y2="224" marker-end="url(#m12a)"/>
+      </svg>
+      <figcaption>Figure 12.1 — The inference adapter pattern. Clients keep calling reliability-api; its new <code>/generate</code> route forwards to the model server's OpenAI-compatible API. Each tier has its own Service, probes, metrics and scaling policy.</figcaption>
+    </figure>
+
+    <h3>Online vs batch inference</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>Online (real-time)</th><th>Batch (offline)</th></tr></thead>
+      <tbody>
+        <tr><td>Trigger</td><td>a user/request is waiting</td><td>a dataset/job (e.g. nightly summarisation of 1M documents)</td></tr>
+        <tr><td>Primary metric</td><td>latency percentiles (TTFT, ITL, p95 E2E) at a given load</td><td>throughput (tokens/s, cost per 1M tokens), completion time</td></tr>
+        <tr><td>Kubernetes object</td><td>Deployment + Service (+ autoscaler)</td><td>Job / CronJob / queue workers (Module 04)</td></tr>
+        <tr><td>Batching</td><td>bounded by latency SLO</td><td>as large as memory allows</td></tr>
+        <tr><td>Failure handling</td><td>timeouts, retries with budget, shed load</td><td>checkpoint and resume; idempotent items</td></tr>
+      </tbody>
+    </table></div>
+    <p>This module focuses on <strong>online</strong> serving, because it is where reliability work (probes, autoscaling, tail latency) matters most.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="s-lifecycle">The LLM request lifecycle: prefill vs decode</h2>
+    <p><strong>Definition.</strong> Autoregressive generation has two phases. <strong>Prefill</strong> processes all prompt tokens in one forward pass (highly parallel, compute-bound), writing each layer's attention keys/values into the <strong>KV cache</strong>, and produces the first output token. <strong>Decode</strong> then produces one token per step per sequence, each step reading the whole KV cache (memory-bandwidth-bound) and appending one more entry.</p>
+    <p><strong>Why an operator must care.</strong> The two phases map to different user-visible metrics (prefill + queueing → TTFT; decode → inter-token latency) and different bottlenecks. Long prompts hurt TTFT; long outputs and many concurrent sequences hurt ITL and fill the KV cache; a full KV cache forces the server to queue or preempt requests — which shows up as queue depth, not CPU.</p>
+
+    <div class="widget stepper" data-steps='[
+      {"title":"Request arrives and waits","html":"A chat request (prompt 600 tokens, max_tokens 128) reaches the model server. If all batch slots or KV-cache blocks are in use, it waits in the <strong>queue</strong>. Queue time counts toward TTFT and E2E latency but no compute happens. Metric: <code>vllm:num_requests_waiting</code>."},
+      {"title":"Prefill","html":"The scheduler admits the request. All 600 prompt tokens go through the model in parallel; their keys/values are written to the <strong>KV cache</strong>. This is compute-heavy and scales with prompt length."},
+      {"title":"First token → TTFT ends","html":"Prefill produces logits for the next token; the first token is sampled and streamed to the client. <strong>Time to first token</strong> = queue + prefill + network. Metric: <code>vllm:time_to_first_token_seconds</code>."},
+      {"title":"Decode steps","html":"Each step generates one token for every running sequence, reading the KV cache and appending one entry. The gap between streamed tokens is the <strong>inter-token latency</strong>. Metric: <code>vllm:inter_token_latency_seconds</code>."},
+      {"title":"Other requests join (continuous batching)","html":"While this request decodes, the scheduler admits newly arrived requests into the same running batch at step boundaries. More sequences per step → higher total tokens/s but each step gets a bit slower → ITL rises."},
+      {"title":"Finish and free memory","html":"Generation stops at an end-of-sequence token or <code>max_tokens</code>. KV-cache blocks are released for waiting requests. <strong>E2E latency</strong> ends at the last token. Metric: <code>vllm:e2e_request_latency_seconds</code>; tokens counted in <code>vllm:generation_tokens_total</code>."}
+    ]'>
+      <div class="w-title">Step through one streamed generation</div>
+      <svg viewBox="0 0 880 250" role="img" aria-label="Timeline of queue, prefill, first token, decode steps and KV cache growth">
+        <defs><marker id="m12b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <line class="line" x1="20" y1="120" x2="860" y2="120" marker-end="url(#m12b)"/>
+        <text x="840" y="140" class="t-muted">time</text>
+        <g data-step="0"><rect class="box3" x="30" y="80" width="110" height="36" rx="6"/><text x="85" y="103" text-anchor="middle">queue</text></g>
+        <g data-step="1,2"><rect class="box2" x="145" y="80" width="190" height="36" rx="6"/><text x="240" y="103" text-anchor="middle">prefill (600 tokens)</text></g>
+        <g data-step="2"><circle class="dot-accent" cx="340" cy="98" r="7"/><text x="340" y="70" text-anchor="middle" class="t-bold">token 1</text>
+          <path class="line accent" d="M30,52 L340,52" marker-end="url(#m12b)"/><text x="185" y="45" text-anchor="middle" class="t-muted">TTFT</text></g>
+        <g data-step="3,4,5">
+          <rect class="box4" x="352" y="84" width="38" height="28" rx="4"/><rect class="box4" x="396" y="84" width="38" height="28" rx="4"/>
+          <rect class="box4" x="440" y="84" width="38" height="28" rx="4"/><rect class="box4" x="484" y="84" width="38" height="28" rx="4"/>
+          <rect class="box4" x="528" y="84" width="38" height="28" rx="4"/><rect class="box4" x="572" y="84" width="38" height="28" rx="4"/>
+          <rect class="box4" x="616" y="84" width="38" height="28" rx="4"/><rect class="box4" x="660" y="84" width="38" height="28" rx="4"/>
+          <text x="525" y="76" text-anchor="middle" class="t-muted">decode: 1 token per step</text></g>
+        <g data-step="3"><path class="line ok" d="M396,128 L434,128"/><text x="415" y="146" text-anchor="middle" class="t-muted">ITL</text></g>
+        <g data-step="4"><rect class="box3" x="484" y="150" width="214" height="22" rx="4"/><text x="591" y="166" text-anchor="middle">request B joins batch</text></g>
+        <g data-step="5"><circle class="dot-ok" cx="708" cy="98" r="7"/><text x="760" y="103" class="t-bold">done</text>
+          <path class="line ok" d="M30,30 L708,30" marker-end="url(#m12b)"/><text x="370" y="24" text-anchor="middle" class="t-muted">E2E latency</text></g>
+        <g data-step="1,2,3,4,5"><text x="30" y="205" class="t-muted">KV cache</text>
+          <rect class="box" x="100" y="192" width="600" height="20" rx="4"/>
+          <rect class="box2" x="100" y="192" width="240" height="20" rx="4"/></g>
+        <g data-step="3,4"><rect class="box4" x="340" y="192" width="200" height="20" rx="0"/></g>
+        <g data-step="4"><rect class="box3" x="540" y="192" width="110" height="20" rx="0"/><text x="595" y="232" text-anchor="middle" class="t-muted">B's blocks</text></g>
+        <g data-step="5"><text x="400" y="232" text-anchor="middle" class="t-muted">blocks freed → waiting requests admitted</text></g>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+    <h3>The KV cache as the real capacity limit</h3>
+    <p>Each running sequence holds KV entries for <em>prompt + generated</em> tokens. Memory per token depends on layers × heads × head size × dtype, so a server has a fixed budget of tokens it can hold at once. vLLM manages this budget in fixed-size blocks (PagedAttention) and reports <code>vllm:kv_cache_usage_perc</code> (fraction of used blocks, 0–1). When it approaches 1, new requests wait (queue grows) or running ones are preempted (<code>vllm:num_preemptions</code>). This is why <strong>"how many concurrent requests can one replica take?" depends on prompt and output lengths</strong>, not just on request count.</p>
+    <details class="q"><summary>Self-check: users complain that the first word appears slowly, but once text starts it streams quickly. Which phase/metric do you investigate first?</summary><div class="a">TTFT = queueing + prefill. Check queue depth (<code>vllm:num_requests_waiting</code>, <code>vllm:request_queue_time_seconds</code>) and prompt lengths (<code>vllm:request_prompt_tokens</code>, prefill time). Fast streaming means decode/ITL is fine. Fixes: more replicas (queue), shorter prompts / prefix caching (prefill), or limiting concurrency per replica.</div></details>
+
+    <!-- ============================================================ -->
+    <h2 id="s-metrics">Inference metrics: definitions and formulas</h2>
+    <p>Generic HTTP metrics (requests/s, p95 latency) from Module 07 are necessary but not sufficient: a 2-second request that streams its first token in 150 ms feels fast; a 2-second request that shows nothing until the end feels broken. Streaming LLM APIs need token-level metrics.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 250" role="img" aria-label="Annotated timeline of a streamed response showing TTFT, ITL and E2E">
+        <defs><marker id="m12c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <line class="line" x1="40" y1="140" x2="860" y2="140" marker-end="url(#m12c)"/>
+        <circle class="dot-warn" cx="60" cy="140" r="6"/><text x="60" y="166" text-anchor="middle" class="t-mono">t_send</text>
+        <circle class="dot-accent" cx="300" cy="140" r="6"/><text x="300" y="166" text-anchor="middle" class="t-mono">t_tok1</text>
+        <circle class="dot-accent" cx="380" cy="140" r="5"/><circle class="dot-accent" cx="460" cy="140" r="5"/>
+        <circle class="dot-accent" cx="540" cy="140" r="5"/><circle class="dot-accent" cx="620" cy="140" r="5"/>
+        <circle class="dot-accent" cx="700" cy="140" r="5"/><circle class="dot-ok" cx="780" cy="140" r="6"/>
+        <text x="780" y="166" text-anchor="middle" class="t-mono">t_last</text>
+        <path class="line accent" d="M60,100 L300,100" marker-end="url(#m12c)"/><path class="line accent" d="M300,100 L60,100" marker-end="url(#m12c)"/>
+        <text x="180" y="92" text-anchor="middle" class="t-bold">TTFT = t_tok1 − t_send</text>
+        <path class="line ok" d="M300,118 L380,118" marker-end="url(#m12c)"/>
+        <text x="340" y="112" text-anchor="middle" class="t-muted">ITL</text>
+        <path class="line" d="M60,50 L780,50" marker-end="url(#m12c)"/><path class="line" d="M780,50 L60,50" marker-end="url(#m12c)"/>
+        <text x="420" y="42" text-anchor="middle" class="t-bold">E2E (request latency) = t_last − t_send</text>
+        <text x="540" y="200" text-anchor="middle" class="t-muted">N output tokens ⇒ ITL = (E2E − TTFT) / (N − 1)</text>
+        <text x="540" y="220" text-anchor="middle" class="t-muted">per-user tokens/s = 1 / ITL ; queue + prefill live inside TTFT</text>
+      </svg>
+      <figcaption>Figure 12.2 — A streamed response measured from the client. Server-side histograms (vLLM) exclude network time; client-side tools (AIPerf) include it. Always state which side you measured.</figcaption>
+    </figure>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Metric</th><th>Definition / formula</th><th>What moves it</th><th>vLLM server metric</th><th>AIPerf (client) name</th></tr></thead>
+      <tbody>
+        <tr><td><strong>TTFT</strong></td><td><code>t_first_token − t_send</code></td><td>queueing, prompt length (prefill), network</td><td><code>vllm:time_to_first_token_seconds</code> (histogram)</td><td>Time to First Token</td></tr>
+        <tr><td><strong>ITL</strong> (inter-token latency)</td><td>mean gap between tokens: <code>(E2E − TTFT) / (N_out − 1)</code></td><td>batch size per step, model size, memory bandwidth</td><td><code>vllm:inter_token_latency_seconds</code></td><td>Inter Token Latency</td></tr>
+        <tr><td><strong>TPOT</strong> (time per output token)</td><td>per request, decode time ÷ generated tokens (≈ ITL; definitions differ by tool — check)</td><td>same as ITL</td><td><code>vllm:request_time_per_output_token_seconds</code></td><td>—</td></tr>
+        <tr><td><strong>E2E latency</strong></td><td><code>t_last_token − t_send</code></td><td>TTFT + N_out × ITL</td><td><code>vllm:e2e_request_latency_seconds</code></td><td>Request Latency</td></tr>
+        <tr><td><strong>Output tokens/s (system)</strong></td><td><code>Σ output tokens ÷ benchmark duration</code></td><td>batching, replicas</td><td><code>rate(vllm:generation_tokens_total[1m])</code></td><td>Output Token Throughput</td></tr>
+        <tr><td><strong>Output tokens/s per user</strong></td><td><code>1 / ITL</code></td><td>inverse of ITL</td><td>—</td><td>Output Token Throughput Per User</td></tr>
+        <tr><td><strong>Requests/s</strong></td><td><code>completed requests ÷ duration</code>; with Little's law <code>λ = L / W</code> (L = in-flight, W = E2E)</td><td>everything</td><td><code>rate(vllm:request_success_total[1m])</code></td><td>Request Throughput</td></tr>
+        <tr><td><strong>Queue depth</strong></td><td>requests admitted to the server but not yet running</td><td>load vs capacity, KV-cache space</td><td><code>vllm:num_requests_waiting</code> (gauge); running: <code>vllm:num_requests_running</code></td><td>— (server metric)</td></tr>
+        <tr><td><strong>KV-cache usage</strong></td><td>fraction of KV blocks in use (0–1)</td><td>concurrency × (prompt + output) length</td><td><code>vllm:kv_cache_usage_perc</code></td><td>—</td></tr>
+        <tr><td><strong>Goodput</strong></td><td>requests/s that <em>met</em> the SLO (e.g. TTFT ≤ 500 ms and ITL ≤ 50 ms)</td><td>the business-relevant throughput</td><td>—</td><td>Goodput (<code>good_request_count / duration</code>)</td></tr>
+      </tbody>
+    </table></div>
+    <p>vLLM metric names above were taken from the vLLM metrics design page and the current source of its Prometheus logger (29 Oct 2026). Counters are exported with a <code>_total</code> suffix (<code>vllm:prompt_tokens_total</code>, <code>vllm:generation_tokens_total</code>, <code>vllm:request_success_total</code>). Names change between versions (e.g. older <code>gpu_cache_usage_perc</code> vs current <code>kv_cache_usage_perc</code>) — always <code>curl /metrics</code> on <em>your</em> version before writing PromQL.</p>
+
+    <h3>Why averages lie (again)</h3>
+    <p>Module 08's lesson applies doubly: report p50/p90/p99 of TTFT and ITL, not means. A server can have a fine mean TTFT while 5% of requests wait seconds in the queue. And never average percentiles across replicas — aggregate histogram buckets, then compute quantiles:</p>
+<pre data-title="PromQL — p95 TTFT across all model-server replicas"><code>histogram_quantile(0.95,
+  sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))</code></pre>
+
+    <div class="widget" id="w-calc">
+      <div class="w-title">Inference metrics calculator</div>
+      <div class="w-sub">Enter what a client observed for a typical request plus average concurrency. The calculator applies the formulas above and Little's law (in-flight = arrival rate × latency) for a steady state.</div>
+      <div class="row">
+        <label style="flex:1">TTFT (ms) <input type="number" id="c-ttft" value="350" min="0"></label>
+        <label style="flex:1">E2E latency (ms) <input type="number" id="c-e2e" value="4200" min="0"></label>
+        <label style="flex:1">Output tokens N <input type="number" id="c-n" value="128" min="1"></label>
+      </div>
+      <div class="row">
+        <label style="flex:1">Prompt tokens <input type="number" id="c-p" value="600" min="0"></label>
+        <label style="flex:1">Concurrency (in-flight) <input type="number" id="c-c" value="8" min="1"></label>
+        <label style="flex:1">SLO TTFT ≤ (ms) <input type="number" id="c-sttft" value="500" min="0"></label>
+        <label style="flex:1">SLO ITL ≤ (ms) <input type="number" id="c-sitl" value="40" min="0"></label>
+      </div>
+      <div class="out" id="c-out"></div>
+    </div>
+
+    <details class="q"><summary>Self-check: run A shows 900 output tokens/s; run B shows 1,400 tokens/s. B is "better", right?</summary><div class="a">Not necessarily. B may achieve higher system throughput by running more concurrent sequences, which raises ITL and TTFT per user. Compare at a fixed latency SLO (goodput), and check per-user tokens/s, p95 TTFT/ITL, error rate and that both runs used the same prompts, lengths and concurrency.</div></details>
+
+    <!-- ============================================================ -->
+    <h2 id="s-batching">Batching: static, dynamic, continuous</h2>
+    <p><strong>Definition.</strong> Batching runs several requests through the model in the same forward pass. Accelerators are far more efficient on a batch than on a single sequence, because weight reads from memory are amortised across sequences.</p>
+    <p><strong>Problem it solves.</strong> Serving one request at a time leaves most of a GPU idle and makes tokens/s (and cost per token) terrible. The question is <em>how</em> to form batches without making individual users wait too long.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 400" role="img" aria-label="Static, dynamic and continuous batching compared">
+        <text x="20" y="22" class="t-bold">Static batching</text>
+        <text x="200" y="22" class="t-muted">batch of 4 starts together; slots idle until the longest finishes</text>
+        <rect class="box2" x="20" y="34" width="180" height="16" rx="3"/><rect class="box2" x="20" y="54" width="400" height="16" rx="3"/>
+        <rect class="box2" x="20" y="74" width="120" height="16" rx="3"/><rect class="box2" x="20" y="94" width="260" height="16" rx="3"/>
+        <rect class="box" x="200" y="34" width="220" height="16" rx="3"/><rect class="box" x="140" y="74" width="280" height="16" rx="3"/><rect class="box" x="280" y="94" width="140" height="16" rx="3"/>
+        <text x="310" y="46" text-anchor="middle" class="t-muted">idle</text>
+        <rect class="box3" x="430" y="34" width="200" height="16" rx="3"/><rect class="box3" x="430" y="54" width="150" height="16" rx="3"/>
+        <text x="650" y="66" class="t-muted">next batch waits for whole batch</text>
+        <text x="20" y="152" class="t-bold">Dynamic batching</text>
+        <text x="200" y="152" class="t-muted">wait up to a window (or max size) to collect requests, then run as a batch</text>
+        <rect class="box3" x="20" y="164" width="60" height="16" rx="3"/><text x="50" y="200" text-anchor="middle" class="t-muted">window</text>
+        <rect class="box2" x="80" y="164" width="200" height="16" rx="3"/><rect class="box2" x="80" y="184" width="320" height="16" rx="3"/>
+        <rect class="box" x="280" y="164" width="120" height="16" rx="3"/>
+        <rect class="box3" x="400" y="164" width="60" height="16" rx="3"/>
+        <rect class="box2" x="460" y="164" width="240" height="16" rx="3"/><rect class="box2" x="460" y="184" width="160" height="16" rx="3"/>
+        <text x="720" y="196" class="t-muted">good for fixed-size</text>
+        <text x="720" y="212" class="t-muted">non-generative models</text>
+        <text x="20" y="262" class="t-bold">Continuous (in-flight) batching</text>
+        <text x="250" y="262" class="t-muted">batch membership changes at every decode step</text>
+        <rect class="box4" x="20" y="274" width="180" height="16" rx="3"/><rect class="box4" x="204" y="274" width="200" height="16" rx="3"/><rect class="box4" x="408" y="274" width="260" height="16" rx="3"/>
+        <rect class="box4" x="20" y="294" width="400" height="16" rx="3"/><rect class="box4" x="424" y="294" width="180" height="16" rx="3"/>
+        <rect class="box4" x="20" y="314" width="120" height="16" rx="3"/><rect class="box4" x="144" y="314" width="220" height="16" rx="3"/><rect class="box4" x="368" y="314" width="300" height="16" rx="3"/>
+        <rect class="box4" x="20" y="334" width="260" height="16" rx="3"/><rect class="box4" x="284" y="334" width="160" height="16" rx="3"/><rect class="box4" x="448" y="334" width="200" height="16" rx="3"/>
+        <text x="690" y="300" class="t-muted">a finished sequence's</text>
+        <text x="690" y="316" class="t-muted">slot is refilled at the</text>
+        <text x="690" y="332" class="t-muted">next step: no idle slots</text>
+        <text x="20" y="385" class="t-muted">Each bar = one request occupying a batch slot over time. Plain boxes = wasted slot time. vLLM uses continuous batching.</text>
+      </svg>
+      <figcaption>Figure 12.3 — Static batching wastes slots on short outputs; dynamic batching adds a collection delay; continuous batching (used by LLM servers such as vLLM) admits and evicts sequences at decode-step granularity.</figcaption>
+    </figure>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Strategy</th><th>How it works</th><th>Strength</th><th>Weakness</th></tr></thead>
+      <tbody>
+        <tr><td>Static</td><td>fixed batch formed by the caller/client; runs to completion</td><td>simple; fine for offline jobs with equal-length items</td><td>output lengths vary wildly for LLMs → idle slots; head-of-line blocking</td></tr>
+        <tr><td>Dynamic</td><td>server collects requests for up to <em>T</em> ms or <em>B</em> items, then runs them</td><td>great for fixed-shape models (classifiers, embeddings)</td><td>adds up to <em>T</em> ms latency; still static once started</td></tr>
+        <tr><td>Continuous</td><td>scheduler re-forms the batch every decode step; new requests prefill and join</td><td>highest utilisation for generation</td><td>more sequences per step → each step slower (ITL ↑); KV cache becomes the limit</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Server knobs (vLLM examples):</strong> <code>--max-num-seqs</code> (max sequences per step), <code>--max-num-batched-tokens</code> (token budget per step), <code>--enable-chunked-prefill</code> (split long prefills so they do not stall decodes; the vLLM Kubernetes GPU example uses it). Defaults and availability vary by version — check <code>vllm serve --help</code>.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="s-tradeoff">Concurrency vs latency: the core trade-off</h2>
+    <p>More concurrent requests per replica means bigger batches: <strong>throughput goes up, then flattens</strong> (the batch or KV cache is full), while <strong>per-request latency goes up</strong> — slowly at first (each step a little slower), then sharply (requests start queueing). The knee of that curve is the replica's useful capacity, and it is what your autoscaler target should be based on.</p>
+
+    <div class="widget" id="w-toy">
+      <div class="w-title">Concurrency ↔ latency visualiser — a TOY model</div>
+      <div class="w-sub"><strong>Illustrative only.</strong> A deliberately simple closed-loop model: each decode step costs <em>d₀·(1 + k·(active−1))</em> ms; at most <em>B</em> sequences run; extra clients queue. Real servers differ (chunked prefill, preemption, memory limits). Use it to build intuition, never to predict capacity — measure that with AIPerf.</div>
+      <div class="row">
+        <label style="flex:1">Concurrency C: <span id="t-cv"></span><input type="range" id="t-c" min="1" max="64" value="8"></label>
+        <label style="flex:1">Max batch B: <span id="t-bv"></span><input type="range" id="t-b" min="1" max="48" value="16"></label>
+      </div>
+      <div class="row">
+        <label style="flex:1">Step base d₀ (ms) <input type="number" id="t-d" value="25" min="1"></label>
+        <label style="flex:1">Per-seq slowdown k <input type="number" id="t-k" value="0.06" step="0.01" min="0"></label>
+        <label style="flex:1">Prefill (ms) <input type="number" id="t-p" value="200" min="0"></label>
+        <label style="flex:1">Output tokens <input type="number" id="t-n" value="128" min="1"></label>
+      </div>
+      <svg id="t-svg" viewBox="0 0 720 260" role="img" aria-label="Toy model chart of latency and throughput versus concurrency"></svg>
+      <div class="out" id="t-out"></div>
+    </div>
+    <p><strong>What to notice:</strong> below B, throughput rises almost linearly while latency rises gently — free capacity. Above B, throughput is flat and every extra client only adds queueing delay (TTFT explodes first). Production lesson for reliability-api: <em>cap concurrency per model-server replica near the knee and add replicas</em> rather than letting one replica queue endlessly.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="s-gpu">CPU vs GPU on Kubernetes</h2>
+    <p><strong>Definition.</strong> Kubernetes natively understands CPU and memory. GPUs are <em>extended resources</em> advertised by a vendor <strong>device plugin</strong>. Per the Kubernetes "Schedule GPUs" task page: the administrator installs vendor drivers on nodes and runs the vendor's device plugin; Pods then request e.g. <code>nvidia.com/gpu</code> or <code>amd.com/gpu</code>.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 340" role="img" aria-label="GPU scheduling with a device plugin">
+        <defs><marker id="m12d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="330" y="14" width="530" height="312" rx="12"/>
+        <text x="344" y="34" class="t-muted">GPU node (label accelerator=…, taint nvidia.com/gpu…)</text>
+        <rect class="box4" x="350" y="250" width="110" height="56" rx="6"/><text x="405" y="274" text-anchor="middle" class="t-bold">GPU 0</text><text x="405" y="292" text-anchor="middle" class="t-muted">driver</text>
+        <rect class="box4" x="470" y="250" width="110" height="56" rx="6"/><text x="525" y="274" text-anchor="middle" class="t-bold">GPU 1</text><text x="525" y="292" text-anchor="middle" class="t-muted">driver</text>
+        <rect class="box3" x="350" y="54" width="230" height="64" rx="8"/>
+        <text x="465" y="78" text-anchor="middle" class="t-bold">device plugin (DaemonSet)</text>
+        <text x="465" y="98" text-anchor="middle" class="t-muted">discovers GPUs, registers</text>
+        <rect class="box2" x="350" y="146" width="230" height="74" rx="8"/>
+        <text x="465" y="170" text-anchor="middle" class="t-bold">kubelet</text>
+        <text x="465" y="190" text-anchor="middle" class="t-mono">allocatable:</text>
+        <text x="465" y="208" text-anchor="middle" class="t-mono">nvidia.com/gpu: 2</text>
+        <line class="line" x1="465" y1="118" x2="465" y2="146" marker-end="url(#m12d)"/>
+        <line class="line dash" x1="465" y1="250" x2="465" y2="220"/>
+        <rect class="box3" x="620" y="130" width="220" height="110" rx="8"/>
+        <text x="730" y="152" text-anchor="middle" class="t-bold">model-server Pod</text>
+        <text x="730" y="172" text-anchor="middle" class="t-mono">limits: nvidia.com/gpu: 1</text>
+        <text x="730" y="192" text-anchor="middle" class="t-mono">nodeSelector / toleration</text>
+        <text x="730" y="212" text-anchor="middle" class="t-muted">device + libs injected</text>
+        <text x="730" y="228" text-anchor="middle" class="t-muted">at container start</text>
+        <line class="line ok" x1="580" y1="183" x2="620" y2="183" marker-end="url(#m12d)"/>
+        <rect class="box2" x="20" y="54" width="270" height="74" rx="8"/>
+        <text x="155" y="78" text-anchor="middle" class="t-bold">API server / node status</text>
+        <text x="155" y="98" text-anchor="middle" class="t-muted">node reports capacity for</text>
+        <text x="155" y="116" text-anchor="middle" class="t-mono">nvidia.com/gpu</text>
+        <rect class="box2" x="20" y="166" width="270" height="94" rx="8"/>
+        <text x="155" y="190" text-anchor="middle" class="t-bold">scheduler</text>
+        <text x="155" y="210" text-anchor="middle" class="t-muted">filter: free GPUs ≥ request,</text>
+        <text x="155" y="228" text-anchor="middle" class="t-muted">nodeSelector matches, taint</text>
+        <text x="155" y="246" text-anchor="middle" class="t-muted">tolerated → bind Pod to node</text>
+        <line class="line" x1="350" y1="183" x2="290" y2="100" marker-end="url(#m12d)"/>
+        <line class="line" x1="155" y1="128" x2="155" y2="166" marker-end="url(#m12d)"/>
+        <path class="line accent" d="M290,230 C 450,330 600,300 700,240" marker-end="url(#m12d)"/>
+        <text x="420" y="324" class="t-muted">bind</text>
+      </svg>
+      <figcaption>Figure 12.4 — The device plugin advertises GPUs to the kubelet, which reports them as allocatable; the scheduler places Pods that request <code>nvidia.com/gpu</code> only on nodes with free GPUs and matching selectors/tolerations.</figcaption>
+    </figure>
+
+    <h3>Rules for GPU resources (from kubernetes.io)</h3>
+    <ul>
+      <li>GPUs "are only supposed to be specified in the <code>limits</code> section": you may set only a limit (the request defaults to it); if you set both they must be equal; you cannot set a request without a limit.</li>
+      <li>GPUs are whole integers per container in this model — no <code>0.5</code> GPU. Sharing is done by other mechanisms (below).</li>
+      <li>Label GPU nodes (e.g. <code>kubectl label nodes node1 accelerator=example-gpu-x100</code>) and use <code>nodeSelector</code>/affinity to target a GPU type; the page recommends Node Feature Discovery to label automatically.</li>
+    </ul>
+<pre data-title="GPU Pod spec fragment (Standard cluster with labelled, tainted GPU pool)"><code>spec:
+  nodeSelector:
+    accelerator: example-gpu-x100        <span class="c"># your label (or cloud provider label)</span>
+  tolerations:
+  - key: nvidia.com/gpu                  <span class="c"># match the taint your platform applies</span>
+    operator: Exists
+    effect: NoSchedule
+  containers:
+  - name: model-server
+    image: vllm/vllm-openai:&lt;pinned-version&gt;
+    resources:
+      limits:
+        nvidia.com/gpu: 1                <span class="c"># request defaults to the limit</span>
+        memory: 20Gi
+      requests:
+        cpu: "2"
+        memory: 6Gi</code></pre>
+    <p><strong>Why taints?</strong> GPU nodes are expensive. Tainting them (commonly with a key like <code>nvidia.com/gpu</code>, effect <code>NoSchedule</code>) keeps reliability-api and other CPU Pods off them; only Pods with a matching toleration land there. Check the actual taint with <code>kubectl describe node</code>.</p>
+    <p><strong>On GKE Autopilot</strong> (Module 11), you instead set <code>nodeSelector: cloud.google.com/gke-accelerator: "nvidia-tesla-t4"</code> (for example) plus <code>limits: nvidia.com/gpu: 1</code>; Autopilot installs default NVIDIA drivers, and GPU Pods use the node-based billing model. Both type and quantity are required. GPU availability and quotas vary by region — and GPUs are the fastest way to an unpleasant bill.</p>
+
+    <h3>GPU sharing options (brief)</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Option</th><th>Isolation</th><th>Good for</th></tr></thead>
+      <tbody>
+        <tr><td>Multi-Instance GPU (MIG)</td><td>hardware partitions (up to seven on supported GPUs) with dedicated compute/memory</td><td>several small inference servers needing predictable latency</td></tr>
+        <tr><td>Time-sharing</td><td>software; context switching between processes on one GPU</td><td>bursty/interactive, dev/test, tolerant of latency variation</td></tr>
+        <tr><td>NVIDIA MPS</td><td>software; cooperative concurrent CUDA processes with limits</td><td>batch/small jobs</td></tr>
+        <tr><td>Dynamic Resource Allocation (DRA)</td><td>Kubernetes API for richer device requests</td><td>newer clusters/drivers; see Kubernetes DRA docs</td></tr>
+      </tbody>
+    </table></div>
+    <h3>CPU inference</h3>
+    <p>Small models (sub-1B parameters) run on CPU, slowly — perfectly adequate for <em>learning the operational workflow</em>. vLLM's own Kubernetes guide notes its CPU deployment is "for demonstration and testing purposes only". Treat CPU results as functional tests, not performance claims.</p>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>Pod Pending: <code>Insufficient nvidia.com/gpu</code></strong> — no free GPU, device plugin not running, or node not ready. <code>kubectl describe node | grep -A5 Allocatable</code>.</li>
+      <li><strong>Pending: untolerated taint</strong> — add the toleration. <strong>Pending: node affinity mismatch</strong> — label typo.</li>
+      <li><strong>CUDA errors at start</strong> — driver/CUDA version mismatch between node driver and image.</li>
+      <li><strong>OOMKilled</strong> — host memory limit too small for weight loading (weights often pass through host RAM). GPU OOM appears in logs, not as OOMKilled.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="s-startup">Model weights, startup and probes</h2>
+    <p><strong>Problem.</strong> reliability-api starts in under a second. A model server may need minutes: pull a multi-GB image, download several GB of weights, load them into memory, allocate the KV cache, compile/warm kernels. Module 04 probe defaults would kill it long before it is ready, and a rolling update could route traffic to Pods that cannot answer.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 270" role="img" aria-label="Model server startup timeline and probe coverage">
+        <defs><marker id="m12e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box" x="20" y="40" width="70" height="44" rx="6"/><text x="55" y="66" text-anchor="middle">schedule</text>
+        <rect class="box3" x="90" y="40" width="170" height="44" rx="6"/><text x="175" y="60" text-anchor="middle" class="t-bold">image pull</text><text x="175" y="76" text-anchor="middle" class="t-muted">multi-GB layers</text>
+        <rect class="box3" x="260" y="40" width="200" height="44" rx="6"/><text x="360" y="60" text-anchor="middle" class="t-bold">weights download</text><text x="360" y="76" text-anchor="middle" class="t-muted">skip if PVC cache hit</text>
+        <rect class="box2" x="460" y="40" width="150" height="44" rx="6"/><text x="535" y="60" text-anchor="middle" class="t-bold">load + KV alloc</text><text x="535" y="76" text-anchor="middle" class="t-muted">RAM / GPU memory</text>
+        <rect class="box2" x="610" y="40" width="110" height="44" rx="6"/><text x="665" y="66" text-anchor="middle">warm-up</text>
+        <rect class="box4" x="720" y="40" width="140" height="44" rx="6"/><text x="790" y="66" text-anchor="middle" class="t-bold">serving</text>
+        <line class="line" x1="20" y1="110" x2="860" y2="110" marker-end="url(#m12e)"/>
+        <rect class="box" x="90" y="128" width="40" height="22" rx="4"/><text x="110" y="166" text-anchor="middle" class="t-muted">no probes</text>
+        <text x="60" y="144" text-anchor="middle" class="t-muted">kubelet:</text>
+        <path class="line accent" d="M260,140 L720,140" marker-end="url(#m12e)"/>
+        <text x="490" y="132" text-anchor="middle" class="t-bold">startupProbe GET /health (allow e.g. 30 × 10 s)</text>
+        <path class="line ok" d="M720,180 L860,180" marker-end="url(#m12e)"/>
+        <text x="790" y="172" text-anchor="middle" class="t-muted">readiness + liveness</text>
+        <text x="20" y="206" class="t-muted">Probes run only once the container is running; liveness/readiness wait for the startupProbe.</text>
+        <text x="20" y="226" class="t-muted">Readiness gates Service traffic: a Pod still loading weights gets none.</text>
+        <text x="20" y="246" class="t-muted">Shorten the left part: node image caching, smaller images, a model-cache PVC.</text>
+      </svg>
+      <figcaption>Figure 12.5 — Startup of a model server. The startupProbe protects the slow middle; readiness keeps traffic away until the model is loaded; liveness only starts afterwards.</figcaption>
+    </figure>
+
+    <h3>Techniques</h3>
+    <ul>
+      <li><strong>startupProbe with a generous budget</strong>: <code>failureThreshold × periodSeconds</code> ≥ worst-case load time (e.g. 60 × 10 s = 10 min for big models). Once it succeeds, liveness can be strict.</li>
+      <li><strong>Readiness that means "can generate"</strong>: vLLM exposes <code>/health</code> (the vLLM Kubernetes example uses it for both probes). Our mock returns 503 until "weights are loaded", like reliability-api's <code>READY_DELAY_SECONDS</code>.</li>
+      <li><strong>Model cache on a PVC</strong>: mount a PersistentVolumeClaim at the Hugging Face cache path (<code>/root/.cache/huggingface</code> in the vLLM examples) so restarts skip the download. With <code>ReadWriteOnce</code> volumes only one node can mount it; for many replicas use read-only-many storage, pre-baked node images, or per-replica caches (KServe offers <code>LocalModelCache</code> resources for this).</li>
+      <li><strong>Do not bake weights into the image</strong> unless they are small: a 15 GB image slows every pull, every node, every rollout. Keep images lean and load weights from a cache.</li>
+      <li><strong>Rollouts</strong>: with slow startup, use <code>maxUnavailable: 0</code>, <code>maxSurge: 1</code> (Module 04) — and remember the surge Pod needs a whole extra GPU.</li>
+      <li><strong>Shared memory</strong>: tensor-parallel inference needs <code>/dev/shm</code>; the vLLM GPU example mounts an <code>emptyDir</code> with <code>medium: Memory</code>.</li>
+    </ul>
+<pre data-title="Probe block for a model server"><code>startupProbe:
+  httpGet: { path: /health, port: 8000 }
+  periodSeconds: 10
+  failureThreshold: 60          <span class="c"># up to 10 minutes to load</span>
+readinessProbe:
+  httpGet: { path: /health, port: 8000 }
+  periodSeconds: 5
+  failureThreshold: 3
+livenessProbe:
+  httpGet: { path: /health, port: 8000 }
+  periodSeconds: 10
+  failureThreshold: 6           <span class="c"># tolerate short stalls under heavy batches</span></code></pre>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>Restart loop during load</strong>: liveness (or a too-short startupProbe) kills the container mid-load. Symptom: <code>RESTARTS</code> climbs, logs end mid-download. vLLM's k8s troubleshooting section describes probe failures with "KeyboardInterrupt: terminated" in logs — that is the kubelet's SIGTERM.</li>
+      <li><strong>Liveness failing under load</strong>: a saturated server responds slowly to <code>/health</code>; kubelet restarts it, dropping every in-flight generation and making overload worse. Give liveness a generous timeout/threshold.</li>
+      <li><strong>Disk pressure / evictions</strong>: weights downloaded to the container filesystem fill node ephemeral storage. Use a PVC or set ephemeral-storage requests.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="s-vllm">vLLM: an OpenAI-compatible model server</h2>
+    <p>vLLM implements OpenAI-style HTTP APIs (<code>/v1/completions</code>, <code>/v1/chat/completions</code>, <code>/v1/models</code>, embeddings and more) and exposes Prometheus metrics at <code>/metrics</code> on the same port (8000 by default). Start it with <code>vllm serve &lt;model&gt;</code>:</p>
+<pre data-title="vLLM — local start, from the docs"><code>vllm serve NousResearch/Meta-Llama-3-8B-Instruct --dtype auto --api-key token-abc123
+curl http://localhost:8000/metrics       <span class="c"># Prometheus text format, vllm:* series</span></code></pre>
+    <div class="callout warn"><span class="label">Security note from the vLLM docs</span>
+      <p><code>--api-key</code> only protects endpoints under <code>/v1</code>, <code>/v2</code> and <code>/inference</code>; other endpoints on the same server (e.g. <code>/invocations</code>) are not authenticated. Do not expose vLLM directly — keep it a ClusterIP Service behind reliability-api or a gateway, and add NetworkPolicy (Module 05) so only reliability-api can reach it.</p>
+    </div>
+    <h3>Key metrics to scrape</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Metric</th><th>Type</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td><code>vllm:num_requests_running</code></td><td>gauge</td><td>sequences in the current batch — concurrency per replica</td></tr>
+        <tr><td><code>vllm:num_requests_waiting</code></td><td>gauge</td><td>queue depth — best scale-out signal</td></tr>
+        <tr><td><code>vllm:kv_cache_usage_perc</code></td><td>gauge (0–1)</td><td>memory pressure; near 1 → queueing/preemption</td></tr>
+        <tr><td><code>vllm:time_to_first_token_seconds</code></td><td>histogram</td><td>TTFT SLI</td></tr>
+        <tr><td><code>vllm:inter_token_latency_seconds</code></td><td>histogram</td><td>ITL SLI</td></tr>
+        <tr><td><code>vllm:e2e_request_latency_seconds</code></td><td>histogram</td><td>E2E latency</td></tr>
+        <tr><td><code>vllm:request_queue_time_seconds</code></td><td>histogram</td><td>time spent waiting</td></tr>
+        <tr><td><code>vllm:prompt_tokens_total</code>, <code>vllm:generation_tokens_total</code></td><td>counters</td><td>input/output tokens/s via <code>rate()</code></td></tr>
+        <tr><td><code>vllm:request_success_total</code></td><td>counter (label: finish reason)</td><td>completed requests/s</td></tr>
+        <tr><td><code>vllm:num_preemptions_total</code></td><td>counter</td><td>KV-cache pressure events</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>The mock model server (default for labs)</h3>
+    <p>To learn the operational workflow without GPUs or multi-GB downloads, we use <code>mock-llm</code>: a ~90-line FastAPI app that speaks the OpenAI chat API (including SSE streaming), simulates weight loading, prefill and decode with a bounded batch, and exports Prometheus metrics with names modelled on (but deliberately <em>not identical to</em>) vLLM's, so nobody mistakes mock numbers for vLLM numbers.</p>
+<pre data-title="mock-llm/mock_llm.py"><code>import asyncio, json, os, time, uuid
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+MAX_BATCH = int(os.getenv("MAX_BATCH", "8"))                      <span class="c"># sequences decoded together</span>
+PREFILL_MS_PER_TOKEN = float(os.getenv("PREFILL_MS_PER_TOKEN", "0.5"))
+DECODE_STEP_MS = float(os.getenv("DECODE_STEP_MS", "25"))         <span class="c"># step time with 1 running sequence</span>
+STEP_COST_PER_SEQ = float(os.getenv("STEP_COST_PER_SEQ", "0.06")) <span class="c"># slowdown per extra running sequence</span>
+LOAD_SECONDS = float(os.getenv("LOAD_SECONDS", "20"))             <span class="c"># simulated weight loading</span>
+
+RUNNING = Gauge("mockllm_num_requests_running", "Sequences in prefill/decode")
+WAITING = Gauge("mockllm_num_requests_waiting", "Requests waiting for a batch slot")
+TTFT = Histogram("mockllm_time_to_first_token_seconds", "Server-side TTFT",
+                 buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30))
+E2E = Histogram("mockllm_e2e_request_latency_seconds", "Server-side E2E latency",
+                buckets=(0.5, 1, 2, 5, 10, 20, 40, 80))
+GEN_TOKENS = Counter("mockllm_generation_tokens", "Generated tokens")
+PROMPT_TOKENS = Counter("mockllm_prompt_tokens", "Prompt tokens")
+
+app = FastAPI()
+STARTED = time.monotonic()
+slots = asyncio.Semaphore(MAX_BATCH)
+running = 0
+
+
+def loaded() -&gt; bool:
+    return time.monotonic() - STARTED &gt;= LOAD_SECONDS
+
+
+async def generate(prompt_tokens: int, max_tokens: int):
+    """Yield tokens with LLM-like timing: queue, prefill, then decode steps."""
+    global running
+    t0 = time.perf_counter()
+    PROMPT_TOKENS.inc(prompt_tokens)
+    WAITING.inc()
+    await slots.acquire()                       <span class="c"># queue until a batch slot is free</span>
+    WAITING.dec()
+    RUNNING.inc()
+    running += 1
+    try:
+        await asyncio.sleep(prompt_tokens * PREFILL_MS_PER_TOKEN / 1000)   <span class="c"># prefill</span>
+        TTFT.observe(time.perf_counter() - t0)
+        GEN_TOKENS.inc()
+        yield "tok0 "                           <span class="c"># first token comes out of prefill</span>
+        for i in range(1, max_tokens):
+            step_ms = DECODE_STEP_MS * (1 + STEP_COST_PER_SEQ * (running - 1))
+            await asyncio.sleep(step_ms / 1000)  <span class="c"># one decode step</span>
+            GEN_TOKENS.inc()
+            yield f"tok{i} "
+    finally:
+        running -= 1
+        RUNNING.dec()
+        slots.release()
+        E2E.observe(time.perf_counter() - t0)
+
+
+@app.get("/health")
+def health():
+    if not loaded():
+        return JSONResponse({"status": "loading"}, status_code=503)
+    return {"status": "ok"}
+
+
+@app.get("/v1/models")
+def models():
+    return {"object": "list", "data": [{"id": "mock-llm", "object": "model"}]}
+
+
+@app.post("/v1/chat/completions")
+async def chat(req: Request):
+    if not loaded():
+        return JSONResponse({"error": {"message": "model loading"}}, status_code=503)
+    body = await req.json()
+    text = " ".join(str(m.get("content", "")) for m in body.get("messages", []))
+    prompt_tokens = max(1, len(text.split()))   <span class="c"># crude: 1 word = 1 token</span>
+    max_tokens = int(body.get("max_tokens") or body.get("max_completion_tokens") or 64)
+    model = body.get("model", "mock-llm")
+    rid = "chatcmpl-" + uuid.uuid4().hex[:12]
+
+    if body.get("stream"):
+        async def sse():
+            async for tok in generate(prompt_tokens, max_tokens):
+                chunk = {"id": rid, "object": "chat.completion.chunk", "created": int(time.time()),
+                         "model": model,
+                         "choices": [{"index": 0, "delta": {"content": tok}, "finish_reason": None}]}
+                yield f"data: {json.dumps(chunk)}\n\n"
+            done = {"id": rid, "object": "chat.completion.chunk", "created": int(time.time()),
+                    "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+            yield f"data: {json.dumps(done)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(sse(), media_type="text/event-stream")
+
+    out = [tok async for tok in generate(prompt_tokens, max_tokens)]
+    return {"id": rid, "object": "chat.completion", "created": int(time.time()), "model": model,
+            "choices": [{"index": 0, "finish_reason": "length",
+                         "message": {"role": "assistant", "content": "".join(out)}}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": len(out),
+                      "total_tokens": prompt_tokens + len(out)}}
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)</code></pre>
+<pre data-title="mock-llm/Dockerfile"><code>FROM python:3.12-slim
+RUN useradd --create-home --uid 10001 app
+WORKDIR /app
+RUN pip install --no-cache-dir fastapi uvicorn prometheus-client   <span class="c"># pin versions in your repo</span>
+COPY mock_llm.py .
+USER 10001
+EXPOSE 8000
+CMD ["uvicorn", "mock_llm:app", "--host", "0.0.0.0", "--port", "8000"]</code></pre>
+    <p>The mock uses <code>asyncio.sleep</code>, so it burns no CPU: it models an accelerator-bound server where CPU utilisation tells you nothing about saturation — exactly the situation that makes CPU-based HPA useless (next sections).</p>
+
+<pre data-title="deploy/kubernetes/mock-llm.yaml"><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-llm
+  namespace: reliability-lab
+  labels: { app.kubernetes.io/name: mock-llm }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: mock-llm }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: mock-llm }
+    spec:
+      containers:
+      - name: mock-llm
+        image: mock-llm:0.1.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - { name: http, containerPort: 8000 }
+        env:
+        - { name: MAX_BATCH, value: "8" }
+        - { name: LOAD_SECONDS, value: "20" }
+        resources:
+          requests: { cpu: 100m, memory: 128Mi }
+          limits:   { memory: 256Mi }
+        startupProbe:
+          httpGet: { path: /health, port: http }
+          periodSeconds: 5
+          failureThreshold: 24          <span class="c"># 2 minutes to "load weights"</span>
+        readinessProbe:
+          httpGet: { path: /health, port: http }
+          periodSeconds: 5
+        livenessProbe:
+          httpGet: { path: /health, port: http }
+          periodSeconds: 10
+          failureThreshold: 6
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-llm
+  namespace: reliability-lab
+  labels: { app.kubernetes.io/name: mock-llm }
+spec:
+  selector: { app.kubernetes.io/name: mock-llm }
+  ports:
+  - { name: http, port: 8000, targetPort: http }</code></pre>
+
+    <section class="lab"><header>Lab 1 — Deploy a model server (mock, optionally vLLM on CPU) and read its metrics</header><div class="body">
+      <p><strong>Goal:</strong> an OpenAI-compatible model server running in the <code>reliability-lab</code> kind cluster, probes behaving correctly during "weight loading", streaming verified, metrics scraped.</p>
+      <ol class="steps">
+        <li><strong>Build and load the mock</strong>:
+<pre><code>cd kubernetes-reliability-lab/mock-llm
+docker build -t mock-llm:0.1.0 .
+kind load docker-image mock-llm:0.1.0 --name reliability-lab
+kubectl apply -f ../deploy/kubernetes/mock-llm.yaml
+kubectl -n reliability-lab get pods -l app.kubernetes.io/name=mock-llm -w</code></pre>
+          <p>Example output (yours will differ in names/timings) — note READY stays <code>0/1</code> for ~20 s while "weights load", without restarts:</p>
+<pre><code><span class="o">NAME                        READY   STATUS    RESTARTS   AGE
+mock-llm-7c9d8f6b5c-2xk9p   0/1     Running   0          5s
+mock-llm-7c9d8f6b5c-2xk9p   1/1     Running   0          25s</span></code></pre></li>
+        <li><strong>Call it</strong> (non-streaming, then streaming):
+<pre><code>kubectl -n reliability-lab port-forward svc/mock-llm 8001:8000 &amp;
+curl -s localhost:8001/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"mock-llm","messages":[{"role":"user","content":"Explain readiness probes"}],"max_tokens":5}'
+curl -sN localhost:8001/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"mock-llm","stream":true,"messages":[{"role":"user","content":"hi"}],"max_tokens":3}'</code></pre>
+          <p>Example output (IDs/timestamps differ; SSE events are separated by blank lines, shortened here with …):</p>
+<pre><code><span class="o">{"id":"chatcmpl-1f2e3d4c5b6a","object":"chat.completion","created":1793280000,"model":"mock-llm","choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","content":"tok0 tok1 tok2 tok3 tok4 "}}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}}
+data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", …, "choices": [{"index": 0, "delta": {"content": "tok0 "}, "finish_reason": null}]}
+data: {"id": "chatcmpl-…", … "delta": {"content": "tok1 "} …}
+data: {"id": "chatcmpl-…", … "delta": {"content": "tok2 "} …}
+data: {"id": "chatcmpl-…", … "delta": {}, "finish_reason": "length"}]}
+data: [DONE]</span></code></pre></li>
+        <li><strong>Read the metrics</strong>: <code>curl -s localhost:8001/metrics | grep mockllm_</code>. Find the TTFT histogram buckets and the token counter (exported as <code>mockllm_generation_tokens_total</code>).</li>
+        <li><strong>Scrape it with Prometheus</strong>: create a ServiceMonitor for label <code>app.kubernetes.io/name: mock-llm</code>, port <code>http</code>, path <code>/metrics</code> (as in Module 07; the <code>monitoring</code> release must select it, e.g. by label <code>release: monitoring</code>). In Prometheus, query <code>mockllm_num_requests_running</code>.</li>
+        <li><strong>Break it on purpose</strong>: set <code>LOAD_SECONDS=200</code> with the startupProbe budget unchanged (120 s). Watch the Pod restart (<code>kubectl describe pod</code> → "Startup probe failed"). Fix by raising <code>failureThreshold</code>. Write down the rule you learned.</li>
+      </ol>
+      <h4>Optional B — vLLM on CPU (heavy)</h4>
+      <p>Needs several GB of RAM for the kind node and downloads a multi-GB image plus model. Uses the CPU image named in vLLM's Kubernetes guide (x86_64; an arm64 variant is listed there for Apple Silicon) and a small public model. Expect slow generation — it is a functional test.</p>
+<pre><code>VLLM_IMAGE=public.ecr.aws/q9t5s3a7/vllm-cpu-release-repo:latest   <span class="c"># pin a tag in real use</span>
+<span class="c"># Deployment as in deploy/kubernetes/mock-llm.yaml, but:</span>
+<span class="c">#   image: $VLLM_IMAGE</span>
+<span class="c">#   command: ["/bin/sh","-c"]</span>
+<span class="c">#   args: ["vllm serve Qwen/Qwen2.5-0.5B-Instruct --dtype=bfloat16"]</span>
+<span class="c">#   resources.requests.memory: 4Gi, limits.memory: 8Gi; startupProbe failureThreshold: 90 (15 min)</span>
+<span class="c">#   volumeMount a PVC at /root/.cache/huggingface so restarts skip the download</span>
+curl -s localhost:8001/metrics | grep -E '^vllm:(num_requests|kv_cache_usage)'</code></pre>
+      <p>Example output (values differ):</p>
+<pre><code><span class="o">vllm:num_requests_running{engine="0",model_name="Qwen/Qwen2.5-0.5B-Instruct"} 0.0
+vllm:num_requests_waiting{engine="0",model_name="Qwen/Qwen2.5-0.5B-Instruct"} 0.0
+vllm:kv_cache_usage_perc{engine="0",model_name="Qwen/Qwen2.5-0.5B-Instruct"} 0.0</span></code></pre>
+      <p>(Label sets vary by version.) <strong>Cleanup:</strong> <code>kubectl -n reliability-lab delete deploy/mock-llm svc/mock-llm</code> when finished with the module; delete any PVC you created; <code>docker image rm</code> large images if disk is short.</p>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2 id="s-adapter">Integrating with reliability-api: the inference adapter</h2>
+    <p><strong>Definition.</strong> An adapter is a thin route in your application that translates your API into the model server's API (here: OpenAI chat completions), applies timeouts and error mapping, and emits its own metrics. The study guide's rule: "The inference backend should be an adapter, not a reason to rewrite the entire platform."</p>
+    <p><strong>Why it matters.</strong> Clients keep a stable contract (<code>POST /generate</code>), the model server can be swapped (mock → vLLM → KServe → hosted API) by changing <code>MODEL_BASE_URL</code>, and your existing Helm chart, CI, dashboards, HPA and failure experiments keep working.</p>
+<pre data-title="app/main.py — additions to the canonical app (rest unchanged)"><code>import httpx
+
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://mock-llm.reliability-lab.svc.cluster.local:8000")
+MODEL_NAME = os.getenv("MODEL_NAME", "mock-llm")
+MODEL_TIMEOUT_SECONDS = float(os.getenv("MODEL_TIMEOUT_SECONDS", "60"))
+
+UPSTREAM = Histogram("model_upstream_duration_seconds", "Model server call latency", ["outcome"])
+client = httpx.AsyncClient(base_url=MODEL_BASE_URL,
+                           timeout=httpx.Timeout(MODEL_TIMEOUT_SECONDS, connect=2.0))
+
+
+@app.post("/generate")
+async def generate(payload: dict, response: Response):
+    start = time.perf_counter()
+    try:
+        r = await client.post("/v1/chat/completions", json={
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": str(payload.get("prompt", ""))}],
+            "max_tokens": int(payload.get("max_tokens", 64)),
+        })
+        r.raise_for_status()
+    except httpx.HTTPError as exc:                    <span class="c"># timeout, connect error, 4xx/5xx</span>
+        UPSTREAM.labels("error").observe(time.perf_counter() - start)
+        REQUESTS.labels("/generate", "502").inc()
+        log.warning("model upstream error: %r", exc)
+        response.status_code = 502
+        return {"error": "model upstream unavailable"}
+    UPSTREAM.labels("ok").observe(time.perf_counter() - start)
+    LATENCY.labels("/generate").observe(time.perf_counter() - start)
+    REQUESTS.labels("/generate", "200").inc()
+    data = r.json()
+    return {"text": data["choices"][0]["message"]["content"], "usage": data.get("usage", {})}</code></pre>
+    <p>Add <code>httpx</code> to the app's dependencies, add <code>MODEL_BASE_URL</code>/<code>MODEL_NAME</code> to <code>ConfigMap/reliability-api-config</code>, and bump the image tag. Nothing else in the chart changes.</p>
+    <h3>Design decisions (and their trade-offs)</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Decision</th><th>Choice here</th><th>Why / trade-off</th></tr></thead>
+      <tbody>
+        <tr><td>Should <code>/ready</code> check the model server?</td><td><strong>No</strong></td><td>If the model is down, making every reliability-api Pod unready removes <code>/health</code>, <code>/work</code> and turns a partial outage into a total one (cascading failure). Return 502 from <code>/generate</code> and alert on it instead.</td></tr>
+        <tr><td>Timeouts</td><td>connect 2 s, total 60 s</td><td>Generation is long; a short total timeout cancels valid requests. But unbounded waits pile up connections. Match to max_tokens × expected ITL plus margin.</td></tr>
+        <tr><td>Retries</td><td>none in the adapter</td><td>Retrying a generation doubles GPU work under overload. If you add retries, only for connect errors, with a budget.</td></tr>
+        <tr><td>Streaming</td><td>not proxied (yet)</td><td>Simpler first. A streaming proxy (SSE passthrough) preserves TTFT for users; measure TTFT at reliability-api if you add it.</td></tr>
+        <tr><td>Concurrency limit</td><td>(extension) a semaphore per Pod</td><td>Shedding with 429 when too many generations are in flight protects the model server's queue.</td></tr>
+      </tbody>
+    </table></div>
+
+    <section class="lab"><header>Lab 2 — Wire reliability-api to the model server and observe both tiers</header><div class="body">
+      <ol class="steps">
+        <li>Add the adapter code and <code>httpx</code> dependency; rebuild as <code>reliability-api:0.2.0</code>; <code>kind load docker-image reliability-api:0.2.0 --name reliability-lab</code>.</li>
+        <li>Upgrade the release:
+<pre><code>helm upgrade reliability-api charts/reliability-api -n reliability-lab \
+  --set image.tag=0.2.0 \
+  --set env.MODEL_BASE_URL=http://mock-llm.reliability-lab.svc.cluster.local:8000
+kubectl -n reliability-lab rollout status deploy/reliability-api</code></pre>
+          <p>(Use whatever value keys your chart uses for env/ConfigMap entries.)</p></li>
+        <li>Call through the app:
+<pre><code>kubectl -n reliability-lab port-forward svc/reliability-api 8080:80 &amp;
+curl -s localhost:8080/generate -H 'Content-Type: application/json' \
+  -d '{"prompt":"Summarise the HPA algorithm","max_tokens":16}'</code></pre>
+          <p>Example output:</p>
+<pre><code><span class="o">{"text":"tok0 tok1 tok2 tok3 tok4 tok5 tok6 tok7 tok8 tok9 tok10 tok11 tok12 tok13 tok14 tok15 ","usage":{"prompt_tokens":4,"completion_tokens":16,"total_tokens":20}}</span></code></pre></li>
+        <li><strong>Load both tiers</strong> with your Module 08 k6 script pointed at <code>POST /generate</code> with 16 virtual users. In Grafana, put side by side: reliability-api p95 <code>http_request_duration_seconds{path="/generate"}</code>, CPU of reliability-api Pods, <code>mockllm_num_requests_waiting</code>, and <code>mockllm_num_requests_running</code>.</li>
+        <li><strong>Observe the lesson:</strong> with 16 users and <code>MAX_BATCH=8</code>, waiting ≈ 8 and latency roughly doubles, while CPU on both Deployments stays near idle. Write one sentence in your notes: "The CPU-based HPA would not have scaled because …".</li>
+        <li><strong>Failure test</strong> (Module 08 style): <code>kubectl -n reliability-lab scale deploy/mock-llm --replicas=0</code> during load. Expect <code>/generate</code> 502s, while <code>/health</code> and <code>/ready</code> stay 200. Restore with <code>--replicas=1</code> and measure recovery time (includes the 20 s "load").</li>
+      </ol>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2 id="s-kserve">KServe: model serving as a Kubernetes API</h2>
+    <p><strong>Definition.</strong> KServe is "a cloud-native, Kubernetes-based model serving platform". It adds CRDs so you declare <em>what</em> to serve and it creates the Deployments/Services/autoscalers for you:</p>
+    <ul>
+      <li><strong>InferenceService</strong> (<code>serving.kserve.io/v1beta1</code>) — the main object. Its <code>predictor</code> names a <code>modelFormat</code> and a <code>storageUri</code> (e.g. <code>hf://…</code>, <code>gs://…</code>); optional transformer/explainer components exist for pre/post-processing.</li>
+      <li><strong>ServingRuntime / ClusterServingRuntime</strong> (namespace- vs cluster-scoped) — a template for Pods that can serve particular model formats: container image, args, supported formats. Built-ins include <code>kserve-huggingfaceserver</code> (Hugging Face models; uses a vLLM backend for generative models) and <code>kserve-tritonserver</code>.</li>
+      <li><strong>Storage initializer</strong> — an init container that downloads the model from <code>storageUri</code> before the server starts (configurable via <code>ClusterStorageContainer</code>).</li>
+      <li><strong>Deployment modes</strong> — <em>Standard</em> (plain Deployments + Services; recommended in the docs for generative inference; autoscale with HPA or KEDA; no HTTP scale-from-zero) and <em>Knative</em> (Knative Services; request-driven autoscaling with scale-to-zero; the default mode at install unless changed).</li>
+    </ul>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 330" role="img" aria-label="KServe InferenceService reconciliation">
+        <defs><marker id="m12f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="30" width="200" height="80" rx="8"/>
+        <text x="120" y="54" text-anchor="middle" class="t-bold">InferenceService</text>
+        <text x="120" y="74" text-anchor="middle" class="t-mono">modelFormat: huggingface</text>
+        <text x="120" y="94" text-anchor="middle" class="t-mono">storageUri: hf://…</text>
+        <rect class="box3" x="20" y="150" width="200" height="70" rx="8"/>
+        <text x="120" y="176" text-anchor="middle" class="t-bold">ClusterServingRuntime</text>
+        <text x="120" y="196" text-anchor="middle" class="t-mono">kserve-huggingfaceserver</text>
+        <rect class="box" x="270" y="80" width="170" height="80" rx="8"/>
+        <text x="355" y="108" text-anchor="middle" class="t-bold">KServe controller</text>
+        <text x="355" y="128" text-anchor="middle" class="t-muted">matches format →</text>
+        <text x="355" y="146" text-anchor="middle" class="t-muted">runtime, reconciles</text>
+        <line class="line" x1="220" y1="70" x2="270" y2="105" marker-end="url(#m12f)"/>
+        <line class="line" x1="220" y1="185" x2="270" y2="140" marker-end="url(#m12f)"/>
+        <rect class="zone" x="480" y="14" width="390" height="300" rx="12"/>
+        <text x="494" y="34" class="t-muted">Standard mode (recommended for LLMs)</text>
+        <rect class="box4" x="500" y="50" width="160" height="50" rx="6"/><text x="580" y="80" text-anchor="middle">Deployment</text>
+        <rect class="box4" x="690" y="50" width="160" height="50" rx="6"/><text x="770" y="80" text-anchor="middle">Service / route</text>
+        <rect class="box4" x="500" y="120" width="350" height="110" rx="8"/>
+        <text x="675" y="142" text-anchor="middle" class="t-bold">predictor Pod</text>
+        <rect class="box" x="516" y="156" width="150" height="58" rx="6"/><text x="591" y="180" text-anchor="middle">storage-initializer</text><text x="591" y="198" text-anchor="middle" class="t-muted">init: download</text>
+        <rect class="box" x="684" y="156" width="150" height="58" rx="6"/><text x="759" y="180" text-anchor="middle">kserve-container</text><text x="759" y="198" text-anchor="middle" class="t-muted">runtime (vLLM)</text>
+        <line class="line" x1="666" y1="185" x2="684" y2="185" marker-end="url(#m12f)"/>
+        <rect class="box3" x="500" y="248" width="350" height="50" rx="6"/>
+        <text x="675" y="270" text-anchor="middle" class="t-bold">HPA or KEDA ScaledObject</text>
+        <text x="675" y="288" text-anchor="middle" class="t-muted">Knative mode: Knative Service + KPA, scale-to-zero</text>
+        <line class="line" x1="440" y1="120" x2="500" y2="80" marker-end="url(#m12f)"/>
+        <line class="line" x1="440" y1="130" x2="500" y2="170" marker-end="url(#m12f)"/>
+      </svg>
+      <figcaption>Figure 12.6 — You declare an InferenceService; the controller picks a serving runtime by model format and creates the workload. Standard mode yields ordinary Deployments you can inspect with the same kubectl skills.</figcaption>
+    </figure>
+<pre data-title="InferenceService for an LLM (example from KServe docs; GPU)"><code>apiVersion: "serving.kserve.io/v1beta1"
+kind: "InferenceService"
+metadata:
+  name: "huggingface-llm"
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: huggingface
+      storageUri: "hf://meta-llama/llama-3-8b-instruct"
+      resources:
+        requests:
+          cpu: "1"
+          memory: "2Gi"
+          nvidia.com/gpu: 1
+        limits:
+          cpu: "1"
+          memory: "2Gi"
+          nvidia.com/gpu: 1</code></pre>
+    <p>KServe prefixes its OpenAI-compatible endpoints with <code>openai</code> (per the generative-inference docs), so the adapter's base path changes when you switch backends — another reason to keep that knowledge in one adapter.</p>
+    <h3>Plain Deployment vs KServe: when to use which</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>Plain Deployment (this course)</th><th>KServe</th></tr></thead>
+      <tbody>
+        <tr><td>Learning value</td><td>you see and own every object</td><td>you learn a platform abstraction</td></tr>
+        <tr><td>Many models / teams</td><td>copy-paste YAML per model</td><td>one CRD per model, shared runtimes, model caching, canary rollouts</td></tr>
+        <tr><td>Dependencies</td><td>none</td><td>KServe controller, cert-manager; Knative (+ networking) for Knative mode; Gateway/ingress</td></tr>
+        <tr><td>Debugging</td><td>direct</td><td>one more layer: read InferenceService status conditions, then the generated Deployment/Pods</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Failure cases:</strong> InferenceService stuck <code>READY=False</code> — <code>kubectl describe inferenceservice</code> conditions; storage-initializer failing (bad URI, missing token: <code>kubectl logs POD -c storage-initializer</code>); no runtime supports the <code>modelFormat</code>; GPU Pending as in the GPU section.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="s-autoscale">Autoscaling inference</h2>
+    <h3>Why CPU-based HPA is a poor signal</h3>
+    <ul>
+      <li><strong>GPU-bound servers</strong> keep host CPU low even when saturated; CPU-HPA never scales. (Our mock shows the extreme: zero CPU at full saturation.)</li>
+      <li><strong>CPU servers</strong> look 100% busy whether serving 4 or 40 requests — utilisation saturates, it does not tell you how far over capacity you are.</li>
+      <li><strong>GPU utilisation</strong> is also misleading: "utilisation" means a kernel ran during the sample window, not that the GPU is full; it fluctuates with batch composition (the KServe autoscaling docs make the same point).</li>
+      <li><strong>What users feel</strong> is queueing. The signal closest to user pain and to capacity is <strong>queue depth</strong> (<code>num_requests_waiting</code>) and <strong>in-flight concurrency per replica</strong> (<code>num_requests_running</code>), with KV-cache usage as a secondary pressure signal.</li>
+    </ul>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 280" role="img" aria-label="Scaling on queue depth with Prometheus and KEDA">
+        <defs><marker id="m12g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box4" x="20" y="100" width="170" height="70" rx="8"/>
+        <text x="105" y="126" text-anchor="middle" class="t-bold">model server Pods</text>
+        <text x="105" y="146" text-anchor="middle" class="t-mono">/metrics: waiting=12</text>
+        <rect class="box" x="230" y="100" width="150" height="70" rx="8"/>
+        <text x="305" y="126" text-anchor="middle" class="t-bold">Prometheus</text>
+        <text x="305" y="146" text-anchor="middle" class="t-muted">scrape every 15–30 s</text>
+        <rect class="box3" x="420" y="100" width="170" height="70" rx="8"/>
+        <text x="505" y="122" text-anchor="middle" class="t-bold">KEDA</text>
+        <text x="505" y="140" text-anchor="middle" class="t-mono">ScaledObject query</text>
+        <text x="505" y="158" text-anchor="middle" class="t-muted">exposes external metric</text>
+        <rect class="box2" x="630" y="100" width="110" height="70" rx="8"/>
+        <text x="685" y="130" text-anchor="middle" class="t-bold">HPA</text>
+        <text x="685" y="150" text-anchor="middle" class="t-muted">desired = ⌈m/t⌉</text>
+        <rect class="box4" x="770" y="100" width="100" height="70" rx="8"/>
+        <text x="820" y="130" text-anchor="middle" class="t-bold">replicas</text>
+        <text x="820" y="150" text-anchor="middle" class="t-mono">1 → 3</text>
+        <line class="line" x1="190" y1="135" x2="230" y2="135" marker-end="url(#m12g)"/>
+        <line class="line" x1="380" y1="135" x2="420" y2="135" marker-end="url(#m12g)"/>
+        <line class="line" x1="590" y1="135" x2="630" y2="135" marker-end="url(#m12g)"/>
+        <line class="line" x1="740" y1="135" x2="770" y2="135" marker-end="url(#m12g)"/>
+        <path class="line dash" d="M820,170 L820,230 L105,230 L105,170" marker-end="url(#m12g)"/>
+        <text x="460" y="250" text-anchor="middle" class="t-muted">new replica: schedule → (GPU node provision) → image pull → load weights → ready … minutes</text>
+        <path class="line bad" d="M60,40 L330,40"/>
+        <text x="20" y="30" class="t-muted">CPU-HPA path (metrics-server → CPU %) stays flat for accelerator-bound or saturated servers</text>
+        <text x="505" y="60" text-anchor="middle" class="t-muted">alt: prometheus-adapter → custom metrics API</text>
+      </svg>
+      <figcaption>Figure 12.7 — Scaling on queue depth. KEDA turns a PromQL result into an external metric for an HPA it manages. The dashed loop is slow for model servers, so scale early and keep a minimum warm capacity.</figcaption>
+    </figure>
+
+    <h3>KEDA ScaledObject for the mock (or vLLM)</h3>
+    <p>KEDA is a Kubernetes event-driven autoscaler; its Prometheus scaler runs a query and scales a target so that <code>metric / replicas ≈ threshold</code>. The KServe docs use exactly this approach for LLMs (scaling on <code>vllm:num_requests_running</code> with a target of 2 per Pod, in Standard mode).</p>
+<pre data-title="deploy/kubernetes/mock-llm-scaledobject.yaml"><code>apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: mock-llm
+  namespace: reliability-lab
+spec:
+  scaleTargetRef:
+    name: mock-llm                 <span class="c"># the Deployment</span>
+  minReplicaCount: 1               <span class="c"># keep one warm replica: cold start is slow</span>
+  maxReplicaCount: 4
+  cooldownPeriod: 300
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc:9090
+      query: sum(mockllm_num_requests_waiting) + sum(mockllm_num_requests_running)
+      threshold: "6"               <span class="c"># target in-flight per replica (below MAX_BATCH=8)</span></code></pre>
+    <p>The Prometheus Service name depends on your kube-prometheus-stack release (<code>kubectl -n monitoring get svc</code>). For vLLM, use <code>sum(vllm:num_requests_running) + sum(vllm:num_requests_waiting)</code> or scale on waiting alone with a small threshold.</p>
+    <h3>How to pick the target</h3>
+    <ol>
+      <li>Benchmark one replica with an AIPerf concurrency sweep (next section).</li>
+      <li>Find the highest concurrency that still meets your SLO (e.g. p95 TTFT ≤ 500 ms, p95 ITL ≤ 50 ms) — the knee.</li>
+      <li>Set the per-replica target a bit below that (headroom for the slow scale-up loop).</li>
+      <li>Load-test the autoscaler itself: step load from 4 → 24 users and measure time-to-scale and SLO violations during the ramp (Module 08 method).</li>
+    </ol>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Option</th><th>Signal</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>HPA on CPU (Module 08)</td><td>CPU utilisation vs request</td><td>fine for reliability-api itself; wrong for the model server</td></tr>
+        <tr><td>HPA + prometheus-adapter</td><td>custom/external metrics API from PromQL</td><td>no extra controller semantics; more config</td></tr>
+        <tr><td>KEDA</td><td>PromQL (and many other scalers)</td><td>manages the HPA for you; supports activation thresholds; scale-to-zero for non-HTTP sources</td></tr>
+        <tr><td>Knative KPA (KServe Knative mode)</td><td>in-flight requests per Pod (concurrency) or RPS</td><td>request-driven, scale-to-zero, panic window for bursts; cold starts include model load</td></tr>
+      </tbody>
+    </table></div>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>Flapping</strong>: queue empties as soon as a replica becomes ready, then fills again. Use stabilisation/cooldown and a combined running+waiting signal.</li>
+      <li><strong>Scaling too late</strong>: model load takes minutes; by the time the replica is ready the burst is over. Keep <code>minReplicaCount</code> warm capacity, scale earlier, and pre-pull images.</li>
+      <li><strong>Scale to zero surprise</strong>: the first request after idle waits for a full cold start (possibly including a GPU node). Fine for batch, painful for chat.</li>
+      <li><strong>Metric missing</strong> (Prometheus down, query typo): KEDA cannot compute; check <code>kubectl get scaledobject</code> READY/ACTIVE columns and KEDA operator logs. Consider KEDA's fallback settings.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="s-bench">Benchmarking with AIPerf</h2>
+    <p><strong>Definition.</strong> AIPerf (<code>ai-dynamo/aiperf</code>) is a benchmarking tool for generative-AI serving. It sends requests to OpenAI-compatible (and other) endpoints in concurrency or request-rate modes, measures client-side TTFT, ITL, request latency and throughput, and exports CSV/JSON artifacts.</p>
+    <p><strong>Problem it solves.</strong> A naive loop of <code>curl</code> calls measures the wrong thing: it ignores streaming (no TTFT), uses one prompt (unrealistic cache hits), has no warm-up (cold-start pollution), and runs one concurrency level (no curve). AIPerf encodes the methodology.</p>
+<pre data-title="Install and basic run (from the AIPerf README)"><code>python3 -m venv venv &amp;&amp; source venv/bin/activate
+pip install aiperf
+aiperf profile \
+  --model "granite4:350m" \
+  --streaming \
+  --endpoint-type chat \
+  --tokenizer ibm-granite/granite-4.0-micro \
+  --url http://localhost:11434 \
+  --concurrency 5 \
+  --request-count 10</code></pre>
+    <p>Useful options (names from the AIPerf CLI reference, 29 Oct 2026; run <code>aiperf profile --help</code> for your version):</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>--model</code>, <code>--url</code>, <code>--endpoint-type chat</code></td><td>target; the path (e.g. <code>/v1/chat/completions</code>) is appended from the endpoint type</td></tr>
+        <tr><td><code>--streaming</code></td><td>enables TTFT and ITL measurement</td></tr>
+        <tr><td><code>--concurrency N</code> / <code>--request-rate R</code></td><td>closed-loop (N in flight) vs open-loop (R req/s) load (Module 08 terms)</td></tr>
+        <tr><td><code>--request-count</code>, <code>--benchmark-duration</code></td><td>how long to measure</td></tr>
+        <tr><td><code>--warmup-request-count</code></td><td>requests sent first and discarded</td></tr>
+        <tr><td><code>--synthetic-input-tokens-mean</code> / <code>--isl</code>, <code>--output-tokens-mean</code> / <code>--osl</code> (+ <code>-stddev</code>)</td><td>synthetic prompt and output lengths</td></tr>
+        <tr><td><code>--input-file</code> + <code>--custom-dataset-type single_turn</code></td><td>your fixed prompt set (JSONL, e.g. <code>{"text": "…"}</code> per line)</td></tr>
+        <tr><td><code>--random-seed</code></td><td>reproducible synthetic data and sampling</td></tr>
+        <tr><td><code>--extra-inputs</code></td><td>extra request fields (e.g. <code>max_tokens:128</code>, <code>ignore_eos:true</code> where supported)</td></tr>
+        <tr><td><code>--tokenizer</code></td><td>tokenizer used to count tokens client-side</td></tr>
+        <tr><td><code>--artifact-dir</code>, <code>--ui-type simple|none|dashboard</code></td><td>where results go; UI mode (use <code>none</code> in CI)</td></tr>
+      </tbody>
+    </table></div>
+    <div class="callout warn"><span class="label">Output length is not guaranteed</span>
+      <p>The README notes that <code>--output-tokens-mean</code> "cannot be guaranteed unless you pass <code>ignore_eos</code> and/or <code>min_tokens</code> via <code>--extra-inputs</code> to an inference server that supports them". If baseline and candidate stop at different lengths, their latencies are not comparable — record the measured output sequence length too.</p>
+    </div>
+
+    <h3>Methodology checklist</h3>
+    <ol>
+      <li><strong>Freeze the workload</strong>: a fixed prompt file (committed to <code>experiments/load/prompts.jsonl</code>), fixed <code>max_tokens</code>, fixed seed. Never compare runs with different prompts.</li>
+      <li><strong>Warm up</strong>: discard the first requests (JIT, cache allocation, connection setup, lazy loading).</li>
+      <li><strong>Sweep concurrency</strong> (e.g. 1, 2, 4, 8, 16, 32) to draw the latency/throughput curve — one point is an anecdote.</li>
+      <li><strong>Repeat</strong> each point ≥ 3 times; report median and spread. Restart the server between candidates.</li>
+      <li><strong>Check the load generator</strong> is not the bottleneck (its CPU, network; Module 08). Run it in-cluster or on a separate machine for serious runs.</li>
+      <li><strong>Correlate</strong> client metrics (AIPerf) with server metrics (Prometheus: queue, running, KV cache) and Kubernetes metrics (restarts, throttling, OOM).</li>
+      <li><strong>Record the environment</strong>: model + revision, server + version + flags, image digest, node type, GPU/CPU, replicas, Kubernetes version, AIPerf version and full command.</li>
+    </ol>
+
+    <section class="lab"><header>Lab 3 — Baseline vs candidate with AIPerf</header><div class="body">
+      <p><strong>Question:</strong> does raising <code>MAX_BATCH</code> from 8 (baseline) to 16 (candidate) improve goodput at our SLO (p95 TTFT ≤ 500 ms, p95 ITL ≤ 60 ms) for 16 concurrent users? (Mock server: the answer illustrates the method, not a real model.)</p>
+      <ol class="steps">
+        <li><strong>Prompt set</strong>:
+<pre><code>mkdir -p experiments/load
+cat &gt; experiments/load/prompts.jsonl &lt;&lt; 'EOF'
+{"text": "Explain what a Kubernetes readiness probe does in two sentences."}
+{"text": "List three causes of CrashLoopBackOff."}
+{"text": "Why is CPU utilisation a poor autoscaling signal for GPU inference?"}
+{"text": "Summarise the difference between TTFT and inter-token latency."}
+{"text": "What does a PodDisruptionBudget protect against?"}
+EOF</code></pre></li>
+        <li><strong>Baseline</strong> (MAX_BATCH=8), port-forward the model server directly to isolate it:
+<pre><code>kubectl -n reliability-lab set env deploy/mock-llm MAX_BATCH=8
+kubectl -n reliability-lab rollout status deploy/mock-llm
+kubectl -n reliability-lab port-forward svc/mock-llm 8001:8000 &amp;
+for c in 1 4 8 16; do
+  aiperf profile --model mock-llm --url http://localhost:8001 \
+    --endpoint-type chat --streaming --tokenizer gpt2 \
+    --input-file experiments/load/prompts.jsonl --custom-dataset-type single_turn \
+    --extra-inputs max_tokens:64 \
+    --concurrency $c --warmup-request-count 10 --request-count 100 \
+    --random-seed 42 --ui-type simple \
+    --artifact-dir experiments/reports/baseline-b8/c$c
+done</code></pre>
+          <p>(<code>--tokenizer gpt2</code> downloads a public tokenizer to count the mock's "tokN" words; counts are approximate — fine for comparing two mock runs, meaningless for real models.)</p></li>
+        <li><strong>Candidate</strong>: <code>kubectl -n reliability-lab set env deploy/mock-llm MAX_BATCH=16</code>, wait for rollout (the new Pod "loads" for 20 s), re-establish the port-forward, repeat the loop into <code>candidate-b16/</code>.</li>
+        <li><strong>Read results</strong>: each run prints a table and writes <code>profile_export_aiperf.json</code>/<code>.csv</code> under the artifact dir. Example of the table <em>shape</em> only (rows abbreviated, values omitted on purpose — use your own measured numbers):
+<pre><code><span class="o">                    NVIDIA AIPerf | LLM Metrics
+Metric                                 avg      p50      p90      p99
+Time to First Token (ms)            …        …        …        …
+Inter Token Latency (ms)            …        …        …        …
+Request Latency (ms)                …        …        …        …
+Output Token Throughput (tokens/sec)  …
+Request Throughput (requests/sec)     …</span></code></pre></li>
+        <li><strong>Expectation from the toy model</strong> (verify, do not assume): at c=16, baseline queues half the requests (TTFT jumps by roughly one service time), candidate runs all 16 together (no queue) but each step is slower (ITL ↑). Whether goodput improves depends on which SLO term binds.</li>
+        <li><strong>Fill in the report template below</strong>, including Prometheus screenshots of <code>mockllm_num_requests_waiting</code> during both runs.</li>
+      </ol>
+      <p><strong>Cleanup:</strong> stop port-forwards (<code>kill %1</code> or close terminals); <code>kubectl -n reliability-lab set env deploy/mock-llm MAX_BATCH=8</code> to restore the baseline; keep the artifacts (small JSON/CSV) but do not commit huge raw files.</p>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2 id="s-quality">Quality evaluation is a separate experiment</h2>
+    <p>Performance tells you <em>how fast</em>; quality tells you <em>how good</em>. Changing quantisation, model, prompt template, sampling parameters or even server version can change outputs. A candidate that is 30% faster but answers worse is not an improvement. The study guide's exit criterion: "clearly distinguish model quality, serving performance, client-side latency, and infrastructure health."</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>Performance benchmark</th><th>Quality evaluation</th></tr></thead>
+      <tbody>
+        <tr><td>Question</td><td>latency/throughput at load</td><td>are answers correct/useful/safe?</td></tr>
+        <tr><td>Inputs</td><td>fixed prompt set, lengths, concurrency</td><td>fixed eval set with expected answers or rubric</td></tr>
+        <tr><td>Sampling</td><td>whatever production uses</td><td>deterministic where possible (temperature 0, fixed seed)</td></tr>
+        <tr><td>Metrics</td><td>TTFT, ITL, E2E, tokens/s, goodput, errors</td><td>exact match / pass@k / rubric score / human review; refusal rate</td></tr>
+        <tr><td>Tooling</td><td>AIPerf, Prometheus</td><td>an eval harness of your choice; versioned eval set</td></tr>
+        <tr><td>Load</td><td>concurrent</td><td>sequential is fine (speed irrelevant)</td></tr>
+      </tbody>
+    </table></div>
+    <p>Run both for every candidate, report both, and make the decision rule explicit up front (e.g. "accept if goodput ≥ +10% and quality score not lower by more than 1 point on the 200-item eval set").</p>
+
+    <!-- ============================================================ -->
+    <h2 id="s-report">Experiment report template</h2>
+<pre data-title="experiments/reports/2026-10-29-maxbatch.md"><code># Experiment: MAX_BATCH 8 → 16 on mock-llm
+Date: 2026-10-29      Author: &lt;you&gt;      Status: draft | final | inconclusive
+
+## Question and hypothesis
+Does MAX_BATCH=16 increase goodput (p95 TTFT ≤ 500 ms AND p95 ITL ≤ 60 ms) at concurrency 16?
+Hypothesis: yes, because baseline queues 8 of 16 requests.
+Decision rule (written BEFORE running): accept if goodput +10% and no quality regression.
+
+## Environment (identical for both arms unless stated)
+- Cluster: kind reliability-lab, k8s vX.Y, node: laptop (CPU model, RAM)
+- Model server: mock-llm image digest sha256:…  (baseline env MAX_BATCH=8, candidate 16)
+- App: reliability-api:0.2.0 (not in path: benchmark hit model server directly)
+- Load generator: AIPerf vX.Y, run from laptop via port-forward  ← note this limitation
+- Command: aiperf profile … (full command per arm in appendix)
+
+## Workload
+Prompt file experiments/load/prompts.jsonl (5 prompts, sha256 …), max_tokens 64,
+warm-up 10, 100 measured requests per point, concurrency {1,4,8,16}, seed 42, 3 repeats.
+
+## Results (median of 3 repeats; client-side)
+| conc | arm       | p95 TTFT ms | p95 ITL ms | p95 E2E ms | out tok/s | req/s | goodput | errors |
+|------|-----------|-------------|------------|------------|-----------|-------|---------|--------|
+| 16   | baseline  |             |            |            |           |       |         |        |
+| 16   | candidate |             |            |            |           |       |         |        |
+
+## Server / cluster evidence
+- max mockllm_num_requests_waiting: baseline …, candidate …   (Grafana panel link/screenshot)
+- restarts / OOMKills / throttling during runs: none | …
+
+## Quality
+Not applicable for the mock (outputs are synthetic). For real models: eval set name/version, score per arm.
+
+## Conclusion
+Accept / reject / inconclusive, with the reason. Threats to validity (port-forward overhead,
+laptop noise, mock ≠ real model).
+
+## Appendix
+Raw artifact paths, exact commands, versions.</code></pre>
+
+    <!-- ============================================================ -->
+    <h2 id="s-trouble">Inference troubleshooting quick map</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Symptom</th><th>Look at</th><th>Likely cause</th></tr></thead>
+      <tbody>
+        <tr><td>High TTFT, normal ITL</td><td>waiting, queue time, prompt tokens</td><td>not enough replicas / slots; long prompts</td></tr>
+        <tr><td>High ITL, normal TTFT</td><td>running sequences, step time</td><td>batch too large for the latency SLO; slower hardware</td></tr>
+        <tr><td>Throughput flat while latency climbs</td><td>KV-cache usage, preemptions</td><td>past the knee; add replicas, cap concurrency</td></tr>
+        <tr><td>Pods restart while loading</td><td>events, previous logs</td><td>startupProbe too short, liveness too strict, OOM during load</td></tr>
+        <tr><td>Pending GPU Pod</td><td>describe pod</td><td>no free GPU, taint/selector mismatch, device plugin missing</td></tr>
+        <tr><td><code>/generate</code> 502s</td><td>adapter logs, upstream histogram</td><td>model server down/unready, timeout too short, wrong base URL/path</td></tr>
+        <tr><td>Autoscaler never scales</td><td>ScaledObject/HPA status, query result in Prometheus</td><td>CPU signal used, metric name changed between versions, wrong Prometheus address</td></tr>
+        <tr><td>Benchmark numbers jump run to run</td><td>load generator CPU, warm-up, prompt set</td><td>cold start in measurement, laptop noise, different output lengths</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Need</th><th>Command / snippet</th></tr></thead>
+      <tbody>
+        <tr><td>Start vLLM</td><td><code>vllm serve MODEL [--dtype auto] [--api-key …]</code> → port 8000</td></tr>
+        <tr><td>Server metrics</td><td><code>curl -s localhost:8000/metrics | grep '^vllm:'</code></td></tr>
+        <tr><td>p95 TTFT</td><td><code>histogram_quantile(0.95, sum by (le)(rate(vllm:time_to_first_token_seconds_bucket[5m])))</code></td></tr>
+        <tr><td>Output tokens/s</td><td><code>sum(rate(vllm:generation_tokens_total[1m]))</code></td></tr>
+        <tr><td>Queue depth</td><td><code>sum(vllm:num_requests_waiting)</code></td></tr>
+        <tr><td>ITL formula</td><td><code>(E2E − TTFT) / (N_out − 1)</code></td></tr>
+        <tr><td>Little's law</td><td><code>in-flight = req/s × latency</code></td></tr>
+        <tr><td>GPU request</td><td><code>resources.limits."nvidia.com/gpu": 1</code> (+ nodeSelector, toleration)</td></tr>
+        <tr><td>Autopilot GPU</td><td><code>nodeSelector: cloud.google.com/gke-accelerator: "nvidia-tesla-t4"</code></td></tr>
+        <tr><td>Slow-start probe</td><td><code>startupProbe: periodSeconds 10, failureThreshold 60</code></td></tr>
+        <tr><td>KEDA trigger</td><td><code>type: prometheus</code>, <code>serverAddress</code>, <code>query</code>, <code>threshold</code></td></tr>
+        <tr><td>Benchmark</td><td><code>aiperf profile --model M --url U --endpoint-type chat --streaming --concurrency C --warmup-request-count W --request-count N</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>Model server</dt><dd>Process that holds model weights in memory and serves inference over an API.</dd>
+      <dt>Prefill</dt><dd>Forward pass over the whole prompt; fills the KV cache; yields the first token.</dd>
+      <dt>Decode</dt><dd>Iterative generation, one token per step per sequence.</dd>
+      <dt>KV cache</dt><dd>Stored attention keys/values for every token of every running sequence; main memory limit for concurrency.</dd>
+      <dt>TTFT</dt><dd>Time to first token: send → first streamed token.</dd>
+      <dt>ITL / TPOT</dt><dd>Inter-token latency / time per output token: average gap between generated tokens.</dd>
+      <dt>E2E latency</dt><dd>Send → last token.</dd>
+      <dt>Goodput</dt><dd>Throughput counting only requests that met the SLO.</dd>
+      <dt>Continuous batching</dt><dd>Re-forming the batch at each decode step so finished sequences are replaced immediately.</dd>
+      <dt>Device plugin</dt><dd>Node agent that advertises extended resources (e.g. <code>nvidia.com/gpu</code>) to the kubelet.</dd>
+      <dt>MIG</dt><dd>Multi-Instance GPU: hardware partitioning of one GPU into isolated slices.</dd>
+      <dt>InferenceService</dt><dd>KServe CRD declaring a model to serve (predictor, format, storage URI).</dd>
+      <dt>ServingRuntime</dt><dd>KServe template describing which container serves which model formats.</dd>
+      <dt>KEDA</dt><dd>Event-driven autoscaler that feeds external metrics (e.g. PromQL) into an HPA.</dd>
+      <dt>AIPerf</dt><dd>Client-side benchmarking tool for generative-AI endpoints.</dd>
+      <dt>Inference adapter</dt><dd>App route that translates its API to the model server's, with timeouts and metrics.</dd>
+    </dl>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. Why should reliability-api and the model server be separate Deployments?</summary><div class="a">Different resource profiles (CPU vs GPU, MB vs GB memory), startup times (seconds vs minutes), scaling signals (CPU vs queue depth) and release cadences. Separating them allows independent placement, scaling and upgrades, and swapping the backend via the adapter.</div></details>
+    <details class="q"><summary>2. A request has TTFT 400 ms, E2E 3,580 ms and 128 output tokens. What is the ITL and per-user tokens/s?</summary><div class="a">ITL = (3580 − 400)/(128 − 1) ≈ 25.0 ms; per-user ≈ 1000/25 = 40 tokens/s.</div></details>
+    <details class="q"><summary>3. With 12 requests in flight on average and an average E2E of 4 s, what is the request rate?</summary><div class="a">Little's law: λ = L / W = 12 / 4 = 3 requests/s.</div></details>
+    <details class="q"><summary>4. Why does continuous batching increase throughput but also ITL?</summary><div class="a">It keeps every batch slot busy (no waiting for the longest sequence), so more tokens are produced per step and per second overall. But each step processes more sequences and reads more KV cache, so the time per step — the gap between a single user's tokens — grows.</div></details>
+    <details class="q"><summary>5. What are the three rules for specifying GPUs in a container spec?</summary><div class="a">Specify GPUs in limits; a limit alone is enough (request defaults to it); if both are set they must be equal; you cannot set a GPU request without a limit. Values are whole numbers.</div></details>
+    <details class="q"><summary>6. A model server restarts every 3 minutes during startup with "Startup probe failed". What do you change and why not just remove probes?</summary><div class="a">Increase the startupProbe budget (<code>failureThreshold × periodSeconds</code>) beyond worst-case load time, and/or speed loading (PVC cache). Removing probes would let traffic hit an unready server (no readiness) and leave hung servers running (no liveness).</div></details>
+    <details class="q"><summary>7. Why is <code>num_requests_waiting</code> a better autoscaling signal than CPU for vLLM on GPUs?</summary><div class="a">Host CPU barely changes with GPU load, and utilisation metrics saturate. Waiting requests directly measure demand exceeding the replica's capacity and correlate with TTFT — what users feel.</div></details>
+    <details class="q"><summary>8. Why should <code>/ready</code> of reliability-api not depend on the model server?</summary><div class="a">A model outage would mark all reliability-api Pods unready, removing them from the Service and breaking unrelated endpoints — a cascading failure. Return 502 on <code>/generate</code>, alert on its error rate, and keep readiness about the Pod's own ability to serve.</div></details>
+    <details class="q"><summary>9. Name four things that make two AIPerf runs incomparable.</summary><div class="a">Different prompt sets or lengths, different output lengths (EOS vs max_tokens), no/different warm-up, different concurrency or request-rate mode, different server flags/versions/image digests, load-generator bottleneck in one run, different hardware.</div></details>
+    <details class="q"><summary>10. What does KServe Standard mode give up compared to Knative mode, and why might LLM serving still prefer it?</summary><div class="a">Standard mode lacks request-driven scale-to-zero for HTTP. LLM servers have long cold starts and expensive accelerators, so scale-to-zero is rarely acceptable for interactive traffic; Standard mode is simpler (no Knative dependency) and integrates with HPA/KEDA on LLM metrics.</div></details>
+    <details class="q"><summary>11. Your candidate is 25% faster on AIPerf. What else must be true before you ship it?</summary><div class="a">Quality evaluation on the fixed eval set shows no unacceptable regression; error rates are equal or lower; results repeat across runs; the environment and workload were identical; and the decision rule written in advance is satisfied.</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus/">Schedule GPUs — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/">Horizontal Pod Autoscaling — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Configure liveness, readiness and startup probes — kubernetes.io</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/">vLLM OpenAI-compatible server — docs.vllm.ai</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/design/metrics.html">vLLM metrics design — docs.vllm.ai</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/usage/metrics.html">vLLM production metrics — docs.vllm.ai</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/deployment/k8s.html">Using Kubernetes (vLLM) — docs.vllm.ai</a></li>
+      <li><a href="https://docs.vllm.ai/en/latest/getting_started/installation/cpu.html">vLLM CPU installation — docs.vllm.ai</a></li>
+      <li><a href="https://kserve.github.io/website/docs/concepts/architecture">KServe architecture — kserve.github.io</a></li>
+      <li><a href="https://kserve.github.io/website/docs/concepts/resources">KServe resources (InferenceService, ServingRuntime) — kserve.github.io</a></li>
+      <li><a href="https://kserve.github.io/website/docs/model-serving/generative-inference/overview">KServe generative inference overview — kserve.github.io</a></li>
+      <li><a href="https://kserve.github.io/website/docs/model-serving/generative-inference/autoscaling">KServe autoscaling with LLM metrics (KEDA) — kserve.github.io</a></li>
+      <li><a href="https://kserve.github.io/website/docs/admin-guide/kubernetes-deployment">KServe Standard (Kubernetes) deployment mode — kserve.github.io</a></li>
+      <li><a href="https://keda.sh/docs/latest/scalers/prometheus/">KEDA Prometheus scaler — keda.sh</a></li>
+      <li><a href="https://github.com/ai-dynamo/aiperf">AIPerf README — github.com/ai-dynamo/aiperf</a> (CLI options: <a href="https://github.com/ai-dynamo/aiperf/blob/main/docs/cli-options.md">docs/cli-options.md</a>; metrics formulas: <a href="https://github.com/ai-dynamo/aiperf/blob/main/docs/metrics-reference.md">docs/metrics-reference.md</a>; warm-up: <a href="https://github.com/ai-dynamo/aiperf/blob/main/docs/tutorials/warmup.md">docs/tutorials/warmup.md</a>)</li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/how-to/autopilot-gpus">Deploy GPU workloads in Autopilot — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/timesharing-gpus">GPU sharing strategies in GKE — docs.cloud.google.com</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="11-gke-cloud.html"><small>◀ Previous</small>Module 11 · Google Cloud &amp; GKE</a>
+      <a class="next" href="13-troubleshooting-capstone.html"><small>Next ▶</small>Module 13 · Troubleshooting Playbook & Capstone Project</a>
+    </nav>
+  </article></main>
+</div>
+
+<script>
+(function () {
+  function $(id) { return document.getElementById(id); }
+  function num(id, d) { var v = parseFloat($(id).value); return isFinite(v) ? v : d; }
+
+  /* ---------- Metrics calculator ---------- */
+  function calc() {
+    var ttft = num("c-ttft", 0), e2e = num("c-e2e", 0), n = Math.max(1, num("c-n", 1));
+    var p = num("c-p", 0), c = Math.max(1, num("c-c", 1));
+    var sT = num("c-sttft", 0), sI = num("c-sitl", 0);
+    var lines = [];
+    if (e2e < ttft) { $("c-out").textContent = "E2E must be ≥ TTFT."; return; }
+    var itl = n > 1 ? (e2e - ttft) / (n - 1) : 0;
+    var perUser = itl > 0 ? 1000 / itl : 0;
+    var rps = c / (e2e / 1000);
+    var outTps = rps * n, inTps = rps * p;
+    lines.push("ITL            = (E2E − TTFT)/(N − 1) = (" + e2e + " − " + ttft + ")/(" + n + " − 1) = " + itl.toFixed(2) + " ms");
+    lines.push("decode time    = E2E − TTFT = " + (e2e - ttft).toFixed(0) + " ms");
+    lines.push("per-user tok/s = 1000 / ITL = " + perUser.toFixed(1));
+    lines.push("requests/s     = C / E2E = " + c + " / " + (e2e / 1000).toFixed(3) + " s = " + rps.toFixed(2) + "   (Little's law)");
+    lines.push("output tok/s   = req/s × N = " + outTps.toFixed(1) + "  (system)");
+    lines.push("input tok/s    = req/s × prompt = " + inTps.toFixed(1));
+    var okT = ttft <= sT, okI = itl <= sI;
+    lines.push("SLO check      : TTFT " + (okT ? "OK" : "VIOLATED") + ", ITL " + (okI ? "OK" : "VIOLATED") +
+      (okT && okI ? "  → counts toward goodput" : "  → does NOT count toward goodput"));
+    $("c-out").textContent = lines.join("\n");
+  }
+  ["c-ttft", "c-e2e", "c-n", "c-p", "c-c", "c-sttft", "c-sitl"].forEach(function (i) { $(i).addEventListener("input", calc); });
+  calc();
+
+  /* ---------- Toy concurrency model ---------- */
+  var NS = "http://www.w3.org/2000/svg";
+  function el(tag, attrs, text) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function model(C, B, d0, k, P, N) {
+    var a = Math.min(C, B);
+    var step = d0 * (1 + k * (a - 1));
+    var S = P + N * step;                       // service time once admitted (ms)
+    var W = C > B ? S * (C - B) / B : 0;        // approx. closed-loop queue wait (ms)
+    var e2e = W + S;
+    var rps = C / (e2e / 1000);
+    return { step: step, S: S, W: W, ttft: W + P, e2e: e2e, rps: rps, tps: rps * N, active: a };
+  }
+  function toy() {
+    var C = parseInt($("t-c").value, 10), B = parseInt($("t-b").value, 10);
+    var d0 = num("t-d", 25), k = num("t-k", 0.06), P = num("t-p", 200), N = Math.max(1, num("t-n", 128));
+    $("t-cv").textContent = C; $("t-bv").textContent = B;
+    var svg = $("t-svg");
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var x0 = 50, x1 = 690, y0 = 220, y1 = 30, maxC = 64;
+    var pts = [], maxE = 0, maxT = 0;
+    for (var c = 1; c <= maxC; c++) { var m = model(c, B, d0, k, P, N); pts.push(m); if (m.e2e > maxE) maxE = m.e2e; if (m.tps > maxT) maxT = m.tps; }
+    function X(c) { return x0 + (c - 1) / (maxC - 1) * (x1 - x0); }
+    svg.appendChild(el("line", { "class": "line", x1: x0, y1: y0, x2: x1, y2: y0 }));
+    svg.appendChild(el("line", { "class": "line", x1: x0, y1: y0, x2: x0, y2: y1 }));
+    [1, 16, 32, 48, 64].forEach(function (c) { svg.appendChild(el("text", { "class": "t-muted", x: X(c), y: y0 + 16, "text-anchor": "middle" }, String(c))); });
+    svg.appendChild(el("text", { "class": "t-muted", x: (x0 + x1) / 2, y: y0 + 34, "text-anchor": "middle" }, "concurrency (clients in flight)"));
+    var pe = "", pt = "";
+    pts.forEach(function (m, i) {
+      var x = X(i + 1);
+      pe += (i ? " L" : "M") + x.toFixed(1) + "," + (y0 - m.e2e / maxE * (y0 - y1)).toFixed(1);
+      pt += (i ? " L" : "M") + x.toFixed(1) + "," + (y0 - m.tps / maxT * (y0 - y1)).toFixed(1);
+    });
+    svg.appendChild(el("path", { "class": "line accent", d: pe, "stroke-width": 2.2 }));
+    svg.appendChild(el("path", { "class": "line ok", d: pt, "stroke-width": 2.2 }));
+    var xb = X(Math.min(B, maxC));
+    svg.appendChild(el("line", { "class": "line dash", x1: xb, y1: y0, x2: xb, y2: y1 }));
+    svg.appendChild(el("text", { "class": "t-muted", x: xb + 4, y: y1 + 10 }, "B = " + B));
+    var xc = X(C);
+    svg.appendChild(el("line", { "class": "line bad", x1: xc, y1: y0, x2: xc, y2: y1 + 20 }));
+    var cur = pts[C - 1];
+    svg.appendChild(el("circle", { "class": "dot-accent", cx: xc, cy: y0 - cur.e2e / maxE * (y0 - y1), r: 4 }));
+    svg.appendChild(el("circle", { "class": "dot-ok", cx: xc, cy: y0 - cur.tps / maxT * (y0 - y1), r: 4 }));
+    svg.appendChild(el("text", { "class": "t-muted", x: x0 + 6, y: y1 - 10 }, "blue: E2E latency (max " + (maxE / 1000).toFixed(1) + " s)   green: output tok/s (max " + maxT.toFixed(0) + ")   red: your C"));
+    $("t-out").textContent =
+      "C=" + C + ", B=" + B + " → running " + cur.active + ", queued " + Math.max(0, C - B) + "\n" +
+      "step/ITL   " + cur.step.toFixed(1) + " ms    per-user " + (1000 / cur.step).toFixed(1) + " tok/s\n" +
+      "TTFT       " + cur.ttft.toFixed(0) + " ms  (queue " + cur.W.toFixed(0) + " + prefill " + P + ")\n" +
+      "E2E        " + (cur.e2e / 1000).toFixed(2) + " s\n" +
+      "throughput " + cur.rps.toFixed(2) + " req/s, " + cur.tps.toFixed(0) + " output tok/s\n" +
+      "TOY MODEL — for intuition only; measure real servers with AIPerf.";
+  }
+  ["t-c", "t-b", "t-d", "t-k", "t-p", "t-n"].forEach(function (i) { $(i).addEventListener("input", toy); });
+  toy();
+})();
+</script>
+</body>
+</html>

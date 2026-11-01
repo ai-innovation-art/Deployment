@@ -1,0 +1,1198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 02 · Docker &amp; Containers — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 02 · Docker &amp; Containers</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="02"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 02 · Docker &amp; Containers</h1>
+    <p class="lede">In Module 01 you ran <code>reliability-api</code> as a plain Linux process. Here you package it as a versioned, immutable <strong>image</strong>, <code>reliability-api:0.1.0</code>, that runs the same way on your laptop, in CI, and in Kubernetes. You will write a production-quality Dockerfile (multi-stage, non-root, pinned base, cache-friendly). You will learn why layer order decides build speed, why <code>CMD</code> must use exec form for signals to work, how ports, volumes, and networks connect containers to the world, and how to diagnose the classic failures: exit 137, "works inside but not outside", and a 10-second <code>docker stop</code>.</p>
+    <div class="meta"><span class="pill accent">Prereq: Module 01</span><span class="pill">≈ 6 h study + 4 h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Explain image vs container vs registry. Describe what an image is made of (manifest, config, layers) and why the <strong>OCI</strong> standard lets Docker-built images run on Kubernetes.</li>
+      <li>Write and explain, line by line, the reliability-api Dockerfile: multi-stage, pinned base image, <code>requirements.txt</code>, non-root user, exec-form <code>CMD</code>, <code>HEALTHCHECK</code>.</li>
+      <li>Predict which build steps are cached and which are rebuilt after a code change. Order instructions to keep rebuilds fast.</li>
+      <li>Use <code>.dockerignore</code> to keep secrets and junk out of the build context.</li>
+      <li>Walk a container through its lifecycle states and know which command moves it between them.</li>
+      <li>Use tags for humans and <strong>digests</strong> for reproducibility.</li>
+      <li>Explain PID 1, exec vs shell form, <code>--init</code>, and why they decide whether shutdown is graceful.</li>
+      <li>Use <code>docker run</code> flags: <code>-p</code>, <code>-e</code>, <code>--env-file</code>, <code>--rm</code>, <code>--name</code>, <code>-d</code>, <code>--memory</code>, <code>--cpus</code>, <code>--init</code>, <code>--stop-timeout</code>, <code>--network</code>, <code>-v</code>/<code>--mount</code>.</li>
+      <li>Choose between volumes, bind mounts, and tmpfs. Connect containers on a user-defined bridge network and resolve each other by name.</li>
+      <li>Compare Docker <code>HEALTHCHECK</code> with Kubernetes probes, run a small Compose stack, and measure image size.</li>
+    </ul>
+
+    <h2>Why containers? VMs vs containers</h2>
+    <p><strong>Problem.</strong> "It works on my machine" happens because the app depends on many things outside its own code: the Python version, installed packages, OS libraries, environment variables, and file paths. Each machine differs slightly. A <strong>container image</strong> packages the app <em>together with</em> its userland dependencies into one versioned artifact. A <strong>container</strong> runs that artifact as an isolated process.</p>
+    <p><strong>Key point from Module 01:</strong> a container is <em>not</em> a small VM. It is a normal Linux process placed in namespaces (its own view of PIDs, network, mounts, hostname) and cgroups (CPU and memory limits), with the image's files as its root filesystem. All containers on a host share <strong>one kernel</strong>.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="Virtual machines each with a guest OS versus containers sharing one host kernel">
+        <text x="210" y="24" text-anchor="middle" class="t-bold">Virtual machines</text>
+        <text x="650" y="24" text-anchor="middle" class="t-bold">Containers</text>
+        <rect class="box2" x="30" y="40" width="170" height="40" rx="6"/><text x="115" y="65" text-anchor="middle">reliability-api</text>
+        <rect class="box2" x="220" y="40" width="170" height="40" rx="6"/><text x="305" y="65" text-anchor="middle">other app</text>
+        <rect class="box" x="30" y="86" width="170" height="36" rx="6"/><text x="115" y="109" text-anchor="middle" class="t-muted">Python + libs</text>
+        <rect class="box" x="220" y="86" width="170" height="36" rx="6"/><text x="305" y="109" text-anchor="middle" class="t-muted">runtime + libs</text>
+        <rect class="box3" x="30" y="128" width="170" height="50" rx="6"/><text x="115" y="150" text-anchor="middle" class="t-bold">Guest OS + kernel</text><text x="115" y="168" text-anchor="middle" class="t-muted">GBs, boots in seconds+</text>
+        <rect class="box3" x="220" y="128" width="170" height="50" rx="6"/><text x="305" y="150" text-anchor="middle" class="t-bold">Guest OS + kernel</text><text x="305" y="168" text-anchor="middle" class="t-muted">GBs, boots in seconds+</text>
+        <rect class="box4" x="30" y="186" width="360" height="40" rx="6"/><text x="210" y="211" text-anchor="middle" class="t-bold">Hypervisor</text>
+        <rect class="box" x="30" y="232" width="360" height="40" rx="6"/><text x="210" y="257" text-anchor="middle">Host OS / hardware</text>
+        <rect class="box2" x="470" y="40" width="170" height="40" rx="6"/><text x="555" y="65" text-anchor="middle">reliability-api</text>
+        <rect class="box2" x="660" y="40" width="170" height="40" rx="6"/><text x="745" y="65" text-anchor="middle">load generator</text>
+        <rect class="box" x="470" y="86" width="170" height="36" rx="6"/><text x="555" y="109" text-anchor="middle" class="t-muted">image: Python + libs</text>
+        <rect class="box" x="660" y="86" width="170" height="36" rx="6"/><text x="745" y="109" text-anchor="middle" class="t-muted">image: its own libs</text>
+        <rect class="zone" x="462" y="34" width="376" height="96" rx="8"/>
+        <text x="650" y="148" text-anchor="middle" class="t-muted">namespaces + cgroups around each process</text>
+        <rect class="box4" x="470" y="160" width="360" height="40" rx="6"/><text x="650" y="185" text-anchor="middle" class="t-bold">Container runtime (Docker → containerd → runc)</text>
+        <rect class="box3" x="470" y="206" width="360" height="26" rx="6"/><text x="650" y="224" text-anchor="middle" class="t-bold">ONE shared Linux kernel</text>
+        <rect class="box" x="470" y="236" width="360" height="36" rx="6"/><text x="650" y="259" text-anchor="middle">Host OS / hardware</text>
+        <text x="430" y="306" text-anchor="middle" class="t-muted">VM: strong isolation, heavy. Container: lightweight (MBs, starts in ms–s), weaker isolation (shared kernel).</text>
+      </svg>
+      <figcaption>On macOS and Windows, Docker Desktop runs a small Linux VM behind the scenes, because containers need a Linux kernel. Your containers run inside that VM.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Virtual machine</th><th>Container</th></tr>
+      <tr><td>Isolation boundary</td><td>Hardware virtualisation, separate kernel</td><td>Kernel namespaces + cgroups, shared kernel</td></tr>
+      <tr><td>Startup</td><td>Boots an OS</td><td>Starts a process</td></tr>
+      <tr><td>Size</td><td>GBs (full OS)</td><td>MBs to hundreds of MBs (userland only)</td></tr>
+      <tr><td>Security</td><td>Stronger. A kernel bug in a guest rarely affects the host</td><td>A kernel bug can affect all containers. Hence non-root and minimal images</td></tr>
+      <tr><td>Used for reliability-api</td><td>Kubernetes <em>nodes</em> are often VMs (GKE, Module 11)</td><td>The app itself, in every environment</td></tr>
+    </table></div>
+
+    <!-- ============================================================ CORE CONCEPTS -->
+    <h2 id="s-img">Images, containers, registries, and the OCI standard</h2>
+    <dl class="defs">
+      <dt>Image</dt><dd>A read-only, layered filesystem plus metadata (default command, env, user, exposed ports). From the Docker docs: <em>"Images are immutable. Once an image is created, it can't be modified. You can only make a new image or add changes on top of it."</em></dd>
+      <dt>Container</dt><dd>A running (or stopped) instance of an image: the image layers plus a thin <strong>writable layer</strong>, a process, namespaces, cgroups, and config (ports, env, mounts).</dd>
+      <dt>Registry</dt><dd>A server that stores and serves images: Docker Hub, GitHub Container Registry (<code>ghcr.io</code>, Module 09), Google Artifact Registry (Module 11). Inside a registry, a <em>repository</em> holds the versions of one image.</dd>
+      <dt>Tag</dt><dd>A human-friendly, <strong>mutable</strong> pointer to an image version, e.g. <code>0.1.0</code>, <code>3.12-slim</code>, <code>latest</code>.</dd>
+      <dt>Digest</dt><dd>The <strong>content hash</strong> (<code>sha256:…</code>) of an image manifest. It is immutable: same digest ⇒ same bytes.</dd>
+    </dl>
+
+    <h3>What an image actually is</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 340" role="img" aria-label="Image reference resolves via tag to a manifest digest which points to config and layer blobs">
+        <defs><marker id="m2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="30" width="250" height="70" rx="8"/>
+        <text x="145" y="54" text-anchor="middle" class="t-bold">Image reference</text>
+        <text x="145" y="76" text-anchor="middle" class="t-mono">ghcr.io/you/reliability-api</text>
+        <text x="145" y="92" text-anchor="middle" class="t-mono">:0.1.0</text>
+        <rect class="box3" x="20" y="140" width="250" height="56" rx="8"/>
+        <text x="145" y="163" text-anchor="middle" class="t-bold">Tag "0.1.0" (mutable)</text>
+        <text x="145" y="182" text-anchor="middle" class="t-muted">can be re-pointed by a push</text>
+        <path class="line" d="M145 100 L145 138" marker-end="url(#m2a)"/>
+        <rect class="box" x="330" y="120" width="230" height="96" rx="8"/>
+        <text x="445" y="144" text-anchor="middle" class="t-bold">Manifest</text>
+        <text x="445" y="164" text-anchor="middle" class="t-mono">sha256:9f3c…  ← digest</text>
+        <text x="445" y="186" text-anchor="middle" class="t-muted">lists config + layer digests</text>
+        <text x="445" y="204" text-anchor="middle" class="t-muted">(per platform: amd64/arm64)</text>
+        <path class="line accent" d="M270 168 L328 168" marker-end="url(#m2a)"/>
+        <rect class="box4" x="620" y="30" width="220" height="80" rx="8"/>
+        <text x="730" y="54" text-anchor="middle" class="t-bold">Config blob</text>
+        <text x="730" y="74" text-anchor="middle" class="t-muted">Cmd, Env, User, WorkingDir,</text>
+        <text x="730" y="92" text-anchor="middle" class="t-muted">ExposedPorts, Healthcheck</text>
+        <rect class="box4" x="620" y="130" width="220" height="34" rx="6"/><text x="730" y="152" text-anchor="middle" class="t-mono">layer sha256:a1… (base OS)</text>
+        <rect class="box4" x="620" y="170" width="220" height="34" rx="6"/><text x="730" y="192" text-anchor="middle" class="t-mono">layer sha256:b2… (venv)</text>
+        <rect class="box4" x="620" y="210" width="220" height="34" rx="6"/><text x="730" y="232" text-anchor="middle" class="t-mono">layer sha256:c3… (app/)</text>
+        <path class="line" d="M560 145 L618 72" marker-end="url(#m2a)"/>
+        <path class="line" d="M560 160 L618 147" marker-end="url(#m2a)"/>
+        <path class="line" d="M560 175 L618 187" marker-end="url(#m2a)"/>
+        <path class="line" d="M560 190 L618 227" marker-end="url(#m2a)"/>
+        <rect class="zone" x="320" y="262" width="530" height="62" rx="8"/>
+        <text x="585" y="286" text-anchor="middle">Everything is content-addressed: change one byte → new layer digest</text>
+        <text x="585" y="306" text-anchor="middle">→ new manifest → new image digest. Tags are only labels on top.</text>
+        <text x="20" y="250" class="t-mono">…/reliability-api@sha256:9f3c…</text>
+        <text x="20" y="270" class="t-muted">pinning by digest skips the tag</text>
+        <path class="line dash" d="M250 240 L330 200" marker-end="url(#m2a)"/>
+      </svg>
+      <figcaption>A tag resolves to a manifest. The manifest digest is the image's true identity. Digests shown are shortened and illustrative.</figcaption>
+    </figure>
+
+    <h3>OCI: why your Docker image runs on Kubernetes</h3>
+    <p>The <strong>Open Container Initiative</strong> (OCI) is <em>"a lightweight, open governance structure (project), formed under the auspices of the Linux Foundation, for the express purpose of creating open industry standards around container formats and runtimes"</em>. It was launched in 2015 by Docker, CoreOS, and others. It maintains three specifications:</p>
+    <ul>
+      <li><strong>Image Specification</strong>: the manifest/config/layers format above.</li>
+      <li><strong>Runtime Specification</strong>: how to run an unpacked "filesystem bundle". <code>runc</code> is the reference implementation that Docker and containerd use.</li>
+      <li><strong>Distribution Specification</strong>: the HTTP API for pushing to and pulling from registries.</li>
+    </ul>
+    <p>Because of these standards, an image you build with Docker can be pushed to GHCR and pulled and run by <strong>containerd</strong> on a kind node or a GKE node. Kubernetes does not need Docker itself (Module 03).</p>
+
+    <!-- ============================================================ LAYERS -->
+    <h2 id="s-layers">Layers, the union filesystem, and copy-on-write</h2>
+    <p>From the Docker docs: <em>"Each layer in an image contains a set of filesystem changes - additions, deletions, or modifications."</em> When a container starts, <em>"a union filesystem is created where layers are stacked on top of each other, creating a new and unified view"</em>, and <em>"a directory is created specifically for the running container"</em>. This directory is the writable layer.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="Two containers sharing the same read-only image layers each with their own writable layer">
+        <rect class="box2" x="60" y="30" width="300" height="40" rx="6"/><text x="210" y="55" text-anchor="middle" class="t-bold">writable layer: container A</text>
+        <rect class="box2" x="480" y="30" width="300" height="40" rx="6"/><text x="630" y="55" text-anchor="middle" class="t-bold">writable layer: container B</text>
+        <rect class="zone" x="40" y="86" width="760" height="190" rx="10"/>
+        <text x="56" y="106" class="t-muted">read-only image layers of reliability-api:0.1.0, shared by both containers (stored once on disk)</text>
+        <rect class="box4" x="60" y="118" width="720" height="32" rx="6"/><text x="420" y="139" text-anchor="middle" class="t-mono">COPY app/ ./app/                       (~few KB)</text>
+        <rect class="box4" x="60" y="156" width="720" height="32" rx="6"/><text x="420" y="177" text-anchor="middle" class="t-mono">COPY --from=builder /opt/venv /opt/venv  (tens of MB)</text>
+        <rect class="box4" x="60" y="194" width="720" height="32" rx="6"/><text x="420" y="215" text-anchor="middle" class="t-mono">RUN groupadd/useradd app               (tiny)</text>
+        <rect class="box4" x="60" y="232" width="720" height="32" rx="6"/><text x="420" y="253" text-anchor="middle" class="t-mono">FROM python:3.12-slim layers           (base OS + Python)</text>
+        <text x="420" y="300" text-anchor="middle" class="t-muted">Read: found in the top-most layer that has the file. Write: first copied up into the writable layer (copy-on-write).</text>
+        <text x="420" y="318" text-anchor="middle" class="t-muted">Delete the container → its writable layer is gone. Image layers are untouched.</text>
+      </svg>
+      <figcaption>Ten replicas of reliability-api on one node share the image layers on disk. Each container adds only its small writable layer.</figcaption>
+    </figure>
+    <ul>
+      <li><strong>Copy-on-write</strong> (Docker storage docs): <em>"If a file or directory exists in a lower layer within the image, and another layer (including the writable layer) needs read access to it, it just uses the existing file. The first time another layer needs to modify the file … the file is copied into that layer and modified."</em></li>
+      <li><strong>Deleting a file in a later layer does not shrink the image.</strong> The bytes remain in the earlier layer, and the later layer only records "deleted". That is why cleanup must happen in the <em>same</em> <code>RUN</code> that created the files, or why you use multi-stage builds.</li>
+      <li><strong>Ephemeral by design</strong>: anything the app writes to its writable layer disappears when the container is removed or replaced (every Kubernetes rollout replaces containers). Persistent data belongs in volumes.</li>
+    </ul>
+<pre data-title="See the layers"><code>$ docker image history reliability-api:0.1.0
+<span class="o">IMAGE          CREATED         CREATED BY                                      SIZE      COMMENT
+5e1a2b3c4d5e   2 minutes ago   CMD ["uvicorn" "app.main:app" "--host" "0.0…   0B        buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   HEALTHCHECK &amp;{["CMD" "python" "-c" "import…   0B        buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   USER 10001:10001                                0B        buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   COPY app/ ./app/ # buildkit                     4.1kB     buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   COPY /opt/venv /opt/venv # buildkit             38.2MB    buildkit.dockerfile.v0
+&lt;missing&gt;      2 minutes ago   RUN /bin/sh -c groupadd --system --gid 10001…   4.5kB     buildkit.dockerfile.v0
+…              (base image layers)</span>
+<span class="c"># Example output (yours will differ in names/IDs/timings/sizes). 0B rows are metadata-only instructions.</span></code></pre>
+
+    <!-- ============================================================ DOCKERFILE -->
+    <h2 id="s-dockerfile">The reliability-api Dockerfile, line by line</h2>
+    <p>Here is the complete, final Dockerfile first. The sections after it explain each decision: build context, cache, multi-stage, non-root, signals, and health. Project layout (from the study guide's repository plan):</p>
+<pre data-title="kubernetes-reliability-lab/ (relevant part)"><code>kubernetes-reliability-lab/
+├── app/
+│   ├── __init__.py        <span class="c"># empty; makes "app" a package</span>
+│   ├── main.py            <span class="c"># canonical app (Module 01)</span>
+│   └── tests/
+├── requirements.txt
+├── Dockerfile
+└── .dockerignore</code></pre>
+<pre data-title="requirements.txt (example pins — check PyPI for current versions; pin exact versions)"><code>fastapi==0.115.0
+uvicorn==0.30.6
+prometheus-client==0.20.0</code></pre>
+
+<pre data-title="Dockerfile"><code><span class="c"># syntax=docker/dockerfile:1</span>
+<span class="c"># ---- Base image: pinned tag. For fully reproducible builds also pin the digest:</span>
+<span class="c">#      ARG PYTHON_IMAGE=python:3.12-slim@sha256:&lt;digest-you-resolved&gt;</span>
+<span class="k">ARG</span> PYTHON_IMAGE=python:3.12-slim
+
+<span class="c"># ================= Stage 1: builder — create a virtualenv with dependencies =================</span>
+<span class="k">FROM</span> ${PYTHON_IMAGE} AS builder
+<span class="k">ENV</span> PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+<span class="k">RUN</span> python -m venv /opt/venv
+<span class="k">ENV</span> PATH="/opt/venv/bin:$PATH"
+<span class="c"># Copy ONLY the dependency list first, so code edits don't invalidate the slow pip layer</span>
+<span class="k">COPY</span> requirements.txt /tmp/requirements.txt
+<span class="k">RUN</span> pip install -r /tmp/requirements.txt
+
+<span class="c"># ================= Stage 2: runtime — only what is needed to run =================</span>
+<span class="k">FROM</span> ${PYTHON_IMAGE} AS runtime
+<span class="k">ENV</span> PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    APP_MODE=normal \
+    LOG_LEVEL=info \
+    READY_DELAY_SECONDS=0
+<span class="c"># Dedicated unprivileged user with a fixed numeric UID/GID (Kubernetes runAsNonRoot can verify it)</span>
+<span class="k">RUN</span> groupadd --system --gid 10001 app \
+ &amp;&amp; useradd --system --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
+<span class="k">WORKDIR</span> /app
+<span class="k">COPY</span> --from=builder /opt/venv /opt/venv
+<span class="c"># Code is owned by root (default) and only readable by the app user: the app can't modify itself</span>
+<span class="k">COPY</span> app/ ./app/
+<span class="k">USER</span> 10001:10001
+<span class="k">EXPOSE</span> 8000
+<span class="c"># Docker-only health status (Kubernetes ignores this; it uses probes — see below)</span>
+<span class="k">HEALTHCHECK</span> --interval=10s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status == 200 else 1)"]
+<span class="c"># Exec form: uvicorn becomes PID 1 and receives SIGTERM directly. Bind 0.0.0.0 (Module 01).</span>
+<span class="k">CMD</span> ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]</code></pre>
+
+    <div class="table-wrap"><table>
+      <tr><th>Line(s)</th><th>Why it is there</th><th>What breaks without it</th></tr>
+      <tr><td><code>ARG PYTHON_IMAGE=python:3.12-slim</code> before <code>FROM</code></td><td>One place to pin the base for both stages. An <code>ARG</code> declared before the first <code>FROM</code> can be used in <code>FROM</code> lines. <code>slim</code> is the Debian-based variant without compilers and docs.</td><td><code>FROM python</code> (implicitly <code>:latest</code>) gives a different Python and OS whenever upstream moves, so builds are not reproducible.</td></tr>
+      <tr><td><code>FROM … AS builder</code> / <code>AS runtime</code></td><td>Multi-stage: build tools and pip caches stay in the builder. Only <code>/opt/venv</code> is copied across.</td><td>Larger runtime image, larger attack surface.</td></tr>
+      <tr><td><code>COPY requirements.txt</code> → <code>RUN pip install</code> before <code>COPY app/</code></td><td>Cache ordering. Dependencies change rarely, code changes constantly.</td><td>Every one-line code edit re-downloads and reinstalls all packages.</td></tr>
+      <tr><td><code>PIP_NO_CACHE_DIR=1</code></td><td>pip's download cache would otherwise be saved into the layer.</td><td>Tens of MB of wasted cache in the image.</td></tr>
+      <tr><td><code>PYTHONUNBUFFERED=1</code></td><td>Logs reach stdout/stderr immediately, so <code>docker logs</code> and <code>kubectl logs</code> are live (Module 01).</td><td>Logs appear late, or are lost on SIGKILL.</td></tr>
+      <tr><td><code>PYTHONDONTWRITEBYTECODE=1</code></td><td>No <code>.pyc</code> writes at runtime. The code directory is not writable by the app anyway.</td><td>Harmless permission noise.</td></tr>
+      <tr><td><code>ENV APP_MODE / LOG_LEVEL / READY_DELAY_SECONDS</code></td><td>Documents the config contract and sets defaults. Override at run time with <code>-e</code>.</td><td>Nothing functional (the app has defaults), but less discoverable.</td></tr>
+      <tr><td><code>groupadd/useradd</code> + <code>USER 10001:10001</code></td><td>Non-root runtime. <em>"USER … sets the user name (or UID) and optionally the user group (or GID) to use as the default user and group for the remainder of the current stage."</em></td><td>App runs as root (UID 0). A compromise gets root inside the container.</td></tr>
+      <tr><td><code>WORKDIR /app</code></td><td>Sets the directory for following <code>RUN/CMD/COPY</code>. Python finds the <code>app</code> package relative to it.</td><td><code>ModuleNotFoundError: No module named 'app'</code>.</td></tr>
+      <tr><td><code>EXPOSE 8000</code></td><td>Documentation only. Docker: <em>"The EXPOSE instruction doesn't actually publish the port."</em></td><td>Nothing. You still need <code>-p</code> to publish.</td></tr>
+      <tr><td><code>HEALTHCHECK</code></td><td>Docker marks the container <code>healthy</code>/<code>unhealthy</code>. Uses Python, because <code>slim</code> images do not include <code>curl</code>.</td><td>No health status in <code>docker ps</code>, and Compose cannot wait on health.</td></tr>
+      <tr><td><code>CMD ["uvicorn", …, "--host", "0.0.0.0", …]</code></td><td>Exec form, so Uvicorn is PID 1 and gets SIGTERM. Binds all interfaces.</td><td>Shell form: slow, ungraceful stops (exit 137). <code>127.0.0.1</code>: unreachable from outside.</td></tr>
+    </table></div>
+
+    <!-- ============================================================ CONTEXT & DOCKERIGNORE -->
+    <h2 id="s-context">Build context and .dockerignore</h2>
+    <p><strong>Definition.</strong> The <em>build context</em> is <em>"the set of files that your build can access"</em>. When you run <code>docker build .</code>, the <code>.</code> is the context. Only files inside it can be <code>COPY</code>'d. A <code>.dockerignore</code> file, placed <em>"in the root directory of the context"</em>, excludes files from it using glob patterns similar to shell globs.</p>
+    <p><strong>Problems it solves.</strong> (1) <strong>Secrets</strong>: without it, a broad <code>COPY . .</code> can bake <code>.env</code>, cloud keys, or <code>.git</code> history into an image layer, where anyone who pulls the image can extract them. (2) <strong>Speed</strong>: sending a 2 GB <code>.venv</code> or dataset to the builder on every build. (3) <strong>Cache stability</strong>: irrelevant files changing (e.g. <code>.git</code>) would invalidate a <code>COPY . .</code> layer.</p>
+<pre data-title=".dockerignore"><code><span class="c"># VCS and local environments</span>
+.git
+.gitignore
+.venv
+venv/
+<span class="c"># Python byproducts</span>
+**/__pycache__
+**/*.pyc
+.pytest_cache/
+<span class="c"># Secrets and local config — never send to the builder</span>
+.env
+*.env
+*.pem
+<span class="c"># Not needed at runtime</span>
+app/tests/
+deploy/
+experiments/
+docs/
+.github/
+README.md
+Dockerfile
+.dockerignore</code></pre>
+    <div class="callout tip"><span class="label">Defence in depth</span><p>This Dockerfile copies only <code>requirements.txt</code> and <code>app/</code>, an allow-list, so it is safe even without <code>.dockerignore</code>. The ignore file protects against a future <code>COPY . .</code> and keeps the context small. Use both.</p></div>
+    <div class="callout danger"><span class="label">Deleting a secret later does not remove it</span><p><code>COPY .env .</code> followed by <code>RUN rm .env</code> leaves the file inside the earlier layer, recoverable with <code>docker save</code> and a tar viewer. Keep secrets out of the context. Inject them at run time (<code>-e</code>, <code>--env-file</code>, Kubernetes Secrets) or use BuildKit build secrets (<code>RUN --mount=type=secret</code>) when a build step itself needs a credential.</p></div>
+
+    <!-- ============================================================ BUILD CACHE -->
+    <h2 id="s-cache">The build cache: why instruction order matters</h2>
+    <p><strong>How it works</strong> (Docker "Build cache invalidation"): <em>"The builder begins by checking if the base image is already cached. Each subsequent instruction is compared against the cached layers."</em> For <code>COPY</code>/<code>ADD</code>, <em>"the builder calculates a cache checksum from file metadata"</em>, and <em>"The modification time of a file (mtime) is not taken into account"</em>. For <code>RUN</code>, only the command string is compared, not what it would download. The critical rule: <em>"Once a layer changes, then all downstream layers need to be rebuilt as well. Even if they wouldn't build anything differently, they still need to re-run."</em></p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 360" role="img" aria-label="Cache invalidation cascade: bad order versus good order after editing main.py">
+        <text x="210" y="22" text-anchor="middle" class="t-bold">✘ Bad order: COPY everything first</text>
+        <text x="650" y="22" text-anchor="middle" class="t-bold">✔ Good order: dependencies first</text>
+        <rect class="box4" x="40" y="40" width="340" height="38" rx="6"/><text x="56" y="64" class="t-mono">FROM python:3.12-slim</text><text x="366" y="64" text-anchor="end" class="t-muted">CACHED</text>
+        <rect class="box4" x="40" y="86" width="340" height="38" rx="6"/><text x="56" y="110" class="t-mono">WORKDIR /app</text><text x="366" y="110" text-anchor="end" class="t-muted">CACHED</text>
+        <rect class="box3" x="40" y="132" width="340" height="38" rx="6"/><text x="56" y="156" class="t-mono">COPY . .</text><text x="366" y="156" text-anchor="end" class="t-bold">main.py changed ✎</text>
+        <rect class="box3" x="40" y="178" width="340" height="38" rx="6"/><text x="56" y="202" class="t-mono">RUN pip install -r req…</text><text x="366" y="202" text-anchor="end" class="t-bold">REBUILD ~30 s</text>
+        <rect class="box3" x="40" y="224" width="340" height="38" rx="6"/><text x="56" y="248" class="t-mono">CMD [...]</text><text x="366" y="248" text-anchor="end" class="t-bold">REBUILD</text>
+        <path class="line bad" d="M24 151 L24 262"/><circle class="dot-bad" cx="24" cy="151" r="5"/>
+        <rect class="box4" x="480" y="40" width="340" height="38" rx="6"/><text x="496" y="64" class="t-mono">FROM python:3.12-slim</text><text x="806" y="64" text-anchor="end" class="t-muted">CACHED</text>
+        <rect class="box4" x="480" y="86" width="340" height="38" rx="6"/><text x="496" y="110" class="t-mono">WORKDIR /app</text><text x="806" y="110" text-anchor="end" class="t-muted">CACHED</text>
+        <rect class="box4" x="480" y="132" width="340" height="38" rx="6"/><text x="496" y="156" class="t-mono">COPY requirements.txt .</text><text x="806" y="156" text-anchor="end" class="t-muted">CACHED</text>
+        <rect class="box4" x="480" y="178" width="340" height="38" rx="6"/><text x="496" y="202" class="t-mono">RUN pip install -r req…</text><text x="806" y="202" text-anchor="end" class="t-muted">CACHED ⚡</text>
+        <rect class="box3" x="480" y="224" width="340" height="38" rx="6"/><text x="496" y="248" class="t-mono">COPY app/ ./app/</text><text x="806" y="248" text-anchor="end" class="t-bold">main.py changed ✎</text>
+        <rect class="box3" x="480" y="270" width="340" height="38" rx="6"/><text x="496" y="294" class="t-mono">CMD [...]</text><text x="806" y="294" text-anchor="end" class="t-bold">REBUILD (instant)</text>
+        <path class="line bad" d="M464 243 L464 308"/><circle class="dot-bad" cx="464" cy="243" r="5"/>
+        <text x="430" y="340" text-anchor="middle" class="t-muted">The red bar marks the cascade. Everything from the first changed step downward re-runs. Timings illustrative.</text>
+      </svg>
+      <figcaption>Same edit to <code>app/main.py</code>. The only difference is order. Put what changes least at the top and what changes most at the bottom.</figcaption>
+    </figure>
+
+    <div class="widget" id="cachew">
+      <div class="w-title">Layer-cache simulator</div>
+      <div class="w-sub">Pick a Dockerfile and a change, then build. Steps turn ✔ CACHED or ⟳ REBUILT following Docker's rule: the first invalidated step and everything after it re-run. Timings are illustrative.</div>
+      <div class="row">
+        <label style="margin:0">Dockerfile&nbsp;<select id="c-df">
+          <option value="good">reliability-api (multi-stage, deps first)</option>
+          <option value="bad">naive single-stage (COPY . . first)</option>
+        </select></label>
+        <label style="margin:0"><input type="checkbox" id="c-ign" checked> .dockerignore present</label>
+      </div>
+      <div class="row">
+        <label style="margin:0">Change since last build&nbsp;<select id="c-chg">
+          <option value="none">nothing (rebuild immediately)</option>
+          <option value="code" selected>edit app/main.py</option>
+          <option value="req">bump a version in requirements.txt</option>
+          <option value="readme">edit README.md</option>
+          <option value="git">new git commit (.git changes)</option>
+          <option value="base">base image digest updated (docker build --pull)</option>
+          <option value="env">change LOG_LEVEL default in the Dockerfile ENV line</option>
+        </select></label>
+        <button class="btn primary" id="c-go">docker build</button>
+      </div>
+      <div class="out" id="c-out" aria-live="polite"></div>
+    </div>
+    <h3>Cache gotchas</h3>
+    <ul>
+      <li><strong><code>RUN apt-get update</code> alone in a layer gets cached forever.</strong> A later <code>apt-get install newpkg</code> then uses a stale package index. Docker's best-practices guide: always combine <code>apt-get update</code> and <code>apt-get install</code> in one <code>RUN</code>, and clean <code>/var/lib/apt/lists/*</code> in the same step.</li>
+      <li><strong>Unpinned dependencies plus cache = "works on my machine" for builds.</strong> <code>pip install fastapi</code> is cached on your laptop with last month's version, while CI (no cache) gets today's. Pin versions in <code>requirements.txt</code>.</li>
+      <li><strong>Fresh build on purpose:</strong> <code>docker build --pull --no-cache …</code> re-checks the base image and ignores the cache. The best-practices guide recommends this combination for periodic rebuilds that pick up security fixes.</li>
+    </ul>
+
+    <!-- ============================================================ MULTI-STAGE -->
+    <h2 id="s-multistage">Multi-stage builds</h2>
+    <p><strong>Definition</strong> (Docker docs): <em>"Each FROM instruction can use a different base, and each of them begins a new stage of the build. You can selectively copy artifacts from one stage to another, leaving behind everything you don't want in the final image."</em> Stages are named with <code>AS name</code>, files move with <code>COPY --from=name</code>, and <code>docker build --target name</code> stops at a chosen stage. With BuildKit, <em>"only … stages your target depends on"</em> are built.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Builder stage produces /opt/venv which is copied into a clean runtime stage">
+        <defs><marker id="m2b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="20" y="20" width="360" height="250" rx="10"/>
+        <text x="36" y="42" class="t-bold">Stage "builder" (discarded)</text>
+        <rect class="box" x="40" y="56" width="320" height="32" rx="6"/><text x="200" y="77" text-anchor="middle" class="t-mono">python:3.12-slim</text>
+        <rect class="box3" x="40" y="96" width="320" height="32" rx="6"/><text x="200" y="117" text-anchor="middle" class="t-mono">pip, setuptools, build tools</text>
+        <rect class="box3" x="40" y="136" width="320" height="32" rx="6"/><text x="200" y="157" text-anchor="middle" class="t-mono">requirements.txt, temp files</text>
+        <rect class="box4" x="40" y="176" width="320" height="40" rx="6"/><text x="200" y="201" text-anchor="middle" class="t-bold">/opt/venv  (fastapi, uvicorn, …)</text>
+        <text x="200" y="250" text-anchor="middle" class="t-muted">(if a package needed gcc, it would live here only)</text>
+        <path class="line accent" d="M360 196 L478 196" marker-end="url(#m2b)"/>
+        <text x="420" y="184" text-anchor="middle" class="t-mono">COPY</text><text x="420" y="216" text-anchor="middle" class="t-mono">--from=builder</text>
+        <rect class="zone" x="480" y="20" width="360" height="250" rx="10"/>
+        <text x="496" y="42" class="t-bold">Stage "runtime" (the image you ship)</text>
+        <rect class="box" x="500" y="56" width="320" height="32" rx="6"/><text x="660" y="77" text-anchor="middle" class="t-mono">python:3.12-slim (same base)</text>
+        <rect class="box" x="500" y="96" width="320" height="32" rx="6"/><text x="660" y="117" text-anchor="middle" class="t-mono">user app (10001)</text>
+        <rect class="box4" x="500" y="136" width="320" height="32" rx="6"/><text x="660" y="157" text-anchor="middle" class="t-mono">/opt/venv</text>
+        <rect class="box2" x="500" y="176" width="320" height="40" rx="6"/><text x="660" y="201" text-anchor="middle" class="t-bold">/app/app/main.py</text>
+        <text x="660" y="250" text-anchor="middle" class="t-muted">USER 10001 · CMD uvicorn … (exec form)</text>
+      </svg>
+      <figcaption>The venv is copied to the <em>same path</em> on the <em>same base image</em>. Virtualenvs contain absolute paths and point at the base image's Python, so both must match.</figcaption>
+    </figure>
+    <div class="callout note"><span class="label">Honest trade-off for this app</span>
+      <p>reliability-api's dependencies are pure-Python or ship prebuilt wheels, so the size win over a careful single-stage build is modest (mostly pip's own leftovers). The pattern pays off as soon as a dependency needs a compiler (<code>build-essential</code> can add hundreds of MB), and it is the standard shape you will reuse for Go, Node, or model-serving images. Measure it in Lab 2 rather than assuming.</p>
+    </div>
+<pre data-title="Useful multi-stage commands"><code>$ docker build --target builder -t reliability-api:builder .   <span class="c"># stop at the builder stage (debugging)</span>
+$ docker run --rm -it reliability-api:builder bash              <span class="c"># poke around inside it</span>
+$ docker build -t reliability-api:0.1.0 .                       <span class="c"># full build → runtime stage</span></code></pre>
+
+    <!-- ============================================================ NON-ROOT -->
+    <h2 id="s-nonroot">Running as non-root</h2>
+    <p><strong>Problem.</strong> By default a container's process runs as <strong>root (UID 0)</strong> unless the image sets <code>USER</code>. Namespaces limit what that root can see, but it is still UID 0 to the shared kernel. If the app is compromised, root inside the container can install tools, rewrite the app, and make any kernel or runtime escape bug much more dangerous. Docker's best-practices guide: create a dedicated user and switch with <code>USER</code>.</p>
+    <h3>How the reliability-api image does it</h3>
+    <ol>
+      <li><code>groupadd --system --gid 10001 app &amp;&amp; useradd --system --uid 10001 …</code>: a fixed, high, numeric ID that cannot collide with host system users.</li>
+      <li>Code is copied <em>before</em> <code>USER</code> and without <code>--chown</code>. Docker's reference: <em>"Without this flag, files are created with UID and GID of 0."</em> The code is therefore root-owned and world-readable, and the app user can read and execute it but not modify it.</li>
+      <li><code>USER 10001:10001</code> uses <em>numeric</em> IDs. Kubernetes' <code>runAsNonRoot: true</code> check can verify a numeric UID without reading <code>/etc/passwd</code> (Module 05).</li>
+      <li>The port is 8000, so no <code>CAP_NET_BIND_SERVICE</code> is needed (Module 01, privileged ports).</li>
+    </ol>
+<pre data-title="Verify"><code>$ docker run --rm reliability-api:0.1.0 id
+<span class="o">uid=10001(app) gid=10001(app) groups=10001(app)</span>
+$ docker run --rm reliability-api:0.1.0 sh -c 'touch /app/app/x'
+<span class="o">touch: cannot touch '/app/app/x': Permission denied</span>       <span class="c"># good: code is immutable to the app</span>
+<span class="c"># Example output (yours will differ in names/IDs/timings)</span></code></pre>
+    <div class="callout warn"><span class="label">Failure case: the app needs to write somewhere</span><p>If you later add a feature that writes a file (a cache, an upload), it fails with <code>PermissionError</code>. Do not "fix" it with <code>USER root</code> or <code>chmod 777</code>. Write to <code>/tmp</code>, or mount a volume (or a Kubernetes <code>emptyDir</code>) at a dedicated path and give the app user ownership of that path only.</p></div>
+
+    <!-- ============================================================ LIFECYCLE -->
+    <h2 id="s-lifecycle">Image vs container lifecycle</h2>
+    <p>An <strong>image</strong> has a simple life: it is built or pulled, tagged, pushed, and eventually removed. A <strong>container</strong> is a state machine. <code>docker ps</code> filters recognise these states: <em>"created, restarting, running, removing, paused, exited, or dead"</em>.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 880 380" role="img" aria-label="State diagram of image and container lifecycle with docker commands as transitions">
+        <defs><marker id="m2c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <!-- image row -->
+        <rect class="zone" x="10" y="10" width="860" height="80" rx="10"/>
+        <text x="24" y="30" class="t-muted">image</text>
+        <rect class="box" x="40" y="40" width="130" height="38" rx="19"/><text x="105" y="64" text-anchor="middle">Dockerfile</text>
+        <rect class="box2" x="250" y="40" width="190" height="38" rx="19"/><text x="345" y="64" text-anchor="middle" class="t-bold">local image</text>
+        <rect class="box" x="560" y="40" width="160" height="38" rx="19"/><text x="640" y="64" text-anchor="middle">registry</text>
+        <path class="line" d="M170 59 L248 59" marker-end="url(#m2c)"/><text x="209" y="52" text-anchor="middle" class="t-mono">build</text>
+        <path class="line" d="M440 52 L558 52" marker-end="url(#m2c)"/><text x="499" y="46" text-anchor="middle" class="t-mono">push</text>
+        <path class="line" d="M558 70 L442 70" marker-end="url(#m2c)"/><text x="499" y="86" text-anchor="middle" class="t-mono">pull</text>
+        <text x="790" y="64" text-anchor="middle" class="t-mono">rmi → deleted</text>
+        <!-- container states -->
+        <rect class="box3" x="40" y="160" width="130" height="44" rx="22"/><text x="105" y="187" text-anchor="middle" class="t-bold">created</text>
+        <rect class="box4" x="300" y="160" width="140" height="44" rx="22"/><text x="370" y="187" text-anchor="middle" class="t-bold">running</text>
+        <rect class="box3" x="580" y="160" width="130" height="44" rx="22"/><text x="645" y="187" text-anchor="middle" class="t-bold">paused</text>
+        <rect class="box3" x="300" y="290" width="140" height="44" rx="22"/><text x="370" y="317" text-anchor="middle" class="t-bold">exited (code)</text>
+        <rect class="box" x="40" y="290" width="130" height="44" rx="22"/><text x="105" y="317" text-anchor="middle" class="t-bold">removed</text>
+        <rect class="box3" x="580" y="290" width="130" height="44" rx="22"/><text x="645" y="317" text-anchor="middle" class="t-bold">restarting</text>
+        <path class="line dash" d="M300 78 L120 158" marker-end="url(#m2c)"/><text x="160" y="118" class="t-mono">create</text>
+        <path class="line dash" d="M360 78 L368 158" marker-end="url(#m2c)"/><text x="374" y="128" class="t-mono">run = create+start</text>
+        <path class="line" d="M170 182 L298 182" marker-end="url(#m2c)"/><text x="234" y="174" text-anchor="middle" class="t-mono">start</text>
+        <path class="line" d="M440 174 L578 174" marker-end="url(#m2c)"/><text x="509" y="166" text-anchor="middle" class="t-mono">pause</text>
+        <path class="line" d="M578 192 L442 192" marker-end="url(#m2c)"/><text x="509" y="208" text-anchor="middle" class="t-mono">unpause</text>
+        <path class="line bad" d="M350 204 L350 288" marker-end="url(#m2c)"/><text x="230" y="240" class="t-mono">stop / kill /</text><text x="230" y="256" class="t-mono">process exits</text>
+        <path class="line ok" d="M390 288 L390 206" marker-end="url(#m2c)"/><text x="398" y="250" class="t-mono">start</text>
+        <path class="line" d="M300 312 L172 312" marker-end="url(#m2c)"/><text x="236" y="304" text-anchor="middle" class="t-mono">rm</text>
+        <path class="line" d="M440 312 L578 312" marker-end="url(#m2c)"/><text x="509" y="304" text-anchor="middle" class="t-mono">--restart policy</text>
+        <path class="line" d="M630 290 L440 200" marker-end="url(#m2c)"/>
+        <text x="740" y="240" class="t-muted">--rm: removed</text><text x="740" y="256" class="t-muted">automatically</text><text x="740" y="272" class="t-muted">on exit</text>
+        <text x="440" y="366" text-anchor="middle" class="t-muted">The exited container keeps its writable layer, logs, and exit code until rm. That is your evidence: inspect it before removing.</text>
+      </svg>
+      <figcaption>Commands label the transitions (<code>docker container …</code>). Kubernetes runs the same container states underneath Pod phases (Module 03/04).</figcaption>
+    </figure>
+<pre data-title="Walk the lifecycle yourself"><code>$ docker create --name ra reliability-api:0.1.0     <span class="c"># created (not running)</span>
+$ docker start ra                                   <span class="c"># running</span>
+$ docker pause ra; docker unpause ra                <span class="c"># frozen / resumed</span>
+$ docker stop ra                                    <span class="c"># SIGTERM → (10 s) → SIGKILL → exited</span>
+$ docker ps -a --filter name=ra --format '{{.Names}}  {{.Status}}'
+<span class="o">ra  Exited (0) 4 seconds ago</span>
+$ docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' ra
+<span class="o">exited exit=0 oom=false</span>
+$ docker logs ra                                    <span class="c"># logs survive until rm</span>
+$ docker rm ra                                      <span class="c"># removed: writable layer + logs gone</span>
+<span class="c"># Example output (yours will differ). Exit may be 0 or 143 depending on Uvicorn version (Module 01).</span></code></pre>
+
+    <!-- ============================================================ TAGS & DIGESTS -->
+    <h2 id="s-tags">Tags, digests, and registries</h2>
+    <p>A full image reference is <code>[registry/][namespace/]repository[:tag][@digest]</code>. <code>reliability-api:0.1.0</code> is local (Docker Hub is the default registry when none is given). In CI you will push <code>ghcr.io/&lt;you&gt;/reliability-api:&lt;git-sha&gt;</code> (Module 09).</p>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Tag (<code>:0.1.0</code>, <code>:latest</code>)</th><th>Digest (<code>@sha256:…</code>)</th></tr>
+      <tr><td>Mutability</td><td>Mutable: anyone with push rights can point it at a new image</td><td>Immutable: a hash of the content</td></tr>
+      <tr><td>Good for</td><td>Humans, release names, "which version is this?"</td><td>Reproducible builds, deploys, rollbacks, supply-chain security</td></tr>
+      <tr><td>Risk</td><td>Two nodes pulling <code>:0.1.0</code> at different times can run different bytes</td><td>Hard to read. You will not get security fixes until you update it deliberately</td></tr>
+    </table></div>
+    <p>Docker's best-practices guide: <em>"By pinning your images to a digest, you're guaranteed to always use the same image version, even if a publisher replaces the tag with a new image."</em> The pull docs describe the digest as an <em>"immutable identifier"</em>. Digests work in <code>pull</code>, <code>run</code>, <code>create</code>, <code>rmi</code>, and in a Dockerfile's <code>FROM</code>.</p>
+    <div class="callout warn"><span class="label">Why <code>latest</code> is not a version</span><p><code>latest</code> is just the default tag name used when you omit one. It does not mean "newest", and it says nothing about what is inside. Deploying <code>:latest</code> makes rollbacks ambiguous ("which latest?"). Kubernetes also defaults <code>imagePullPolicy</code> to <code>Always</code> for <code>:latest</code> (Module 03). Use explicit versions, and in CI an immutable tag such as the git SHA.</p></div>
+<pre data-title="Tags and digests in practice"><code>$ docker pull python:3.12-slim
+<span class="o">…
+Digest: sha256:&lt;64-hex-characters&gt;
+Status: Downloaded newer image for python:3.12-slim</span>
+$ docker image inspect --format '{{index .RepoDigests 0}}' python:3.12-slim
+<span class="o">python@sha256:&lt;64-hex-characters&gt;</span>       <span class="c"># paste into ARG PYTHON_IMAGE=python:3.12-slim@sha256:…</span>
+$ docker tag reliability-api:0.1.0 ghcr.io/&lt;you&gt;/reliability-api:0.1.0   <span class="c"># a second name, same image ID</span>
+$ docker image ls --digests reliability-api
+<span class="c"># A locally built, never-pushed image shows DIGEST &lt;none&gt;: the registry digest exists after push.</span></code></pre>
+
+    <!-- ============================================================ PID 1 & SIGNALS -->
+    <h2 id="s-pid1">PID 1, exec form, and signal handling</h2>
+    <p>This is where Module 01 pays off. <code>docker stop</code> sends <strong>SIGTERM</strong> (or the image's <code>STOPSIGNAL</code>; <em>"The default is SIGTERM if not defined"</em>) to the container's <strong>PID 1</strong>. It waits <em>"10 seconds for Linux containers"</em> by default (<code>-t</code>/<code>--stop-timeout</code> changes it), then sends <strong>SIGKILL</strong>. Whether shutdown is graceful depends entirely on <em>which process is PID 1</em> and whether it handles SIGTERM. A PID 1 with no handler silently ignores SIGTERM (<code>pid_namespaces(7)</code>).</p>
+    <h3>Exec form vs shell form</h3>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Exec form (✔ use this)</th><th>Shell form (✘ avoid for the main process)</th></tr>
+      <tr><td>Syntax</td><td><code>CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]</code></td><td><code>CMD uvicorn app.main:app --host 0.0.0.0 --port 8000</code></td></tr>
+      <tr><td>What runs</td><td>The executable directly, as PID 1</td><td><code>/bin/sh -c "uvicorn …"</code>: the <strong>shell</strong> is PID 1 and Uvicorn is its child</td></tr>
+      <tr><td>Signals</td><td>Uvicorn receives SIGTERM and drains gracefully</td><td>Docker: <em>"/bin/sh -c … does not pass signals"</em>. SIGTERM goes to the shell, which (as PID 1 without a handler) ignores it. Result: 10 s wait, SIGKILL, exit 137</td></tr>
+      <tr><td>Env var expansion</td><td>No shell, so <code>$VAR</code> is not expanded</td><td>Shell expands <code>$PORT</code> etc.</td></tr>
+    </table></div>
+    <p>FastAPI's Docker guide makes the same point: <em>"Make sure to always use the exec form to ensure that FastAPI can shutdown gracefully and lifespan events are triggered."</em> Some <code>/bin/sh</code> implementations replace themselves with the command when given a single simple command, so shell form <em>sometimes</em> appears to work. Do not rely on that behaviour. Use exec form.</p>
+    <div class="callout tip"><span class="label">Need a shell for variable expansion?</span><p>Use a tiny entrypoint script that ends with <code>exec</code>: <code>exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"</code>. <code>exec</code> <em>replaces</em> the shell with Uvicorn (same PID), so Uvicorn becomes PID 1 again.</p></div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Process tree and signal path for exec form, shell form, and --init">
+        <defs><marker id="m2d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="140" y="22" text-anchor="middle" class="t-bold">Exec form</text>
+        <text x="430" y="22" text-anchor="middle" class="t-bold">Shell form</text>
+        <text x="720" y="22" text-anchor="middle" class="t-bold">--init (docker-init / tini)</text>
+        <rect class="box" x="60" y="40" width="160" height="36" rx="6"/><text x="140" y="63" text-anchor="middle" class="t-mono">docker stop</text>
+        <rect class="box4" x="40" y="120" width="200" height="50" rx="8"/><text x="140" y="142" text-anchor="middle" class="t-bold">PID 1 uvicorn</text><text x="140" y="160" text-anchor="middle" class="t-muted">has SIGTERM handler</text>
+        <path class="line ok" d="M140 76 L140 118" marker-end="url(#m2d)"/><text x="148" y="102" class="t-mono">SIGTERM</text>
+        <text x="140" y="200" text-anchor="middle" class="t-bold">✔ drains, exits in ~1 s</text>
+        <rect class="box" x="350" y="40" width="160" height="36" rx="6"/><text x="430" y="63" text-anchor="middle" class="t-mono">docker stop</text>
+        <rect class="box3" x="330" y="120" width="200" height="50" rx="8"/><text x="430" y="142" text-anchor="middle" class="t-bold">PID 1 /bin/sh -c</text><text x="430" y="160" text-anchor="middle" class="t-muted">no handler → ignored</text>
+        <rect class="box" x="330" y="200" width="200" height="40" rx="8"/><text x="430" y="225" text-anchor="middle" class="t-mono">PID 7 uvicorn</text>
+        <path class="line bad" d="M430 76 L430 118" marker-end="url(#m2d)"/><text x="438" y="102" class="t-mono">SIGTERM ✕</text>
+        <path class="line dash" d="M430 170 L430 198"/>
+        <text x="430" y="268" text-anchor="middle" class="t-bold">✘ 10 s later SIGKILL → 137</text>
+        <rect class="box" x="640" y="40" width="160" height="36" rx="6"/><text x="720" y="63" text-anchor="middle" class="t-mono">docker stop</text>
+        <rect class="box2" x="620" y="120" width="200" height="50" rx="8"/><text x="720" y="142" text-anchor="middle" class="t-bold">PID 1 docker-init</text><text x="720" y="160" text-anchor="middle" class="t-muted">forwards signals, reaps</text>
+        <rect class="box4" x="620" y="200" width="200" height="40" rx="8"/><text x="720" y="225" text-anchor="middle" class="t-mono">PID 7 your app</text>
+        <path class="line ok" d="M720 76 L720 118" marker-end="url(#m2d)"/><text x="728" y="102" class="t-mono">SIGTERM</text>
+        <path class="line ok" d="M720 170 L720 198" marker-end="url(#m2d)"/>
+        <text x="720" y="268" text-anchor="middle" class="t-bold">✔ app gets SIGTERM as non-PID-1</text>
+      </svg>
+      <figcaption><code>--init</code>: <em>"Run an init inside the container that forwards signals and reaps processes"</em>. The default init is <code>docker-init</code>, <em>"backed by tini"</em>. It helps apps that are not written to be PID 1, and it reaps zombies.</figcaption>
+    </figure>
+
+    <div class="widget" id="stopw">
+      <div class="w-title">docker stop simulator</div>
+      <div class="w-sub">Choose how the image starts and run <code>docker stop</code> (default 10 s timeout). The outcome follows the PID 1 rules above.</div>
+      <div class="row">
+        <label style="margin:0">CMD&nbsp;<select id="s-form"><option value="exec">exec form ["uvicorn", …]</option><option value="shell">shell form: uvicorn …</option><option value="script">exec form, but the app is a Python script with NO SIGTERM handler</option></select></label>
+      </div>
+      <div class="row">
+        <label style="margin:0"><input type="checkbox" id="s-init"> docker run --init</label>
+        <label style="margin:0">--stop-timeout&nbsp;<input type="number" id="s-to" value="10" min="0" max="120" style="width:70px"> s</label>
+        <button class="btn primary" id="s-go">docker stop</button>
+      </div>
+      <div class="out" id="s-out" aria-live="polite"></div>
+    </div>
+    <div class="callout note"><span class="label">Kubernetes uses the same rule</span><p>At Pod termination the kubelet <em>"triggers the container runtime to send a TERM signal to process 1 inside each container"</em>, waits <code>terminationGracePeriodSeconds</code> (<em>"The default … is 30 seconds"</em>), then kills. A shell-form image that takes 10 s to stop in Docker takes 30 s per Pod in Kubernetes, and drops in-flight requests at the end. Rolling updates get slow and lossy (Module 04).</p></div>
+
+    <!-- ============================================================ DOCKER RUN -->
+    <h2 id="s-run">docker run, flag by flag</h2>
+    <p>The canonical way to run the image locally:</p>
+<pre data-title="Run reliability-api"><code>$ docker run --rm -d --name reliability-api \
+    -p 127.0.0.1:8000:8000 \
+    -e LOG_LEVEL=debug -e READY_DELAY_SECONDS=10 \
+    --memory 256m --cpus 1 \
+    reliability-api:0.1.0
+<span class="o">3f2c9a1b7e04d5…</span>                      <span class="c"># -d prints the container ID</span>
+$ docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+<span class="o">NAMES             STATUS                             PORTS
+reliability-api   Up 12 seconds (health: starting)   127.0.0.1:8000-&gt;8000/tcp</span>
+<span class="c"># Example output (yours will differ in names/IDs/timings)</span></code></pre>
+    <div class="table-wrap"><table>
+      <tr><th>Flag</th><th>Docs say</th><th>Use with reliability-api</th></tr>
+      <tr><td><code>-p, --publish</code></td><td><em>"Publish a container's port(s) to the host"</em>. Form <code>[hostIP:]hostPort:containerPort[/proto]</code></td><td><code>-p 127.0.0.1:8000:8000</code>: laptop only. <code>-p 8000:8000</code>: all host addresses</td></tr>
+      <tr><td><code>-e, --env</code> / <code>--env-file</code></td><td><em>"Set environment variables"</em> / <em>"Read in a file of environment variables"</em>. These override <code>ENV</code> in the Dockerfile</td><td><code>-e LOG_LEVEL=debug</code>, <code>--env-file ./local.env</code> (keep that file out of git and the build context)</td></tr>
+      <tr><td><code>--rm</code></td><td><em>"Automatically remove the container and its associated anonymous volumes when it exits"</em></td><td>Labs and one-off runs. Leave it off when you need to inspect a crashed container</td></tr>
+      <tr><td><code>--name</code></td><td><em>"Assign a name to the container"</em></td><td>Stable name for <code>logs</code>, <code>exec</code>, and DNS on user-defined networks</td></tr>
+      <tr><td><code>-d, --detach</code></td><td><em>"Run container in background and print container ID"</em></td><td>Keep your terminal. Follow logs with <code>docker logs -f</code></td></tr>
+      <tr><td><code>-m, --memory</code></td><td><em>"The maximum amount of memory the container can use"</em> (minimum 6m)</td><td><code>--memory 256m</code> mirrors the Kubernetes limit 256Mi. Exceeding it triggers an OOM kill → 137</td></tr>
+      <tr><td><code>--cpus</code></td><td><em>"Specify how much of the available CPU resources a container can use"</em>. <code>--cpus=1.5</code> ≡ <code>--cpu-period=100000 --cpu-quota=150000</code></td><td><code>--cpus 1</code>. CPU is <em>throttled</em>, never killed: <code>/work</code> just gets slower</td></tr>
+      <tr><td><code>--init</code></td><td><em>"Run an init inside the container that forwards signals and reaps processes"</em></td><td>Not needed for Uvicorn with exec form. It is the fix for images whose PID 1 cannot handle signals</td></tr>
+      <tr><td><code>--stop-timeout</code></td><td><em>"Timeout (in seconds) to stop a container"</em>, then SIGKILL</td><td>Raise it if <code>/work</code> requests can run longer than 10 s</td></tr>
+      <tr><td><code>--network</code></td><td><em>"Connect a container to a network"</em></td><td><code>--network reliability-net</code> (user-defined bridge, below)</td></tr>
+      <tr><td><code>-v</code> / <code>--mount</code></td><td><em>"Bind mount a volume"</em> / <em>"Attach a filesystem mount to the container"</em></td><td>Not needed by the stateless app. Used in the storage section</td></tr>
+      <tr><td><code>--health-cmd</code> etc.</td><td><em>"Command to run to check health"</em>, which overrides the image's HEALTHCHECK</td><td>Rarely. Prefer the Dockerfile's definition</td></tr>
+    </table></div>
+
+    <h3>Port mapping: two hops, two bindings</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Port mapping from host address and port through Docker forwarding to container eth0 and uvicorn">
+        <defs><marker id="m2e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="110" width="150" height="60" rx="8"/><text x="95" y="135" text-anchor="middle" class="t-bold">curl on laptop</text><text x="95" y="155" text-anchor="middle" class="t-mono">localhost:8000</text>
+        <rect class="zone" x="200" y="30" width="640" height="240" rx="12"/>
+        <text x="216" y="52" class="t-muted">Docker host (on macOS: Docker Desktop's Linux VM, transparently forwarded)</text>
+        <rect class="box3" x="220" y="100" width="190" height="80" rx="8"/>
+        <text x="315" y="124" text-anchor="middle" class="t-bold">host port 8000</text>
+        <text x="315" y="144" text-anchor="middle" class="t-mono">-p 127.0.0.1:8000:8000</text>
+        <text x="315" y="164" text-anchor="middle" class="t-muted">hop 1: Docker's bind</text>
+        <rect class="zone" x="470" y="70" width="350" height="180" rx="10"/>
+        <text x="486" y="92" class="t-muted">container network namespace</text>
+        <rect class="box" x="490" y="110" width="140" height="40" rx="6"/><text x="560" y="135" text-anchor="middle" class="t-mono">eth0 172.17.0.2</text>
+        <rect class="box" x="490" y="190" width="140" height="40" rx="6"/><text x="560" y="215" text-anchor="middle" class="t-mono">lo 127.0.0.1</text>
+        <rect class="box4" x="660" y="140" width="146" height="60" rx="8"/><text x="733" y="164" text-anchor="middle" class="t-bold">uvicorn :8000</text><text x="733" y="184" text-anchor="middle" class="t-mono">--host 0.0.0.0</text>
+        <path class="line accent" d="M170 140 L218 140" marker-end="url(#m2e)"/>
+        <path class="line accent" d="M410 135 L488 130" marker-end="url(#m2e)"/>
+        <text x="449" y="122" text-anchor="middle" class="t-muted">DNAT</text>
+        <path class="line ok" d="M630 130 L658 160" marker-end="url(#m2e)"/>
+        <path class="line ok" d="M630 210 L658 182" marker-end="url(#m2e)"/>
+        <text x="733" y="226" text-anchor="middle" class="t-muted">hop 2: the app's bind</text>
+      </svg>
+      <figcaption>Hop 1 (<code>-p</code>) decides who on the network can reach the host port. Hop 2 (<code>--host</code>) decides whether the app accepts traffic arriving on the container's <code>eth0</code>. Both must be right.</figcaption>
+    </figure>
+    <p>Docker's port-publishing docs: <em>"when a container's ports are mapped without any specific host address, the Docker daemon publishes ports to all host addresses (0.0.0.0 and [::])"</em>, and <em>"publishing container ports is insecure by default"</em>. To restrict to the local machine: <code>-p 127.0.0.1:8080:80</code>. <code>-P</code> publishes all <code>EXPOSE</code>d ports to random host ports.</p>
+
+    <div class="widget" id="portw">
+      <div class="w-title">Port-mapping explorer</div>
+      <div class="w-sub">Build a <code>docker run</code> and a <code>curl</code>. See whether it works, what <code>docker ps</code> shows, and why.</div>
+      <div class="row">
+        <label style="margin:0">-p host IP&nbsp;<select id="p-hip"><option value="">(none: all addresses)</option><option value="127.0.0.1">127.0.0.1</option></select></label>
+        <label style="margin:0">host port&nbsp;<input type="number" id="p-hp" value="8080" min="1" max="65535" style="width:90px"></label>
+        <label style="margin:0">container port&nbsp;<input type="number" id="p-cp" value="8000" min="1" max="65535" style="width:90px"></label>
+      </div>
+      <div class="row">
+        <label style="margin:0">uvicorn --host&nbsp;<select id="p-bind"><option value="0.0.0.0">0.0.0.0</option><option value="127.0.0.1">127.0.0.1 (default)</option></select></label>
+        <label style="margin:0">uvicorn --port&nbsp;<input type="number" id="p-ap" value="8000" min="1" max="65535" style="width:90px"></label>
+      </div>
+      <div class="row">
+        <label style="margin:0">curl from&nbsp;<select id="p-from"><option value="laptop-lo">this laptop → localhost:HOSTPORT</option><option value="lan">another machine → laptop-LAN-IP:HOSTPORT</option><option value="laptop-cp">this laptop → localhost:CONTAINERPORT</option></select></label>
+      </div>
+      <div class="out" id="p-out" aria-live="polite"></div>
+    </div>
+
+    <!-- ============================================================ RESOURCES -->
+    <h2 id="s-limits">Resource limits: --memory, --cpus, and exit 137</h2>
+    <p>These flags write <strong>cgroup</strong> settings (Module 01): <em>"Docker modifies the settings for the container's cgroup on the host machine."</em> They behave differently:</p>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Memory (<code>--memory</code>)</th><th>CPU (<code>--cpus</code>)</th></tr>
+      <tr><td>Kind of resource</td><td>Incompressible: cannot be taken back without killing</td><td>Compressible: time can be withheld</td></tr>
+      <tr><td>Over the limit</td><td>Kernel OOM killer sends SIGKILL to a process in the cgroup → exit <strong>137</strong>, <code>OOMKilled=true</code></td><td><strong>Throttled</strong>: the process waits for the next CFS period (100 ms default). It runs slower and is never killed</td></tr>
+      <tr><td>reliability-api symptom</td><td>Container disappears mid-request, no shutdown logs</td><td><code>/work?ms=50</code> takes much longer than 50 ms of wall time under load</td></tr>
+      <tr><td>Kubernetes equivalent</td><td><code>limits.memory: 256Mi</code></td><td><code>limits.cpu</code> (a trade-off, Module 04)</td></tr>
+    </table></div>
+    <div class="callout warn"><span class="label">Swap detail</span><p>From the resource-constraints docs: <em>"If --memory-swap is unset, and --memory is set, the container can use as much swap as the --memory setting, if the host has swap memory configured."</em> So <code>--memory 64m</code> can mean up to 128 MB of memory plus swap. Set <code>--memory-swap</code> equal to <code>--memory</code> to disable swap and make experiments match Kubernetes (where nodes typically run without swap).</p></div>
+<pre data-title="Watch limits in action"><code>$ docker stats --no-stream reliability-api
+<span class="o">CONTAINER ID   NAME              CPU %   MEM USAGE / LIMIT   MEM %   NET I/O   BLOCK I/O   PIDS
+3f2c9a1b7e04   reliability-api   0.31%   41.2MiB / 256MiB    16.09%  …         …           3</span>
+<span class="c"># Example output (yours will differ in names/IDs/timings)</span></code></pre>
+
+    <!-- ============================================================ STORAGE -->
+    <h2 id="s-storage">Storage: writable layer, volumes, bind mounts, tmpfs</h2>
+    <p>The writable layer is ephemeral: <em>"When a container is destroyed, the writable layer is destroyed with it. Using a volume ensures that the data is persisted even if the container using it is removed."</em> Docker offers three mount types:</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 320" role="img" aria-label="Volumes, bind mounts and tmpfs mounts and where their data lives on the host">
+        <rect class="zone" x="20" y="20" width="820" height="130" rx="10"/>
+        <text x="36" y="42" class="t-muted">container filesystem view</text>
+        <rect class="box2" x="40" y="56" width="230" height="76" rx="8"/><text x="155" y="82" text-anchor="middle" class="t-mono">/data</text><text x="155" y="104" text-anchor="middle" class="t-bold">volume</text><text x="155" y="122" text-anchor="middle" class="t-muted">type=volume</text>
+        <rect class="box3" x="314" y="56" width="230" height="76" rx="8"/><text x="429" y="82" text-anchor="middle" class="t-mono">/app/app (dev only)</text><text x="429" y="104" text-anchor="middle" class="t-bold">bind mount</text><text x="429" y="122" text-anchor="middle" class="t-muted">type=bind</text>
+        <rect class="box4" x="588" y="56" width="230" height="76" rx="8"/><text x="703" y="82" text-anchor="middle" class="t-mono">/tmp/scratch</text><text x="703" y="104" text-anchor="middle" class="t-bold">tmpfs</text><text x="703" y="122" text-anchor="middle" class="t-muted">type=tmpfs</text>
+        <path class="line" d="M155 132 L155 186"/><path class="line" d="M429 132 L429 186"/><path class="line" d="M703 132 L703 186"/>
+        <rect class="box" x="40" y="186" width="230" height="110" rx="8"/>
+        <text x="155" y="208" text-anchor="middle" class="t-bold">Docker-managed area</text>
+        <text x="155" y="228" text-anchor="middle" class="t-muted">created/named by Docker</text>
+        <text x="155" y="246" text-anchor="middle" class="t-muted">survives container rm</text>
+        <text x="155" y="264" text-anchor="middle" class="t-muted">portable, easy backup</text>
+        <text x="155" y="282" text-anchor="middle" class="t-muted">→ databases, state</text>
+        <rect class="box" x="314" y="186" width="230" height="110" rx="8"/>
+        <text x="429" y="208" text-anchor="middle" class="t-bold">any host path you choose</text>
+        <text x="429" y="228" text-anchor="middle" class="t-muted">depends on host layout</text>
+        <text x="429" y="246" text-anchor="middle" class="t-muted">write access by default</text>
+        <text x="429" y="264" text-anchor="middle" class="t-muted">→ live code reload, configs</text>
+        <text x="429" y="282" text-anchor="middle" class="t-muted">use readonly where possible</text>
+        <rect class="box" x="588" y="186" width="230" height="110" rx="8"/>
+        <text x="703" y="208" text-anchor="middle" class="t-bold">host memory only</text>
+        <text x="703" y="228" text-anchor="middle" class="t-muted">gone when container stops</text>
+        <text x="703" y="246" text-anchor="middle" class="t-muted">counts against --memory</text>
+        <text x="703" y="264" text-anchor="middle" class="t-muted">→ scratch, sensitive temp</text>
+        <text x="703" y="282" text-anchor="middle" class="t-muted">files</text>
+      </svg>
+      <figcaption>Kubernetes has direct analogues: PersistentVolumeClaim (volume), <code>hostPath</code> (bind, rarely appropriate), <code>emptyDir</code> with <code>medium: Memory</code> (tmpfs). See Module 05.</figcaption>
+    </figure>
+<pre data-title="Syntax"><code>$ docker volume create ra-data
+$ docker run --rm --mount type=volume,src=ra-data,dst=/data alpine sh -c 'date &gt;&gt; /data/log; cat /data/log'
+$ docker run --rm -v ra-data:/data alpine cat /data/log        <span class="c"># -v short form; data still there</span>
+$ docker run --rm --mount type=bind,src="$PWD/app",dst=/app/app,readonly reliability-api:0.1.0   <span class="c"># live code, read-only</span>
+$ docker run --rm --mount type=tmpfs,dst=/tmp/scratch reliability-api:0.1.0</code></pre>
+    <ul>
+      <li><strong>Mounting over a non-empty directory hides it</strong>: <em>"the pre-existing files are obscured by the mount"</em>. Bind-mounting an empty host folder over <code>/app/app</code> makes the app's code "disappear", and Uvicorn fails with <code>ModuleNotFoundError</code>.</li>
+      <li><strong>Permissions with bind mounts</strong>: files keep their host UID/GID. The container's UID 10001 may not be able to read them. Check with <code>ls -ln</code>.</li>
+      <li><strong>reliability-api is stateless</strong>: it needs no volume. That is deliberate. Stateless replicas are what make Kubernetes scaling and self-healing easy.</li>
+    </ul>
+
+    <!-- ============================================================ NETWORKS -->
+    <h2 id="s-net">Networks: user-defined bridges and container DNS</h2>
+    <p>Containers <em>"have networking enabled by default, and they can make outgoing connections."</em> Every container without <code>--network</code> joins the <strong>default bridge</strong>. On it, containers reach each other only by IP. <strong>User-defined bridge networks</strong> add two things: <em>"automatic DNS resolution between containers"</em> by name or alias, and isolation, because only containers attached to the network can talk to each other.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 320" role="img" aria-label="User-defined bridge network with embedded DNS resolving reliability-api for a load generator container">
+        <defs><marker id="m2f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="20" y="20" width="560" height="280" rx="12"/>
+        <text x="36" y="42" class="t-bold">network: reliability-net (user-defined bridge)</text>
+        <rect class="box2" x="50" y="70" width="200" height="70" rx="8"/><text x="150" y="96" text-anchor="middle" class="t-bold">loadgen</text><text x="150" y="116" text-anchor="middle" class="t-mono">curl reliability-api:8000</text><text x="150" y="132" text-anchor="middle" class="t-muted">172.20.0.3</text>
+        <rect class="box4" x="350" y="70" width="200" height="70" rx="8"/><text x="450" y="96" text-anchor="middle" class="t-bold">reliability-api</text><text x="450" y="116" text-anchor="middle" class="t-mono">0.0.0.0:8000</text><text x="450" y="132" text-anchor="middle" class="t-muted">172.20.0.2</text>
+        <rect class="box3" x="170" y="200" width="260" height="70" rx="8"/><text x="300" y="226" text-anchor="middle" class="t-bold">embedded DNS 127.0.0.11</text><text x="300" y="246" text-anchor="middle" class="t-mono">reliability-api → 172.20.0.2</text><text x="300" y="262" text-anchor="middle" class="t-muted">external names → host DNS</text>
+        <path class="line dash" d="M120 140 L200 198" marker-end="url(#m2f)"/><text x="80" y="180" class="t-mono">1 lookup</text>
+        <path class="line dash" d="M220 200 L140 142" marker-end="url(#m2f)"/>
+        <path class="line accent" d="M250 100 L348 100" marker-end="url(#m2f)"/><text x="299" y="92" text-anchor="middle" class="t-mono">2 TCP :8000</text>
+        <rect class="zone" x="620" y="20" width="220" height="280" rx="12"/>
+        <text x="636" y="42" class="t-bold">default bridge</text>
+        <rect class="box" x="640" y="70" width="180" height="56" rx="8"/><text x="730" y="94" text-anchor="middle">old-container</text><text x="730" y="114" text-anchor="middle" class="t-muted">172.17.0.5</text>
+        <text x="730" y="160" text-anchor="middle" class="t-muted">no name-based DNS;</text>
+        <text x="730" y="178" text-anchor="middle" class="t-muted">cannot reach</text>
+        <text x="730" y="196" text-anchor="middle" class="t-muted">reliability-net at all</text>
+        <text x="730" y="240" text-anchor="middle" class="t-mono">✕</text>
+      </svg>
+      <figcaption>Docker networking docs: <em>"Containers that attach to a custom network use Docker's embedded DNS server"</em> at <code>127.0.0.11</code>, which forwards external lookups to the host's DNS servers. Kubernetes gives you the same pattern with CoreDNS and Service names (Module 05).</figcaption>
+    </figure>
+<pre data-title="Two containers talking by name"><code>$ docker network create reliability-net
+$ docker run -d --rm --name reliability-api --network reliability-net reliability-api:0.1.0
+$ docker run --rm --network reliability-net curlimages/curl -s http://reliability-api:8000/health
+<span class="o">{"status":"ok"}</span>
+$ docker run --rm curlimages/curl -s --max-time 3 http://reliability-api:8000/health   <span class="c"># default bridge</span>
+<span class="o">curl: (6) Could not resolve host: reliability-api</span>
+<span class="c"># Note: no -p was needed for container-to-container traffic. Publishing is only for traffic from outside Docker.</span></code></pre>
+
+    <!-- ============================================================ HEALTHCHECK -->
+    <h2 id="s-health">HEALTHCHECK vs Kubernetes probes</h2>
+    <p><strong>Docker's HEALTHCHECK</strong> <em>"tells Docker how to test a container to check that it's still working. This can detect cases such as a web server stuck in an infinite loop and unable to handle new connections, even though the server process is still running."</em> Status starts as <code>starting</code>, becomes <code>healthy</code> after a passing check, and becomes <code>unhealthy</code> after <code>--retries</code> consecutive failures.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Option</th><th>Default</th><th>reliability-api value</th></tr>
+      <tr><td><code>--interval</code></td><td>30s</td><td>10s</td></tr>
+      <tr><td><code>--timeout</code></td><td>30s (a check that runs longer fails and is SIGKILLed)</td><td>3s</td></tr>
+      <tr><td><code>--start-period</code></td><td>0s (failures here do not count)</td><td>10s</td></tr>
+      <tr><td><code>--start-interval</code></td><td>5s (Docker Engine 25.0+)</td><td>default</td></tr>
+      <tr><td><code>--retries</code></td><td>3</td><td>3</td></tr>
+    </table></div>
+    <p>Exit status of the check command: <strong>0</strong> = healthy, <strong>1</strong> = unhealthy, <strong>2</strong> = reserved (<em>"don't use this exit code"</em>). Only one HEALTHCHECK counts, the last one in the Dockerfile. Check output (first 4096 bytes) is stored and visible with <code>docker inspect</code>.</p>
+<pre data-title="Read health status"><code>$ docker inspect --format '{{.State.Health.Status}}' reliability-api
+<span class="o">healthy</span>
+$ docker inspect --format '{{json .State.Health}}' reliability-api | python3 -m json.tool | head -20</code></pre>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Docker HEALTHCHECK</th><th>Kubernetes probes (Module 04)</th></tr>
+      <tr><td>Defined in</td><td>The image (Dockerfile)</td><td>The Pod spec. Kubernetes does not use the image's HEALTHCHECK</td></tr>
+      <tr><td>Who runs it</td><td>Docker daemon, <em>inside</em> the container (needs Python/curl in the image)</td><td>The kubelet: <code>httpGet</code> from outside the container, or exec/tcp/gRPC</td></tr>
+      <tr><td>Kinds</td><td>One</td><td>Three: <strong>startup</strong>, <strong>liveness</strong> (restart if failing), <strong>readiness</strong> (remove from Service endpoints if failing)</td></tr>
+      <tr><td>Action on failure</td><td>Only marks <code>unhealthy</code>. Plain <code>docker run</code> does <em>not</em> restart the container. Compose can wait on it</td><td>Liveness: restart the container. Readiness: stop sending traffic. Startup: hold off the other probes</td></tr>
+      <tr><td>reliability-api</td><td><code>/health</code></td><td>liveness → <code>/health</code>, readiness → <code>/ready</code> (503 during <code>READY_DELAY_SECONDS</code>)</td></tr>
+    </table></div>
+    <p>Kubernetes probe docs: <em>"Based on the probe results, Kubernetes can restart unhealthy containers or stop sending traffic to containers that are not ready."</em> An HTTP probe succeeds if <em>"the response has a status code greater than or equal to 200 and less than 400"</em>. Keep the Docker HEALTHCHECK for local and Compose use, and define real probes in Kubernetes.</p>
+
+    <!-- ============================================================ COMPOSE -->
+    <h2 id="s-compose">Docker Compose (brief)</h2>
+    <p><strong>What it is.</strong> A YAML file (<code>compose.yaml</code>, following the Compose Specification) that declares several <em>services</em> (containers), their networks, and volumes. <code>docker compose up</code> creates them together. Compose automatically creates a network for the project, so services resolve each other by service name. It is a stepping stone toward Kubernetes' declarative model, not a replacement for it.</p>
+<pre data-title="compose.yaml — reliability-api + a simple load loop"><code>services:
+  reliability-api:
+    build: .
+    image: reliability-api:0.1.0
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      LOG_LEVEL: info
+      READY_DELAY_SECONDS: "5"
+    mem_limit: 256m
+    cpus: 1.0
+
+  loadgen:
+    image: curlimages/curl
+    depends_on:
+      reliability-api:
+        condition: service_healthy    <span class="c"># waits for the image's HEALTHCHECK to pass</span>
+    entrypoint: ["sh", "-c", "while true; do curl -s 'http://reliability-api:8000/work?ms=50'; echo; sleep 1; done"]</code></pre>
+<pre><code>$ docker compose up -d --build
+$ docker compose ps
+$ docker compose logs -f loadgen
+$ docker compose down               <span class="c"># stops and removes containers and the default network</span></code></pre>
+    <p>Docker docs on <code>depends_on</code>: <em>"Compose waits for healthchecks to pass on dependencies marked with service_healthy."</em> Compose has no rolling updates, no multi-node scheduling, and no Service load balancing across replicas the way Kubernetes has them. That gap is why Module 03 exists.</p>
+
+    <!-- ============================================================ IMAGE SIZE -->
+    <h2 id="s-size">Inspecting image size</h2>
+    <p>Smaller images pull faster (Pods start faster, Module 08), cost less storage, and carry fewer packages to patch. Measure; do not guess.</p>
+<pre data-title="Where do the bytes come from?"><code>$ docker image ls reliability-api
+$ docker image history reliability-api:0.1.0                   <span class="c"># size per instruction</span>
+$ docker image history --no-trunc --format '{{.Size}}\t{{.CreatedBy}}' reliability-api:0.1.0
+$ docker run --rm --entrypoint sh reliability-api:0.1.0 -c 'du -sh /opt/venv /usr/local/lib/python3.12'
+<span class="o">38M     /opt/venv
+…       /usr/local/lib/python3.12</span>
+$ docker system df                                             <span class="c"># disk used by images, containers, volumes, build cache</span>
+<span class="c"># Example output (yours will differ). Column names in `docker image ls` vary across Docker versions.</span></code></pre>
+    <div class="table-wrap"><table>
+      <tr><th>Variant to compare in Lab 2</th><th>What changes</th><th>Record</th></tr>
+      <tr><td><code>FROM python:3.12</code> single-stage</td><td>Full Debian with compilers and headers</td><td>Size: ____</td></tr>
+      <tr><td><code>FROM python:3.12-slim</code> single-stage</td><td>Slim base, pip leftovers in image</td><td>Size: ____</td></tr>
+      <tr><td>Multi-stage (this module)</td><td>Slim base, only venv + code</td><td>Size: ____</td></tr>
+    </table></div>
+    <p>Expect the full <code>python:3.12</code> base to be several times larger than <code>-slim</code>. Fill in your own numbers. They are evidence for your project README.</p>
+
+    <!-- ============================================================ RESTART, HARDENING, PUSH -->
+    <h2 id="s-ops">Restart policies, run-time hardening, and pushing to a registry</h2>
+    <h3>Restart policies: Docker's tiny "self-healing"</h3>
+    <p>A restart policy <em>"controls whether the Docker daemon restarts a container after exit"</em>.</p>
+    <div class="table-wrap"><table>
+      <tr><th><code>--restart</code></th><th>Behaviour (docs)</th><th>When for reliability-api</th></tr>
+      <tr><td><code>no</code> (default)</td><td>Don't automatically restart</td><td>Labs. You want to see the crash</td></tr>
+      <tr><td><code>on-failure[:max-retries]</code></td><td>Restart if it exits with a non-zero code</td><td>A single host running the API without an orchestrator</td></tr>
+      <tr><td><code>always</code></td><td>Always restart if it stops (a manual stop sticks until the daemon or container restarts)</td><td>Long-running services on one host</td></tr>
+      <tr><td><code>unless-stopped</code></td><td>Like <code>always</code>, but a stopped container is not restarted even after a daemon restart</td><td>Same, when you want manual stops to persist</td></tr>
+    </table></div>
+    <p>The docs also note <em>"An increasing delay (double the previous delay, starting at 100 milliseconds) is added before each restart"</em>. That is the same idea as Kubernetes' CrashLoopBackOff, which you will meet in Module 04. Docker restarts on <em>exit</em> only. It does not restart a container that is <code>unhealthy</code> but still running. Kubernetes liveness probes add exactly that.</p>
+
+    <h3>Run-time hardening flags (defence in depth)</h3>
+<pre data-title="A locked-down run of reliability-api"><code>$ docker run --rm -d --name reliability-api -p 127.0.0.1:8000:8000 \
+    --read-only --tmpfs /tmp \
+    --cap-drop ALL \
+    --security-opt no-new-privileges=true \
+    --pids-limit 100 \
+    --memory 256m --cpus 1 \
+    reliability-api:0.1.0</code></pre>
+    <div class="table-wrap"><table>
+      <tr><th>Flag</th><th>Docs</th><th>Why it is safe for reliability-api</th></tr>
+      <tr><td><code>--read-only</code></td><td><em>"Mount the container's root filesystem as read only"</em></td><td>The app writes nothing to disk. A <code>--tmpfs /tmp</code> gives libraries that expect a writable temp dir somewhere to write</td></tr>
+      <tr><td><code>--cap-drop ALL</code></td><td><em>"Drop Linux capabilities"</em></td><td>Port 8000 needs no <code>CAP_NET_BIND_SERVICE</code>, and a non-root user rarely needs any capability</td></tr>
+      <tr><td><code>--security-opt no-new-privileges=true</code></td><td><em>"Disable container processes from gaining new privileges"</em></td><td>Blocks setuid-binary privilege escalation inside the container</td></tr>
+      <tr><td><code>--pids-limit</code></td><td><em>"Tune container pids limit"</em></td><td>Caps fork bombs. Uvicorn with one worker uses only a few PIDs</td></tr>
+    </table></div>
+    <p>These map almost one-to-one to Kubernetes <code>securityContext</code> fields (<code>readOnlyRootFilesystem</code>, <code>capabilities.drop</code>, <code>allowPrivilegeEscalation: false</code>), which you will set in Module 05. Verify each flag in Lab 1 by running the app with it and calling every endpoint. A hardening flag that breaks the app gets removed in a hurry, so test first.</p>
+
+    <h3>Pushing to a registry (preview of Module 09)</h3>
+<pre data-title="Push reliability-api to GitHub Container Registry"><code>$ export CR_PAT=&lt;a GitHub token with write:packages&gt;       <span class="c"># never commit this</span>
+$ echo $CR_PAT | docker login ghcr.io -u &lt;you&gt; --password-stdin
+<span class="o">Login Succeeded</span>
+$ SHA=$(git rev-parse --short HEAD)
+$ docker tag reliability-api:0.1.0 ghcr.io/&lt;you&gt;/reliability-api:$SHA
+$ docker push ghcr.io/&lt;you&gt;/reliability-api:$SHA
+<span class="o">…
+&lt;sha&gt;: digest: sha256:&lt;64-hex&gt; size: 1789</span>          <span class="c"># record this digest: it is the deployable identity</span>
+<span class="c"># Example output (yours will differ). On Apple Silicon, images default to arm64; a cloud node may be amd64.
+# Build for the target with: docker buildx build --platform linux/amd64 … (Module 09/11).</span></code></pre>
+
+    <h3>A container debugging flow</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 380" role="img" aria-label="Decision flow for debugging a reliability-api container">
+        <defs><marker id="m2g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="300" y="14" width="260" height="40" rx="8"/><text x="430" y="39" text-anchor="middle" class="t-bold">docker ps -a: what state?</text>
+        <path class="line" d="M350 54 L150 94" marker-end="url(#m2g)"/>
+        <path class="line" d="M430 54 L430 94" marker-end="url(#m2g)"/>
+        <path class="line" d="M510 54 L710 94" marker-end="url(#m2g)"/>
+        <rect class="box3" x="30" y="96" width="240" height="46" rx="8"/><text x="150" y="124" text-anchor="middle" class="t-bold">Exited (code)</text>
+        <rect class="box4" x="310" y="96" width="240" height="46" rx="8"/><text x="430" y="124" text-anchor="middle" class="t-bold">Up, but curl fails</text>
+        <rect class="box3" x="590" y="96" width="240" height="46" rx="8"/><text x="710" y="124" text-anchor="middle" class="t-bold">Up (unhealthy) / slow</text>
+        <rect class="box" x="30" y="166" width="240" height="190" rx="8"/>
+        <text x="44" y="190" class="t-mono">docker logs NAME</text>
+        <text x="44" y="212" class="t-mono">docker inspect -f</text>
+        <text x="44" y="230" class="t-mono"> '{{.State.ExitCode}}</text>
+        <text x="44" y="248" class="t-mono">  {{.State.OOMKilled}}'</text>
+        <text x="44" y="276" class="t-muted">1 → traceback (env? import?)</text>
+        <text x="44" y="296" class="t-muted">127 → PATH / venv missing</text>
+        <text x="44" y="316" class="t-muted">137 → OOM or ignored TERM</text>
+        <text x="44" y="336" class="t-muted">125 → docker run itself</text>
+        <rect class="box" x="310" y="166" width="240" height="190" rx="8"/>
+        <text x="324" y="190" class="t-mono">docker ps → PORTS column</text>
+        <text x="324" y="212" class="t-mono">docker exec NAME python -c</text>
+        <text x="324" y="230" class="t-mono"> "…urlopen(127.0.0.1:8000)"</text>
+        <text x="324" y="258" class="t-muted">works inside, fails outside</text>
+        <text x="324" y="276" class="t-muted"> → --host 0.0.0.0? -p right?</text>
+        <text x="324" y="300" class="t-muted">fails inside too</text>
+        <text x="324" y="318" class="t-muted"> → app not listening on 8000:</text>
+        <text x="324" y="336" class="t-muted">   read logs</text>
+        <rect class="box" x="590" y="166" width="240" height="190" rx="8"/>
+        <text x="604" y="190" class="t-mono">docker inspect --format</text>
+        <text x="604" y="208" class="t-mono"> '{{json .State.Health}}'</text>
+        <text x="604" y="232" class="t-mono">docker stats NAME</text>
+        <text x="604" y="260" class="t-muted">check output shows why</text>
+        <text x="604" y="280" class="t-muted">CPU at --cpus cap →</text>
+        <text x="604" y="298" class="t-muted"> throttled (Lab 4)</text>
+        <text x="604" y="318" class="t-muted">MEM near limit →</text>
+        <text x="604" y="336" class="t-muted"> OOM risk</text>
+      </svg>
+      <figcaption>The same three branches become <code>kubectl get pod</code> → <code>logs --previous</code> / <code>describe</code> / probe events in Modules 03–04.</figcaption>
+    </figure>
+
+    <!-- ============================================================ LABS -->
+    <h2 id="s-labs">Hands-on labs</h2>
+    <p>Prerequisites: Docker Desktop (macOS/Windows) or Docker Engine (Linux), and a project folder containing <code>app/main.py</code>, <code>app/__init__.py</code>, <code>requirements.txt</code>, <code>Dockerfile</code>, and <code>.dockerignore</code> exactly as above. Outputs are <strong>examples</strong>. Record your own.</p>
+
+    <section class="lab"><header>Lab 1 — Build, run, and inspect reliability-api:0.1.0</header><div class="body">
+      <ol class="steps">
+        <li>Build and look at the result:
+<pre><code>$ docker build -t reliability-api:0.1.0 .
+$ docker image ls reliability-api</code></pre></li>
+        <li>Run it detached with config and limits:
+<pre><code>$ docker run -d --name reliability-api -p 127.0.0.1:8000:8000 \
+    -e READY_DELAY_SECONDS=15 --memory 256m --cpus 1 reliability-api:0.1.0</code></pre></li>
+        <li>Watch readiness and health change over the first ~20 s:
+<pre><code>$ for i in $(seq 1 8); do
+    printf '%s  ready=%s  health=%s\n' "$(date +%T)" \
+      "$(curl -s -o /dev/null -w '%{http_code}' localhost:8000/ready)" \
+      "$(docker inspect -f '{{.State.Health.Status}}' reliability-api)"
+    sleep 3
+  done
+<span class="o">10:30:01  ready=503  health=starting
+10:30:04  ready=503  health=starting
+10:30:13  ready=503  health=healthy
+10:30:16  ready=200  health=healthy</span></code></pre>
+          Explain why <code>health</code> can be <code>healthy</code> while <code>ready</code> is still 503. (The HEALTHCHECK calls <code>/health</code>, not <code>/ready</code>. This mismatch is exactly what Kubernetes' separate liveness and readiness probes model.)</li>
+        <li>Inspect the process from inside the container:
+<pre><code>$ docker exec reliability-api id
+<span class="o">uid=10001(app) gid=10001(app) groups=10001(app)</span>
+$ docker exec reliability-api python -c "import os; print(os.getpid(), open('/proc/1/cmdline').read().replace('\0',' '))"
+<span class="o">24 /opt/venv/bin/python /opt/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000</span>
+<span class="c"># PID 1 is uvicorn: exec form worked.</span>
+$ docker exec reliability-api env | grep -E 'LOG_LEVEL|READY'
+$ docker top reliability-api            <span class="c"># host's view of the same processes (host PIDs)</span></code></pre></li>
+        <li>Logs and the stop path:
+<pre><code>$ curl -s 'localhost:8000/work?ms=50'; docker logs --tail 5 reliability-api
+$ time docker stop reliability-api
+<span class="o">reliability-api
+real    0m0.6s</span>                       <span class="c"># fast = SIGTERM handled by PID 1</span>
+$ docker inspect -f 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' reliability-api
+$ docker rm reliability-api</code></pre></li>
+      </ol>
+      <p><strong>Done when:</strong> you can show that the app runs as UID 10001, Uvicorn is PID 1, readiness and health differ during warm-up, and <code>docker stop</code> is fast.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 2 — Build cache and image size experiments</header><div class="body">
+      <ol class="steps">
+        <li>Rebuild with no changes and plain progress output. Every step should say <code>CACHED</code>:
+<pre><code>$ docker build --progress=plain -t reliability-api:0.1.0 . 2&gt;&amp;1 | grep -E 'CACHED|DONE' | head</code></pre></li>
+        <li>Add a comment line to <code>app/main.py</code> and rebuild. Note which steps re-run (expect only <code>COPY app/</code> and the metadata after it). Compare with the <a href="#cachew">simulator</a>.</li>
+        <li>Create a naive variant and repeat the experiment:
+<pre data-title="Dockerfile.naive"><code>FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+RUN pip install -r requirements.txt
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]</code></pre>
+<pre><code>$ docker build -f Dockerfile.naive -t reliability-api:naive .
+$ echo "# touch" &gt;&gt; app/main.py
+$ time docker build -f Dockerfile.naive -t reliability-api:naive .   <span class="c"># pip install re-runs</span></code></pre></li>
+        <li>Measure sizes and fill in the table in "Inspecting image size":
+<pre><code>$ docker image ls --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | grep reliability-api
+$ docker image history reliability-api:naive</code></pre></li>
+        <li>Find the digest of your base image and pin it in the <code>ARG PYTHON_IMAGE</code> line. Rebuild and confirm it still works.</li>
+      </ol>
+      <p><strong>Done when:</strong> you can state, with your own timings, how much a code-only rebuild costs in each Dockerfile, and the size of each variant.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 3 — PID 1 and signals: exec form vs shell vs --init</header><div class="body">
+      <ol class="steps">
+        <li><strong>Exec form (the image default):</strong>
+<pre><code>$ docker run -d --name ok reliability-api:0.1.0
+$ time docker stop ok; docker inspect -f '{{.State.ExitCode}}' ok; docker rm ok</code></pre>
+          Expect well under a second and exit 0 or 143.</li>
+        <li><strong>A shell as PID 1.</strong> Override the command with a shell that must stay alive. The trailing <code>; echo done</code> stops the shell from replacing itself with Uvicorn:
+<pre><code>$ docker run -d --name shelly reliability-api:0.1.0 sh -c 'uvicorn app.main:app --host 0.0.0.0 --port 8000; echo done'
+$ docker exec shelly python -c "print(open('/proc/1/cmdline').read().replace('\0',' '))"
+<span class="o">sh -c uvicorn app.main:app --host 0.0.0.0 --port 8000; echo done</span>
+$ time docker stop shelly; docker inspect -f '{{.State.ExitCode}}' shelly; docker rm shelly
+<span class="o">real    0m10.3s
+137</span></code></pre></li>
+        <li><strong>An app with no SIGTERM handler as PID 1</strong>, with and without <code>--init</code>:
+<pre><code>$ docker run -d --name nohandler python:3.12-slim python -c 'import time; time.sleep(600)'
+$ time docker stop nohandler; docker inspect -f '{{.State.ExitCode}}' nohandler; docker rm nohandler
+<span class="o">real    0m10.2s
+137</span>
+$ docker run -d --init --name withinit python:3.12-slim python -c 'import time; time.sleep(600)'
+$ time docker stop withinit; docker inspect -f '{{.State.ExitCode}}' withinit; docker rm withinit
+<span class="o">real    0m0.4s
+143</span>                                      <span class="c"># python is no longer PID 1 → default action → 128+15</span></code></pre></li>
+        <li>Lower the timeout to feel the difference: <code>docker stop -t 2 …</code>. Then predict the result in the <a href="#stopw">simulator</a> and confirm.</li>
+      </ol>
+      <p><strong>Done when:</strong> you can explain each of the four timings and exit codes using the <code>pid_namespaces(7)</code> rule from Module 01.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 4 — Memory limit (OOM, 137) and CPU throttling</header><div class="body">
+      <ol class="steps">
+        <li>Force an OOM kill with a 64 MiB limit and no swap:
+<pre><code>$ docker run --name oom --memory 64m --memory-swap 64m python:3.12-slim \
+    python -c "x = b'x' * (200 * 1024 * 1024); print('allocated')"
+$ echo "exit=$?"
+<span class="o">exit=137</span>
+$ docker inspect -f 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' oom; docker rm oom
+<span class="o">exit=137 oom=true</span></code></pre>
+          Note: <code>allocated</code> is never printed. No Python code ran after the kill.</li>
+        <li>CPU throttling: run the app with half a CPU and time a 200 ms CPU burn:
+<pre><code>$ docker run -d --rm --name half -p 127.0.0.1:8000:8000 --cpus 0.5 reliability-api:0.1.0
+$ for i in 1 2 3; do curl -s -o /dev/null -w '%{time_total}\n' 'localhost:8000/work?ms=200'; done
+<span class="o">0.41…
+0.40…
+0.42…</span>                               <span class="c"># wall time ≈ 2× the CPU time: throttled, not killed</span>
+$ docker stop half</code></pre>
+          Why can a request asking for 200 ms of work take ~400 ms? With <code>--cpus 0.5</code> the cgroup may use 50 ms of CPU per 100 ms period. Note that <code>/work</code> measures elapsed <em>wall</em> time inside the loop, so the JSON may still report ~200 ms worked while the client waits longer. Investigate and write down what you see.</li>
+      </ol>
+      <p><strong>Done when:</strong> you can distinguish an OOM kill (exit 137 + <code>OOMKilled=true</code>) from CPU throttling (slow, but alive) using evidence.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 5 — User-defined network, DNS, and Compose</header><div class="body">
+      <ol class="steps">
+        <li>Run the "Two containers talking by name" commands from the Networks section. Then run <code>docker network inspect reliability-net</code> and find both container IPs.</li>
+        <li>From a helper container on the same network, check DNS: <code>docker run --rm --network reliability-net python:3.12-slim python -c "import socket; print(socket.gethostbyname('reliability-api'))"</code>. Also read <code>/etc/resolv.conf</code> inside it and find <code>127.0.0.11</code>.</li>
+        <li>Clean up (<code>docker stop reliability-api; docker network rm reliability-net</code>), create <code>compose.yaml</code> from above, and run <code>docker compose up -d --build</code>. Follow <code>docker compose logs -f loadgen</code>. Confirm loadgen waited for <code>healthy</code> before starting.</li>
+        <li><code>docker compose down</code>.</li>
+      </ol>
+    </div></section>
+
+    <!-- ============================================================ TROUBLESHOOTING -->
+    <h2>Troubleshooting quick reference</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Likely cause</th><th>First checks</th></tr>
+      <tr><td>Container exits immediately, code 1</td><td>Python exception: bad env value, import error, missing module</td><td><code>docker logs NAME</code> (works on exited containers; do not use <code>--rm</code> while debugging)</td></tr>
+      <tr><td>Exit 127 / <code>exec: "uvicorn": executable file not found in $PATH</code></td><td>venv not copied, or <code>PATH</code> not set in the runtime stage</td><td><code>docker run --rm --entrypoint sh IMG -c 'echo $PATH; ls /opt/venv/bin'</code></td></tr>
+      <tr><td>Exit 125</td><td><code>docker run</code> itself failed: bad flag, port already allocated</td><td>Read the daemon error text, then <code>docker ps</code> to find who holds the host port</td></tr>
+      <tr><td>Exit 137</td><td>OOM kill, or SIGTERM ignored until timeout</td><td><code>docker inspect -f '{{.State.OOMKilled}}'</code>, <code>time docker stop</code>, PID 1's cmdline</td></tr>
+      <tr><td>"Works inside, not from host" (reset / empty reply)</td><td>App bound to 127.0.0.1, or wrong container port in <code>-p</code></td><td><code>docker ps</code> PORTS column, <code>/proc/1/cmdline</code>, <code>--host 0.0.0.0</code></td></tr>
+      <tr><td><code>port is already allocated</code></td><td>Another container or process uses the host port</td><td><code>docker ps</code>, <code>lsof -nP -iTCP:8000 -sTCP:LISTEN</code></td></tr>
+      <tr><td><code>PermissionError</code> at start</td><td>Files copied with restrictive host modes, or the app writes into root-owned dirs</td><td><code>docker run --rm --entrypoint sh IMG -c 'id; ls -ln /app/app'</code></td></tr>
+      <tr><td><code>ModuleNotFoundError: No module named 'app'</code></td><td>Wrong <code>WORKDIR</code>, <code>app/</code> excluded by <code>.dockerignore</code>, or a mount hides it</td><td><code>docker run --rm --entrypoint ls IMG -R /app</code></td></tr>
+      <tr><td>Every build reinstalls dependencies</td><td><code>COPY . .</code> before <code>pip install</code>, or context noise (.git) without .dockerignore</td><td><code>docker build --progress=plain</code>, look for the first non-CACHED step</td></tr>
+      <tr><td>Container name does not resolve</td><td>Containers on the default bridge, or different networks</td><td><code>docker network inspect</code>, use a user-defined network</td></tr>
+      <tr><td><code>unhealthy</code> but app looks fine</td><td>HEALTHCHECK command missing a tool (curl in slim), or wrong port/path</td><td><code>docker inspect --format '{{json .State.Health}}'</code> shows the check output</td></tr>
+    </table></div>
+
+    <!-- ============================================================ CHEAT SHEET -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Task</th><th>Command</th></tr>
+      <tr><td>Build / build one stage / fresh build</td><td><code>docker build -t reliability-api:0.1.0 .</code> · <code>--target builder</code> · <code>--pull --no-cache</code></td></tr>
+      <tr><td>Run (dev)</td><td><code>docker run --rm -d --name reliability-api -p 127.0.0.1:8000:8000 -e LOG_LEVEL=debug reliability-api:0.1.0</code></td></tr>
+      <tr><td>List / all incl. exited</td><td><code>docker ps</code> · <code>docker ps -a</code></td></tr>
+      <tr><td>Logs</td><td><code>docker logs -f --tail 50 NAME</code></td></tr>
+      <tr><td>Shell / run a command inside</td><td><code>docker exec -it NAME sh</code> · <code>docker exec NAME id</code></td></tr>
+      <tr><td>Exit code, OOM, health</td><td><code>docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}} {{.State.Health.Status}}' NAME</code></td></tr>
+      <tr><td>Live resource usage</td><td><code>docker stats NAME</code></td></tr>
+      <tr><td>Stop / custom timeout / kill</td><td><code>docker stop NAME</code> · <code>docker stop -t 30 NAME</code> · <code>docker kill NAME</code></td></tr>
+      <tr><td>Layers / sizes / disk</td><td><code>docker image history IMG</code> · <code>docker image ls</code> · <code>docker system df</code></td></tr>
+      <tr><td>Tags and digests</td><td><code>docker tag SRC DST</code> · <code>docker image ls --digests</code> · <code>docker image inspect --format '{{index .RepoDigests 0}}' IMG</code></td></tr>
+      <tr><td>Networks</td><td><code>docker network create N</code> · <code>docker run --network N …</code> · <code>docker network inspect N</code></td></tr>
+      <tr><td>Volumes / mounts</td><td><code>docker volume create V</code> · <code>--mount type=volume,src=V,dst=/data</code> · <code>--mount type=bind,src=$PWD/x,dst=/x,readonly</code></td></tr>
+      <tr><td>Compose</td><td><code>docker compose up -d --build</code> · <code>ps</code> · <code>logs -f</code> · <code>down</code></td></tr>
+      <tr><td>Clean up</td><td><code>docker container prune</code> · <code>docker image prune</code> · <code>docker builder prune</code></td></tr>
+    </table></div>
+
+    <!-- ============================================================ GLOSSARY -->
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>Image</dt><dd>Immutable, layered filesystem + config. Identified by digest, named by tags.</dd>
+      <dt>Container</dt><dd>Process(es) started from an image, with namespaces, cgroups, and a writable layer.</dd>
+      <dt>Layer</dt><dd>A set of filesystem changes produced by one build step. Shared between images and containers.</dd>
+      <dt>Writable layer</dt><dd>Per-container copy-on-write layer. Deleted with the container.</dd>
+      <dt>Build context</dt><dd>The set of files the builder can access (the <code>.</code> in <code>docker build .</code>).</dd>
+      <dt>.dockerignore</dt><dd>Patterns excluding files from the build context.</dd>
+      <dt>Build cache</dt><dd>Reuse of previous step results. Invalidated from the first changed step downward.</dd>
+      <dt>Multi-stage build</dt><dd>Several <code>FROM</code> stages in one Dockerfile. Copy only artifacts into the final stage.</dd>
+      <dt>Exec form / shell form</dt><dd><code>CMD ["a","b"]</code> runs directly as PID 1. <code>CMD a b</code> runs under <code>/bin/sh -c</code>.</dd>
+      <dt>PID 1</dt><dd>First process in the container's PID namespace. It receives <code>docker stop</code>'s signal and ignores signals it has no handler for.</dd>
+      <dt>docker-init / tini</dt><dd>Minimal init (<code>--init</code>) that forwards signals and reaps zombies.</dd>
+      <dt>Registry / repository</dt><dd>Image server / a named collection of versions of one image within it.</dd>
+      <dt>Tag / digest</dt><dd>Mutable human label / immutable <code>sha256</code> content address.</dd>
+      <dt>OCI</dt><dd>Open Container Initiative. Image, Runtime, and Distribution specifications that make images portable across Docker, containerd, and Kubernetes.</dd>
+      <dt>Port publishing</dt><dd><code>-p hostIP:hostPort:containerPort</code>: forward host traffic into a container.</dd>
+      <dt>Volume / bind mount / tmpfs</dt><dd>Docker-managed persistent storage / a host path mounted in / memory-backed temporary storage.</dd>
+      <dt>User-defined bridge</dt><dd>Docker network with embedded DNS (127.0.0.11) and isolation from other networks.</dd>
+      <dt>HEALTHCHECK</dt><dd>Image-defined check that sets a Docker health status. Not used by Kubernetes.</dd>
+      <dt>OOMKilled</dt><dd>Container's main process was SIGKILLed for exceeding its memory limit (exit 137).</dd>
+      <dt>Throttling</dt><dd>CPU over the <code>--cpus</code> quota is delayed to the next period. Slower, not killed.</dd>
+    </dl>
+
+    <!-- ============================================================ SELF-CHECK -->
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. What is the difference between an image and a container, in one sentence each?</summary><div class="a">An image is an immutable, layered package of a filesystem plus run configuration, identified by a digest. A container is a running (or stopped) instance of it: a process with namespaces, cgroups, and its own thin writable layer on top of the shared image layers.</div></details>
+    <details class="q"><summary>2. You edit <code>app/main.py</code>. Which steps of the reliability-api Dockerfile re-run, and why does the pip install not re-run?</summary><div class="a">Only the runtime stage's <code>COPY app/ ./app/</code> and the metadata steps after it (<code>USER</code>, <code>EXPOSE</code>, <code>HEALTHCHECK</code>, <code>CMD</code>). The builder stage copies only <code>requirements.txt</code>, whose checksum did not change, so <code>pip install</code> and <code>COPY --from=builder</code> stay cached.</div></details>
+    <details class="q"><summary>3. Why is <code>CMD uvicorn app.main:app …</code> (shell form) a reliability bug?</summary><div class="a">It runs under <code>/bin/sh -c</code>, so the shell is PID 1. <code>docker stop</code> or the kubelet sends SIGTERM to the shell, which typically neither handles nor forwards it, and PID 1 ignores signals without handlers. Uvicorn never drains. After the grace period (10 s Docker / 30 s Kubernetes) everything is SIGKILLed: exit 137, slow rollouts, dropped requests.</div></details>
+    <details class="q"><summary>4. <code>docker run -p 8000:8000 reliability-api:0.1.0</code> works from your laptop. Who else can reach it, and how do you restrict it?</summary><div class="a">Without a host IP, Docker publishes on all host addresses (0.0.0.0 and ::), so anyone who can reach your machine's network interfaces can, subject to host firewalls. Use <code>-p 127.0.0.1:8000:8000</code> to restrict it to the local machine.</div></details>
+    <details class="q"><summary>5. Why pin the base image by digest if you already pin the tag <code>3.12-slim</code>?</summary><div class="a">Tags are mutable. <code>3.12-slim</code> is re-pointed whenever upstream publishes patch releases or OS updates. A digest guarantees the exact same bytes, so builds are reproducible and changes are deliberate. Combine it with a scheduled rebuild (or a dependency bot) so you still pick up security fixes.</div></details>
+    <details class="q"><summary>6. A container exits with 137. List the checks that tell you whether it was an OOM kill.</summary><div class="a"><code>docker inspect -f '{{.State.OOMKilled}}'</code> (true = OOM). <code>docker stats</code> history or metrics near the limit. Kernel log (<code>journalctl -k</code> on Linux hosts). If OOMKilled is false and the stop took exactly the stop timeout, it was SIGKILL after an ignored SIGTERM.</div></details>
+    <details class="q"><summary>7. Two containers on the default bridge cannot reach each other by name. Why, and what is the fix?</summary><div class="a">Only user-defined networks get Docker's embedded DNS (127.0.0.11) with name resolution. On the default bridge, containers can reach each other only by IP. Create a network (<code>docker network create reliability-net</code>) and attach both with <code>--network</code>.</div></details>
+    <details class="q"><summary>8. Docker reports <code>healthy</code>. Will Kubernetes consider the Pod ready?</summary><div class="a">Not because of that. Kubernetes ignores the image's HEALTHCHECK. Readiness comes only from a readiness probe in the Pod spec (for reliability-api, <code>/ready</code>). Without a readiness probe, a container counts as ready as soon as it is running, which may be before the app can serve traffic.</div></details>
+    <details class="q"><summary>9. Why does the runtime stage use <code>USER 10001:10001</code> instead of <code>USER app</code>?</summary><div class="a">Numeric IDs are unambiguous and let Kubernetes' <code>runAsNonRoot</code> check verify the user without resolving names inside the image. A fixed high UID also avoids colliding with system users.</div></details>
+    <details class="q"><summary>10. You <code>COPY .env .</code> and then <code>RUN rm .env</code>. Is the secret gone from the image?</summary><div class="a">No. The file still exists in the layer created by the COPY step. Later layers only mark it deleted. Anyone with the image can extract it. Keep it out of the context (<code>.dockerignore</code>) and inject secrets at run time.</div></details>
+    <details class="q"><summary>11. What do the three OCI specifications standardise, and why does that matter for this course?</summary><div class="a">Image format (manifest/config/layers), runtime (how to run a filesystem bundle; runc), and distribution (registry push/pull API). Because of them, the image you build with Docker and push to GHCR runs unchanged on containerd in kind or GKE.</div></details>
+
+    <!-- ============================================================ SOURCES -->
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://docs.docker.com/reference/dockerfile/">Dockerfile reference — exec/shell form, USER, EXPOSE, COPY --chown, WORKDIR, STOPSIGNAL, HEALTHCHECK — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/build/building/best-practices/">Building best practices — pin by digest, .dockerignore, multi-stage, USER, apt-get, ENTRYPOINT exec — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/build/building/multi-stage/">Multi-stage builds — AS, COPY --from, --target — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/build/cache/">Docker build cache — downstream rebuild rule — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/build/cache/invalidation/">Build cache invalidation — COPY checksum, mtime ignored, RUN — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/build/concepts/context/">Build context — .dockerignore location and syntax — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/get-started/docker-concepts/the-basics/what-is-an-image/">What is an image? — immutability, layers — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/get-started/docker-concepts/building-images/understanding-image-layers/">Understanding image layers — union filesystem, writable layer — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/storage/drivers/">Storage drivers — copy-on-write strategy — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/reference/cli/docker/container/run/">docker container run reference — -p, -e, --rm, --memory, --cpus, --init (docker-init backed by tini), --stop-timeout — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/containers/run/">Running containers — exit status 125/126/127 — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/reference/cli/docker/container/stop/">docker container stop — SIGTERM, 10 s default, SIGKILL — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/reference/cli/docker/container/ls/">docker container ls — container status values — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/containers/resource_constraints/">Resource constraints — memory/OOM, --memory-swap, --cpus — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/network/port-publishing/">Port publishing and mapping — default all addresses, 127.0.0.1 restriction — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/network/">Networking overview — embedded DNS 127.0.0.11 — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/network/drivers/bridge/">Bridge network driver — user-defined vs default bridge — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/storage/volumes/">Volumes — persistence, --mount syntax, obscured files — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/storage/bind-mounts/">Bind mounts — write access by default, readonly — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/storage/tmpfs/">tmpfs mounts — memory-backed, counts against --memory — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/reference/cli/docker/image/pull/">docker image pull — pull by digest (immutable identifier) — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/reference/cli/docker/image/ls/">docker image ls — --digests — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/reference/cli/docker/image/history/">docker image history — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/compose/intro/compose-application-model/">Compose application model — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/reference/compose-file/services/">Compose services reference — depends_on service_healthy, mem_limit, cpus — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/compose/how-tos/networking/">Networking in Compose — default network, service-name discovery — docs.docker.com</a></li>
+      <li><a href="https://opencontainers.org/about/overview/">About the Open Container Initiative — three specifications — opencontainers.org</a></li>
+      <li><a href="https://fastapi.tiangolo.com/deployment/docker/">FastAPI in Containers — Docker — exec form for graceful shutdown — fastapi.tiangolo.com</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/">Liveness, Readiness, and Startup Probes — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/">Pod Lifecycle — termination: TERM to process 1, 30 s default — kubernetes.io</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man7/pid_namespaces.7.html">pid_namespaces(7) — init process signal rules — man7.org</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="01-linux-networking.html"><small>◀ Previous</small>Module 01 · Linux &amp; Networking Foundations</a>
+      <a class="next" href="03-kubernetes-architecture.html"><small>Next ▶</small>Module 03 · Kubernetes Architecture &amp; Core Objects</a>
+    </nav>
+  </article></main>
+</div>
+
+<script>
+(function () {
+  /* ---------- Layer-cache simulator ---------- */
+  // deps: which change kinds invalidate THIS step directly. "meta" = metadata-only step.
+  var DF = {
+    good: [
+      {s: "builder", t: "FROM ${PYTHON_IMAGE} AS builder", deps: ["base"], cost: 2},
+      {s: "builder", t: "ENV PIP_NO_CACHE_DIR=1 …", deps: [], cost: 0, meta: true},
+      {s: "builder", t: "RUN python -m venv /opt/venv", deps: [], cost: 3},
+      {s: "builder", t: "ENV PATH=\"/opt/venv/bin:$PATH\"", deps: [], cost: 0, meta: true},
+      {s: "builder", t: "COPY requirements.txt /tmp/requirements.txt", deps: ["req"], cost: 0.2},
+      {s: "builder", t: "RUN pip install -r /tmp/requirements.txt", deps: [], cost: 30},
+      {s: "runtime", t: "FROM ${PYTHON_IMAGE} AS runtime", deps: ["base"], cost: 0.5},
+      {s: "runtime", t: "ENV PYTHONUNBUFFERED=1 … LOG_LEVEL=info …", deps: ["env"], cost: 0, meta: true},
+      {s: "runtime", t: "RUN groupadd … && useradd … app", deps: [], cost: 1},
+      {s: "runtime", t: "WORKDIR /app", deps: [], cost: 0.1},
+      {s: "runtime", t: "COPY --from=builder /opt/venv /opt/venv", deps: ["@builder"], cost: 1.5},
+      {s: "runtime", t: "COPY app/ ./app/", deps: ["code"], cost: 0.2},
+      {s: "runtime", t: "USER 10001:10001", deps: [], cost: 0, meta: true},
+      {s: "runtime", t: "EXPOSE 8000", deps: [], cost: 0, meta: true},
+      {s: "runtime", t: "HEALTHCHECK …", deps: [], cost: 0, meta: true},
+      {s: "runtime", t: "CMD [\"uvicorn\", …]", deps: [], cost: 0, meta: true}
+    ],
+    bad: [
+      {s: "main", t: "FROM python:3.12-slim", deps: ["base"], cost: 2},
+      {s: "main", t: "ENV LOG_LEVEL=info", deps: ["env"], cost: 0, meta: true},
+      {s: "main", t: "WORKDIR /app", deps: [], cost: 0.1},
+      {s: "main", t: "COPY . .", deps: ["code", "req", "readme", "git?"], cost: 0.5},
+      {s: "main", t: "RUN pip install -r requirements.txt", deps: [], cost: 30},
+      {s: "main", t: "CMD [\"uvicorn\", …]", deps: [], cost: 0, meta: true}
+    ]
+  };
+  var cdf = document.getElementById("c-df"), cign = document.getElementById("c-ign"), cchg = document.getElementById("c-chg"), cout = document.getElementById("c-out");
+  function simulate() {
+    var steps = DF[cdf.value], chg = cchg.value, ign = cign.checked;
+    var lines = [], total = 0, stageDirty = {}, prevStage = null, dirty = false, builderOutputChanged = false;
+    steps.forEach(function (st, i) {
+      if (st.s !== prevStage) { dirty = false; prevStage = st.s; lines.push("── stage: " + st.s + " ──"); }
+      var direct = st.deps.some(function (d) {
+        if (d === "git?") return chg === "git" && !ign;
+        if (d === "readme") return chg === "readme" && !ign;
+        if (d === "@builder") return builderOutputChanged;
+        return d === chg;
+      });
+      if (direct || dirty) dirty = true;
+      if (st.s === "builder" && dirty) builderOutputChanged = true;
+      var tag = dirty ? "⟳ REBUILT" : "✔ CACHED ";
+      if (dirty) total += st.cost;
+      var why = direct ? "  ← invalidated here" : (dirty ? "  (downstream of a change)" : "");
+      lines.push(tag + "  " + st.t + (st.meta ? "  [metadata]" : "") + why);
+    });
+    var note = "";
+    if (chg === "readme" && cdf.value === "good") note = "\nREADME.md is never copied by this Dockerfile (allow-list COPY), so nothing changes.";
+    if ((chg === "readme" || chg === "git") && cdf.value === "bad" && ign) note = "\n.dockerignore excludes it, so it is not in the build context and COPY . . stays cached.";
+    if ((chg === "readme" || chg === "git") && cdf.value === "bad" && !ign) note = "\nWithout .dockerignore the file is part of the context; COPY . . checksum changes → pip re-runs for a non-code change!";
+    if (chg === "base") note = "\nNew base layers invalidate everything (both stages). Expected after --pull when upstream published a new image.";
+    if (chg === "env" && cdf.value === "good") note = "\nChanging an ENV line changes that instruction, so it and everything after it in the runtime stage re-run; the builder stage is untouched.";
+    if (chg === "code" && cdf.value === "good") note = "\nOnly the cheap COPY app/ and metadata re-run: the 30 s pip install stays cached.";
+    if (chg === "code" && cdf.value === "bad") note = "\nA one-line code edit re-runs pip install: the classic slow-build mistake.";
+    lines.push("\nEstimated build time (illustrative): ~" + (Math.round(total * 10) / 10) + " s" + note);
+    cout.textContent = lines.join("\n");
+  }
+  document.getElementById("c-go").addEventListener("click", simulate);
+  [cdf, cign, cchg].forEach(function (el) { el.addEventListener("change", simulate); });
+  simulate();
+
+  /* ---------- docker stop simulator ---------- */
+  var sform = document.getElementById("s-form"), sinit = document.getElementById("s-init"), sto = document.getElementById("s-to"), sout = document.getElementById("s-out");
+  function stopSim() {
+    var f = sform.value, init = sinit.checked, to = Math.max(0, parseInt(sto.value, 10) || 0), L = [];
+    var pid1 = init ? "docker-init (tini)" : (f === "shell" ? "/bin/sh -c" : (f === "script" ? "python script (no SIGTERM handler)" : "uvicorn"));
+    L.push("PID 1 = " + pid1);
+    L.push("t=0s     docker stop → SIGTERM to PID 1");
+    if (f === "exec" && !init) {
+      L.push("t≈0s     uvicorn's handler runs: stop accepting, finish in-flight requests, shutdown events");
+      L.push("t<1s     process exits by itself  → exit 0 (or 143 on Uvicorn versions that re-raise SIGTERM)");
+      L.push("\n✔ Graceful. This is the reliability-api default.");
+    } else if (f === "exec" && init) {
+      L.push("t≈0s     tini forwards SIGTERM to its child, uvicorn → graceful drain");
+      L.push("t<1s     uvicorn exits; tini exits with the child's status → exit 0 or 143");
+      L.push("\n✔ Graceful. --init is harmless here but not needed.");
+    } else if (f === "script" && !init) {
+      L.push("t=0s     kernel does NOT deliver SIGTERM: PID 1 has no handler for it (pid_namespaces(7))");
+      L.push("t=" + to + "s    timeout reached → SIGKILL (always delivered)");
+      L.push("t=" + to + "s    exit 137 (128+9). No cleanup ran.");
+      L.push("\n✘ Slow and abrupt. Fix: add a SIGTERM handler, or run with --init.");
+    } else if (f === "script" && init) {
+      L.push("t≈0s     tini (PID 1, has handlers) forwards SIGTERM to python, which is NOT PID 1");
+      L.push("t≈0s     default action for SIGTERM = terminate → exit 143 (128+15)");
+      L.push("\n✔ Fast stop. Still not a 'drain' (no handler), but no 10 s hang and no SIGKILL.");
+    } else if (f === "shell" && !init) {
+      L.push("t=0s     /bin/sh is PID 1 without a SIGTERM handler → signal not delivered; uvicorn never hears it");
+      L.push("t=" + to + "s    timeout → SIGKILL to PID 1; when a namespace's init dies the kernel SIGKILLs the rest");
+      L.push("t=" + to + "s    exit 137. In-flight requests cut.");
+      L.push("\n✘ The classic shell-form bug. Fix: exec-form CMD (or `exec uvicorn …` in an entrypoint script).");
+      L.push("(Some shells exec a single simple command directly, making this appear to work. Don't rely on it.)");
+    } else {
+      L.push("t≈0s     tini forwards SIGTERM to its child: the shell (not PID 1) → shell terminates (default action)");
+      L.push("t≈0s     the shell does not forward SIGTERM to uvicorn; tini exits after its child, and the kernel");
+      L.push("         SIGKILLs every remaining process in the namespace, including uvicorn");
+      L.push("         exit typically 143 (the shell's status). Uvicorn did not drain.");
+      L.push("\n~ Fast, but NOT graceful. --init can't fix a shell in the middle; fix the CMD.");
+    }
+    if (to === 0) L.push("\nNote: -t 0 means SIGKILL immediately after SIGTERM: no drain time for anyone.");
+    sout.textContent = L.join("\n");
+  }
+  document.getElementById("s-go").addEventListener("click", stopSim);
+  [sform, sinit, sto].forEach(function (el) { el.addEventListener("change", stopSim); });
+  stopSim();
+
+  /* ---------- Port-mapping explorer ---------- */
+  var phip = document.getElementById("p-hip"), php = document.getElementById("p-hp"), pcp = document.getElementById("p-cp"), pbind = document.getElementById("p-bind"), pap = document.getElementById("p-ap"), pfrom = document.getElementById("p-from"), pout = document.getElementById("p-out");
+  function ports() {
+    var hip = phip.value, hp = parseInt(php.value, 10), cp = parseInt(pcp.value, 10), bind = pbind.value, ap = parseInt(pap.value, 10), from = pfrom.value, L = [];
+    var pflag = "-p " + (hip ? hip + ":" : "") + hp + ":" + cp;
+    L.push("$ docker run -d " + pflag + " reliability-api:0.1.0 uvicorn app.main:app --host " + bind + " --port " + ap);
+    var psCol = hip ? hip + ":" + hp + "->" + cp + "/tcp" : "0.0.0.0:" + hp + "->" + cp + "/tcp, [::]:" + hp + "->" + cp + "/tcp";
+    L.push("docker ps PORTS: " + psCol);
+    var url = from === "laptop-lo" ? "http://localhost:" + hp : (from === "lan" ? "http://<laptop-LAN-IP>:" + hp : "http://localhost:" + cp);
+    L.push("$ curl " + url + "/health\n");
+    var ok = true, why = [];
+    if (from === "laptop-cp" && cp !== hp) { ok = false; why.push("Nothing is published on host port " + cp + ". Only " + hp + " is. The container port is not reachable from the host directly (curl exit 7, refused)."); }
+    else {
+      if (from === "lan" && hip === "127.0.0.1") { ok = false; why.push("Hop 1 fails: Docker bound the host port to 127.0.0.1 only, so other machines get refused / timeout. (That's the point of 127.0.0.1 — local only.)"); }
+      if (ok && ap !== cp) { ok = false; why.push("Hop 2 fails: Docker forwards to container port " + cp + " but uvicorn listens on " + ap + ". Nothing listens on " + cp + " inside → reset / empty reply (curl 56/52). Classic '-p 8080:80' mistake when the app uses 8000."); }
+      if (ok && bind === "127.0.0.1") { ok = false; why.push("Hop 2 fails: uvicorn is bound to the container's loopback; forwarded traffic arrives on the container's eth0 → reset / empty reply. Fix: --host 0.0.0.0."); }
+      if (ok) why.push("Hop 1: host " + (hip || "all addresses") + ":" + hp + " accepts the connection. Hop 2: forwarded to container eth0:" + cp + ", where uvicorn listens on 0.0.0.0:" + ap + ".");
+      if (ok && !hip && from === "laptop-lo") why.push("Note: also reachable from other machines on your network (published on all host addresses). Use -p 127.0.0.1:" + hp + ":" + cp + " to restrict.");
+    }
+    L.push((ok ? "✔ 200 {\"status\":\"ok\"}" : "✘ FAILS") + "\n");
+    pout.textContent = L.join("\n") + why.join("\n");
+  }
+  [phip, php, pcp, pbind, pap, pfrom].forEach(function (el) { el.addEventListener("input", ports); el.addEventListener("change", ports); });
+  ports();
+})();
+</script>
+</body>
+</html>

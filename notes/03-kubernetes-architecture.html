@@ -1,0 +1,1431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 03 · Kubernetes Architecture &amp; Core Objects — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/notes.js"></script>
+<style>
+  /* page-local helpers (theme tokens only) */
+  .pod-chip { display:inline-block; font-family: var(--mono); font-size: 12.5px; padding: 6px 10px; margin: 4px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); transition: all .2s; }
+  .pod-chip.match { background: var(--ok-soft); border-color: var(--ok); }
+  .pod-chip.nomatch { opacity: .45; }
+  .pod-chip small { display:block; color: var(--muted); font-size: 11px; }
+  .rec-pods { display:flex; flex-wrap: wrap; gap: 6px; min-height: 52px; margin-top: 8px; }
+  .rec-pod { font-family: var(--mono); font-size: 12px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--ok-soft); }
+  .rec-pod.pending { background: var(--warn-soft); }
+  .rec-pod.dying { background: var(--bad-soft); text-decoration: line-through; }
+  .rec-log { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); border-radius: 8px; padding: 8px 10px; margin-top: 10px; max-height: 180px; overflow-y: auto; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 03 · Kubernetes Architecture &amp; Core Objects</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="03"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 03 · Kubernetes Architecture &amp; Core Objects</h1>
+    <p class="lede">In Module 02 you packaged <code>reliability-api</code> into the image <code>reliability-api:0.1.0</code> and ran it with <code>docker run</code>. That works on one machine, for one copy, while you are watching. This module explains how Kubernetes takes over that job: which processes make up a cluster, how a YAML file you <code>kubectl apply</code> becomes running containers, why everything is a "desired state" that controllers keep converging towards, and how Pods, ReplicaSets and Deployments relate. By the end you will run two replicas of <code>reliability-api</code> on the kind cluster <code>reliability-lab</code>, delete one, and watch Kubernetes put it back.</p>
+    <div class="meta"><span class="pill accent">Prereq: Module 02 · Docker</span><span class="pill">≈ 4 h study + 3 h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Explain what problem a container orchestrator solves that <code>docker run</code> and Compose do not.</li>
+      <li>Name every control-plane and node component, say what it does, and predict what breaks when it is down.</li>
+      <li>Trace the full path of <code>kubectl apply -f deployment.yaml</code> from your laptop to a running container, naming each component that acts.</li>
+      <li>Read any Kubernetes object: <code>apiVersion</code>, <code>kind</code>, <code>metadata</code>, <code>spec</code>, <code>status</code>; and explain who writes which part.</li>
+      <li>Explain declarative vs imperative management and the reconciliation (control) loop.</li>
+      <li>Use namespaces, labels, selectors and annotations correctly, and know which one to reach for.</li>
+      <li>Describe what a Pod really is (shared network namespace, sandbox, init and sidecar containers).</li>
+      <li>Explain the Deployment → ReplicaSet → Pod ownership chain and write a fully annotated Deployment for <code>reliability-api</code>.</li>
+      <li>Use the essential <code>kubectl</code> commands to inspect, debug and safely preview changes.</li>
+    </ul>
+
+    <div class="callout note"><span class="label">How to read this module</span>
+      <p>Each concept follows the same pattern: <strong>definition → the problem it solves → diagram → how it works → applied to reliability-api → failure cases &amp; diagnosis → trade-offs → self-check</strong>. The labs at the end of the major sections are meant to be typed, not just read. All sample outputs are labelled; your names, IDs and timings will differ.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>1. Why orchestration?</h2>
+    <p><strong>Definition.</strong> A <em>container orchestrator</em> is a system that runs containers across a pool of machines on your behalf: it decides where each container runs, restarts or replaces it when it fails, keeps the requested number of copies running, rolls out new versions gradually, and gives clients a stable way to reach whichever copies are currently healthy. Kubernetes is the dominant open-source orchestrator. The official overview describes it as a platform for managing containerized workloads that facilitates both declarative configuration and automation.</p>
+
+    <h3>The problem: what <code>docker run</code> leaves to you</h3>
+    <p>Imagine you are on call for <code>reliability-api</code> and the only tool you have is Docker on one VM:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Situation</th><th>With plain Docker on one host</th><th>What Kubernetes provides</th></tr></thead>
+      <tbody>
+        <tr><td>Process crashes</td><td><code>--restart=always</code> restarts it on the <em>same</em> host only</td><td>kubelet restarts the container; if the Pod is lost, a controller creates a replacement Pod (possibly on another node)</td></tr>
+        <tr><td>The VM dies</td><td>Service is down until a human builds a new VM</td><td>Pods on the failed node are replaced on healthy nodes by their controller</td></tr>
+        <tr><td>You need 2 (or 6) copies</td><td>Run several containers, pick host ports by hand, wire a load balancer yourself</td><td><code>replicas: 2</code> in a Deployment; a Service load-balances across ready Pods</td></tr>
+        <tr><td>Deploying v0.2.0</td><td>Stop old, start new, hope; or write a script</td><td>Rolling update with surge/unavailability limits, rollout status, one-command rollback</td></tr>
+        <tr><td>Container is up but not ready (warming up)</td><td>Traffic hits it anyway</td><td>Readiness probe keeps it out of Service endpoints until it is ready</td></tr>
+        <tr><td>Placing work on machines</td><td>You choose a host by hand</td><td>Scheduler places Pods by resource requests and constraints</td></tr>
+        <tr><td>Config and secrets</td><td><code>-e</code> flags and files on the host</td><td>ConfigMaps and Secrets as API objects (Module 05)</td></tr>
+        <tr><td>Who changed what?</td><td>Shell history on someone's laptop</td><td>Everything is an API object; manifests live in Git and are applied declaratively</td></tr>
+      </tbody>
+    </table></div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Comparison: one Docker host versus a Kubernetes cluster with a control plane keeping two replicas running across nodes">
+        <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="190" y="24" text-anchor="middle" class="t-bold">Before: one Docker host</text>
+        <rect x="40" y="40" width="300" height="210" rx="10" class="zone"/>
+        <text x="56" y="62" class="t-muted">vm-1 (single point of failure)</text>
+        <rect x="70" y="80" width="240" height="46" rx="8" class="box3"/>
+        <text x="190" y="100" text-anchor="middle">docker run -p 8000:8000</text>
+        <text x="190" y="116" text-anchor="middle" class="t-muted">reliability-api:0.1.0</text>
+        <rect x="70" y="150" width="240" height="80" rx="8" class="box"/>
+        <text x="190" y="172" text-anchor="middle" class="t-muted">You handle by hand:</text>
+        <text x="190" y="192" text-anchor="middle" class="t-muted">restarts on other hosts, replicas,</text>
+        <text x="190" y="210" text-anchor="middle" class="t-muted">rollouts, load balancing, health</text>
+        <circle cx="320" cy="58" r="7" class="dot-bad"/>
+
+        <text x="620" y="24" text-anchor="middle" class="t-bold">After: a Kubernetes cluster</text>
+        <rect x="420" y="40" width="400" height="66" rx="10" class="box2"/>
+        <text x="620" y="66" text-anchor="middle" class="t-bold">Control plane</text>
+        <text x="620" y="86" text-anchor="middle" class="t-muted">desired: 2 × reliability-api · keeps converging</text>
+        <rect x="420" y="140" width="190" height="110" rx="10" class="zone"/>
+        <text x="436" y="160" class="t-muted">node A</text>
+        <rect x="440" y="172" width="150" height="56" rx="8" class="box4"/>
+        <text x="515" y="196" text-anchor="middle">Pod 1</text>
+        <text x="515" y="214" text-anchor="middle" class="t-muted">Ready</text>
+        <rect x="630" y="140" width="190" height="110" rx="10" class="zone"/>
+        <text x="646" y="160" class="t-muted">node B</text>
+        <rect x="650" y="172" width="150" height="56" rx="8" class="box4"/>
+        <text x="725" y="196" text-anchor="middle">Pod 2</text>
+        <text x="725" y="214" text-anchor="middle" class="t-muted">Ready</text>
+        <path d="M560 106 L515 170" class="line" marker-end="url(#a1)"/>
+        <path d="M680 106 L725 170" class="line" marker-end="url(#a1)"/>
+        <text x="620" y="280" text-anchor="middle" class="t-muted">node B dies → controller creates a replacement Pod on a healthy node</text>
+      </svg>
+      <figcaption>Figure 1 — The orchestrator turns "keep 2 healthy copies running" from a human runbook into a continuously enforced rule.</figcaption>
+    </figure>
+
+    <h3>What Kubernetes is <em>not</em></h3>
+    <ul>
+      <li>It is not a build system: it runs images that already exist in a registry (or, in kind, that you load into the node).</li>
+      <li>It does not make a buggy app reliable. If <code>reliability-api</code> deadlocks, Kubernetes can only restart it if you configured a liveness probe (Module 04).</li>
+      <li>It does not add capacity by itself. If Pods request more CPU than your nodes have, they stay <code>Pending</code>. Adding nodes is a cluster-autoscaler or human job (Module 08).</li>
+      <li>It is not magic networking: Services, DNS and policies are explicit objects (Module 05).</li>
+    </ul>
+
+    <div class="callout tip"><span class="label">Trade-off</span>
+      <p>Kubernetes adds a lot of moving parts. For a single small service on one VM, Docker plus a process supervisor can be enough. The orchestration pays off once you need several replicas, zero-downtime rollouts, self-healing across machines, or many services sharing infrastructure. In this course we use it because the <em>reliability</em> behaviours (probes, rollouts, autoscaling, recovery) are exactly what we want to study.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>2. Cluster architecture: control plane and nodes</h2>
+    <p><strong>Definition.</strong> A Kubernetes cluster is a set of machines (nodes) plus a <em>control plane</em>. The control plane holds the cluster's state and makes global decisions (for example scheduling) and reacts to events; <em>nodes</em> run your Pods. In production the control plane is usually replicated across several machines; in kind it is a single Docker container named <code>reliability-lab-control-plane</code>.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 480" role="img" aria-label="Kubernetes architecture: control plane with kube-apiserver, etcd, kube-scheduler, kube-controller-manager and optional cloud-controller-manager; two worker nodes each with kubelet, kube-proxy, container runtime and Pods">
+        <defs><marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="20" y="30" width="610" height="235" rx="12" class="zone"/>
+        <text x="36" y="52" class="t-bold">Control plane</text>
+        <text x="140" y="52" class="t-muted">(kind: container reliability-lab-control-plane)</text>
+        <rect x="35" y="70" width="185" height="50" rx="8" class="box2"/>
+        <text x="127" y="92" text-anchor="middle" class="t-bold">kube-scheduler</text>
+        <text x="127" y="109" text-anchor="middle" class="t-muted">assigns Pods to nodes</text>
+        <rect x="35" y="135" width="185" height="50" rx="8" class="box2"/>
+        <text x="127" y="157" text-anchor="middle" class="t-bold">kube-controller-manager</text>
+        <text x="127" y="174" text-anchor="middle" class="t-muted">runs reconcile loops</text>
+        <rect x="35" y="200" width="185" height="50" rx="8" class="box" style="stroke-dasharray:5 4"/>
+        <text x="127" y="222" text-anchor="middle" class="t-bold">cloud-controller-mgr</text>
+        <text x="127" y="239" text-anchor="middle" class="t-muted">optional · cloud APIs</text>
+        <rect x="270" y="120" width="180" height="70" rx="10" class="box3"/>
+        <text x="360" y="148" text-anchor="middle" class="t-bold">kube-apiserver</text>
+        <text x="360" y="166" text-anchor="middle" class="t-muted">the hub · only door to etcd</text>
+        <rect x="490" y="125" width="120" height="60" rx="10" class="box4"/>
+        <text x="550" y="151" text-anchor="middle" class="t-bold">etcd</text>
+        <text x="550" y="168" text-anchor="middle" class="t-muted">key-value store</text>
+        <path d="M220 95 L268 135" class="line" marker-end="url(#a2)" marker-start="url(#a2)"/>
+        <path d="M220 160 L268 157" class="line" marker-end="url(#a2)" marker-start="url(#a2)"/>
+        <path d="M220 225 L268 178" class="line dash" marker-end="url(#a2)" marker-start="url(#a2)"/>
+        <path d="M452 155 L488 155" class="line accent" marker-end="url(#a2)" marker-start="url(#a2)"/>
+
+        <rect x="670" y="80" width="190" height="56" rx="8" class="box"/>
+        <text x="765" y="104" text-anchor="middle" class="t-bold">kubectl / CI / Helm</text>
+        <text x="765" y="122" text-anchor="middle" class="t-muted">HTTPS REST clients</text>
+        <path d="M670 112 L452 140" class="line accent" marker-end="url(#a2)"/>
+
+        <rect x="20" y="300" width="410" height="160" rx="12" class="zone"/>
+        <text x="36" y="322" class="t-bold">Node A</text>
+        <rect x="35" y="335" width="125" height="48" rx="8" class="box2"/>
+        <text x="97" y="356" text-anchor="middle" class="t-bold">kubelet</text>
+        <text x="97" y="373" text-anchor="middle" class="t-muted">node agent</text>
+        <rect x="35" y="395" width="125" height="48" rx="8" class="box2"/>
+        <text x="97" y="416" text-anchor="middle" class="t-bold">kube-proxy</text>
+        <text x="97" y="433" text-anchor="middle" class="t-muted">Service rules</text>
+        <rect x="180" y="335" width="110" height="48" rx="8" class="box3"/>
+        <text x="235" y="356" text-anchor="middle" class="t-bold">containerd</text>
+        <text x="235" y="373" text-anchor="middle" class="t-muted">CRI runtime</text>
+        <rect x="305" y="335" width="115" height="48" rx="8" class="box4"/>
+        <text x="362" y="356" text-anchor="middle">reliability-api</text>
+        <text x="362" y="373" text-anchor="middle" class="t-muted">Pod 1</text>
+        <path d="M160 359 L178 359" class="line" marker-end="url(#a2)"/>
+        <path d="M290 359 L303 359" class="line" marker-end="url(#a2)"/>
+        <text x="205" y="420" class="t-muted">CRI = gRPC API</text>
+
+        <rect x="450" y="300" width="410" height="160" rx="12" class="zone"/>
+        <text x="844" y="322" text-anchor="end" class="t-bold">Node B</text>
+        <rect x="465" y="335" width="125" height="48" rx="8" class="box2"/>
+        <text x="527" y="356" text-anchor="middle" class="t-bold">kubelet</text>
+        <text x="527" y="373" text-anchor="middle" class="t-muted">node agent</text>
+        <rect x="465" y="395" width="125" height="48" rx="8" class="box2"/>
+        <text x="527" y="416" text-anchor="middle" class="t-bold">kube-proxy</text>
+        <text x="527" y="433" text-anchor="middle" class="t-muted">Service rules</text>
+        <rect x="610" y="335" width="110" height="48" rx="8" class="box3"/>
+        <text x="665" y="356" text-anchor="middle" class="t-bold">containerd</text>
+        <text x="665" y="373" text-anchor="middle" class="t-muted">CRI runtime</text>
+        <rect x="735" y="335" width="115" height="48" rx="8" class="box4"/>
+        <text x="792" y="356" text-anchor="middle">reliability-api</text>
+        <text x="792" y="373" text-anchor="middle" class="t-muted">Pod 2</text>
+        <path d="M590 359 L608 359" class="line" marker-end="url(#a2)"/>
+        <path d="M720 359 L733 359" class="line" marker-end="url(#a2)"/>
+
+        <path d="M97 335 L320 192" class="line dash" marker-end="url(#a2)" marker-start="url(#a2)"/>
+        <path d="M527 335 L400 192" class="line dash" marker-end="url(#a2)" marker-start="url(#a2)"/>
+        <text x="420" y="285" text-anchor="middle" class="t-muted">kubelets watch Pods bound to their node and report status back</text>
+      </svg>
+      <figcaption>Figure 2 — Hub-and-spoke: every component talks to <code>kube-apiserver</code>; only the API server talks to etcd. Dashed box = optional component (not present in kind).</figcaption>
+    </figure>
+
+    <p>The single most important structural fact: <strong>components do not call each other directly; they all read and write objects through the API server</strong>. The scheduler does not "tell" a kubelet to start a Pod. It writes the chosen node name into the Pod object; the kubelet on that node is <em>watching</em> for Pods bound to it, notices, and acts. This makes the system loosely coupled: any component can restart and simply re-read the current state.</p>
+
+    <h3>Control-plane components</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Component</th><th>What it does</th><th>If it is down…</th></tr></thead>
+      <tbody>
+        <tr><td><strong>kube-apiserver</strong></td><td>Exposes the Kubernetes HTTP API. Every request (from <code>kubectl</code>, controllers, kubelets) is authenticated, authorized, passed through admission control, validated, then persisted. The front door and the only component that talks to etcd.</td><td>No one can read or change cluster state: <code>kubectl</code> fails, no new scheduling, no scaling. <em>Already running containers keep running</em> — kubelets keep their Pods alive.</td></tr>
+        <tr><td><strong>etcd</strong></td><td>Consistent, highly-available key-value store that is the backing store for all API server data. If it is not in etcd, it does not exist in the cluster.</td><td>API server cannot serve or persist state → same symptoms as API down. Losing etcd data without a backup means losing the cluster's definition of everything.</td></tr>
+        <tr><td><strong>kube-scheduler</strong></td><td>Watches for Pods with no node assigned and picks a node for each one (filtering then scoring, Module 04), then binds the Pod to it.</td><td>New Pods stay <code>Pending</code> forever. Existing Pods are unaffected.</td></tr>
+        <tr><td><strong>kube-controller-manager</strong></td><td>One binary running many controllers (control loops): Deployment, ReplicaSet, Job, node, EndpointSlice, namespace, and more. Each watches some object types and moves actual state toward desired state.</td><td>Nothing reconciles: delete a Pod and no replacement is created; a new Deployment never gets a ReplicaSet; rollouts stall.</td></tr>
+        <tr><td><strong>cloud-controller-manager</strong> <span class="pill">optional</span></td><td>Embeds cloud-specific logic: e.g. creating cloud load balancers for <code>type: LoadBalancer</code> Services, labelling nodes with zones, noticing deleted VMs. Exists on managed clouds such as GKE; absent in kind.</td><td>Cloud integrations stop (new load balancers are not provisioned); core workloads keep running.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Node components</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Component</th><th>What it does</th><th>If it is down…</th></tr></thead>
+      <tbody>
+        <tr><td><strong>kubelet</strong></td><td>The agent on every node. Registers the node, watches the API for Pods bound to its node, asks the container runtime to create/stop containers, runs probes, reports Pod and node status, and sends heartbeats (Node status updates and Lease objects in the <code>kube-node-lease</code> namespace).</td><td>Containers on that node may keep running, but nothing is updated: no restarts, no probe results, no status. The node controller eventually marks the node not ready / unreachable and its Pods get replaced elsewhere.</td></tr>
+        <tr><td><strong>kube-proxy</strong> <span class="pill">optional</span></td><td>Maintains network rules on each node (for example iptables or nftables rules, depending on its mode) that implement Service virtual IPs. Some network plugins replace it entirely.</td><td>Service IPs on that node stop being updated; Pod-to-Pod IP traffic still works. Details in Module 05.</td></tr>
+        <tr><td><strong>Container runtime</strong></td><td>The software that actually runs containers: containerd, CRI-O, or another implementation of the Container Runtime Interface (CRI). kind nodes use containerd.</td><td>kubelet cannot start or stop containers; node becomes NotReady.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h4>The Container Runtime Interface (CRI)</h4>
+    <p>The kubelet does not link against containerd directly. It speaks the <strong>CRI</strong>, a gRPC protocol in which the kubelet is the client and the runtime is the server. From Kubernetes v1.26 onward the kubelet requires the runtime to support the <code>v1</code> CRI API, or the node will not register. This is why "Docker" is not needed on Kubernetes nodes any more: Docker builds the image (an OCI image), and any CRI runtime can run it. Your laptop still uses Docker — kind runs each Kubernetes <em>node</em> as a Docker container, and containerd runs <em>inside</em> it.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 230" role="img" aria-label="Layers in kind: laptop Docker runs node container; inside, kubelet talks CRI gRPC to containerd which runs reliability-api containers">
+        <defs><marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="10" width="800" height="210" rx="12" class="zone"/>
+        <text x="26" y="32" class="t-muted">Your laptop · Docker Desktop / Docker Engine</text>
+        <rect x="40" y="48" width="740" height="156" rx="12" class="box"/>
+        <text x="58" y="72" class="t-bold">Docker container "reliability-lab-control-plane" = one Kubernetes node</text>
+        <rect x="70" y="92" width="150" height="56" rx="8" class="box2"/>
+        <text x="145" y="116" text-anchor="middle" class="t-bold">kubelet</text>
+        <text x="145" y="134" text-anchor="middle" class="t-muted">CRI client</text>
+        <rect x="300" y="92" width="160" height="56" rx="8" class="box3"/>
+        <text x="380" y="116" text-anchor="middle" class="t-bold">containerd</text>
+        <text x="380" y="134" text-anchor="middle" class="t-muted">CRI server</text>
+        <rect x="540" y="86" width="210" height="30" rx="6" class="box4"/>
+        <text x="645" y="106" text-anchor="middle" class="t-mono">pause (Pod sandbox)</text>
+        <rect x="540" y="124" width="210" height="30" rx="6" class="box4"/>
+        <text x="645" y="144" text-anchor="middle" class="t-mono">reliability-api container</text>
+        <path d="M220 120 L298 120" class="line accent" marker-end="url(#a3)"/>
+        <text x="259" y="112" text-anchor="middle" class="t-muted">gRPC</text>
+        <path d="M460 120 L538 104" class="line" marker-end="url(#a3)"/>
+        <path d="M460 120 L538 138" class="line" marker-end="url(#a3)"/>
+        <text x="410" y="185" text-anchor="middle" class="t-muted">Static Pods in this node also run kube-apiserver, etcd, scheduler and controller-manager</text>
+      </svg>
+      <figcaption>Figure 3 — In kind the "node" is a container; inside it, a real kubelet drives containerd via CRI. Images built by your laptop's Docker must be <em>loaded</em> into the node's containerd (<code>kind load docker-image</code>).</figcaption>
+    </figure>
+
+    <h3>Addons</h3>
+    <p>Addons are ordinary Kubernetes workloads that provide cluster features: cluster DNS (CoreDNS) so Pods can resolve <code>reliability-api.reliability-lab.svc.cluster.local</code>, a network plugin (kind ships <em>kindnet</em>), optional dashboards, resource-metrics collection (metrics-server, Module 08) and cluster-level logging. They usually live in <code>kube-system</code>.</p>
+
+    <h3>Where the control plane runs in kind: static Pods</h3>
+    <p>In kubeadm-style clusters (kind uses kubeadm internally) the control-plane components run as <em>static Pods</em>: manifest files on the control-plane node's disk that the kubelet runs directly, then mirrors into the API so you can see them. That is why <code>kubectl get pods -n kube-system</code> lists <code>kube-apiserver-reliability-lab-control-plane</code> even though the API server is what you are talking to.</p>
+
+    <div class="callout example"><span class="label">Applied to reliability-api</span>
+      <p>With a single-node kind cluster, everything in Figure 2 lives in one container. That is fine for learning, but notice what it means for reliability: "2 replicas" of <code>reliability-api</code> on one node do <em>not</em> survive a node failure. Replicas protect you against process crashes and give you rolling updates; spreading across nodes (Module 04: anti-affinity, topology spread) is what protects you against machine failure.</p>
+    </div>
+
+    <h3>Failure cases &amp; how to diagnose</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Symptom</th><th>Likely component</th><th>First commands</th></tr></thead>
+      <tbody>
+        <tr><td><code>The connection to the server … was refused</code> from kubectl</td><td>API server down, wrong kubeconfig context, or the kind container is stopped</td><td><code>kubectl config current-context</code>, <code>docker ps --filter name=reliability-lab</code></td></tr>
+        <tr><td>All new Pods <code>Pending</code>, Events show no scheduling attempt</td><td>kube-scheduler</td><td><code>kubectl get pods -n kube-system</code>, <code>kubectl describe pod</code></td></tr>
+        <tr><td>Pods deleted are not replaced; new Deployments have no ReplicaSet</td><td>kube-controller-manager</td><td><code>kubectl get pods -n kube-system</code>, <code>kubectl logs -n kube-system kube-controller-manager-…</code></td></tr>
+        <tr><td>Node <code>NotReady</code></td><td>kubelet or container runtime on that node</td><td><code>kubectl describe node</code> (Conditions), on kind: <code>docker exec reliability-lab-control-plane journalctl -u kubelet</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <details class="q"><summary>Self-check: The scheduler crashes. Does the running reliability-api Pod stop serving traffic?</summary><div class="a">No. The scheduler only assigns <em>new</em> Pods to nodes. Already-bound Pods are run by their node's kubelet. What breaks is anything needing a new Pod: scaling up, rollouts, replacing a deleted Pod (the ReplicaSet controller will create the Pod object, but it will stay Pending).</div></details>
+    <details class="q"><summary>Self-check: Why is it a deliberate design choice that only the API server talks to etcd?</summary><div class="a">It gives one place for authentication, authorization, admission, validation, versioning and change notifications (watches). Every other component is just an API client, so they can be restarted, replaced or scaled independently, and they all see a consistent view of state.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>3. The life of <code>kubectl apply</code></h2>
+    <p>This is the single most useful mental model in Kubernetes. When you run <code>kubectl apply -f deploy/kubernetes/deployment.yaml</code>, <code>kubectl</code> does <em>not</em> start any container. It writes a record of intent into the API. Then half a dozen independent loops each notice something new and do one small job. Step through it:</p>
+
+    <div class="widget stepper" data-steps='[
+      {"title":"kubectl sends the object","html":"<code>kubectl apply</code> reads <code>deployment.yaml</code>, uses your kubeconfig (cluster URL + credentials for context <code>kind-reliability-lab</code>) and sends the Deployment to the API server over HTTPS: a create if it does not exist yet, otherwise a patch computed from the file, the live object and the last-applied configuration."},
+      {"title":"API server: authenticate, authorize, admit, validate","html":"The request is <b>authenticated</b> (who are you? a client certificate in kind), <b>authorized</b> (may this user create Deployments in namespace <code>reliability-lab</code>? RBAC), passed through <b>admission control</b> (mutating admission may set defaults or inject fields; validating admission may reject), and <b>validated</b> against the schema. Any failure here returns an error to kubectl and nothing is stored."},
+      {"title":"Persist to etcd","html":"The API server fills defaults (for example <code>strategy: RollingUpdate</code>, <code>revisionHistoryLimit: 10</code>), stores the object in etcd, and replies. kubectl prints <code>deployment.apps/reliability-api created</code>. <b>Nothing is running yet</b>; we have only recorded intent."},
+      {"title":"Deployment controller creates a ReplicaSet","html":"The Deployment controller (inside kube-controller-manager) is watching Deployments. It sees one with no matching ReplicaSet, hashes the Pod template, and creates ReplicaSet <code>reliability-api-&amp;lt;pod-template-hash&amp;gt;</code> with <code>replicas: 2</code> and an <code>ownerReference</code> pointing at the Deployment."},
+      {"title":"ReplicaSet controller creates Pod objects","html":"The ReplicaSet controller sees a ReplicaSet wanting 2 Pods and finding 0 matching its selector. It creates 2 Pod objects from the template (names like <code>reliability-api-&amp;lt;hash&amp;gt;-&amp;lt;random&amp;gt;</code>). They have no <code>spec.nodeName</code> yet, so their phase is <code>Pending</code>."},
+      {"title":"Scheduler binds each Pod to a node","html":"kube-scheduler watches for Pods without a node. For each it <b>filters</b> nodes that cannot fit it (not enough requested CPU or memory, taints, selectors) then <b>scores</b> the rest and <b>binds</b> the Pod by writing the node name through the API. Event: <code>Scheduled … Successfully assigned reliability-lab/reliability-api-… to reliability-lab-control-plane</code>."},
+      {"title":"kubelet asks the runtime to start containers","html":"The kubelet on that node is watching Pods bound to it. Via CRI it asks containerd to create the Pod sandbox (network namespace, IP from the network plugin), pull <code>reliability-api:0.1.0</code> if not present, then create and start the container. Events: <code>Pulled</code>, <code>Created</code>, <code>Started</code>."},
+      {"title":"Status flows back; Pod becomes Ready","html":"The kubelet runs probes and writes Pod status (phase <code>Running</code>, condition <code>Ready=True</code> once the readiness probe passes) back through the API server. The EndpointSlice controller adds ready Pod IPs behind the Service. The Deployment status now reads <code>READY 2/2</code>. Every component only reacted to state changes in the API."}
+    ]'>
+      <div class="w-title">Stepper — from <code>kubectl apply</code> to a Ready Pod</div>
+      <div class="w-sub">Highlighted boxes are the actors in the current step.</div>
+      <svg viewBox="0 0 880 330" role="img" aria-label="Sequence of components acting after kubectl apply">
+        <defs><marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <g data-step="0"><rect x="20" y="30" width="130" height="50" rx="8" class="box"/><text x="85" y="60" text-anchor="middle" class="t-bold">kubectl</text></g>
+        <g data-step="0"><path d="M150 55 L328 55" class="line accent" marker-end="url(#a4)"/><text x="239" y="47" text-anchor="middle" class="t-muted">HTTPS</text></g>
+        <g data-step="0,1,2,3,4,5,7"><rect x="330" y="30" width="200" height="50" rx="8" class="box3"/><text x="430" y="52" text-anchor="middle" class="t-bold">kube-apiserver</text><text x="430" y="70" text-anchor="middle" class="t-muted">authn · authz · admission</text></g>
+        <g data-step="2"><path d="M530 55 L718 55" class="line accent" marker-end="url(#a4)"/><text x="624" y="47" text-anchor="middle" class="t-muted">persist</text></g>
+        <g data-step="2"><rect x="720" y="30" width="140" height="50" rx="8" class="box4"/><text x="790" y="60" text-anchor="middle" class="t-bold">etcd</text></g>
+
+        <g data-step="3"><rect x="20" y="140" width="190" height="50" rx="8" class="box2"/><text x="115" y="162" text-anchor="middle" class="t-bold">Deployment ctrl</text><text x="115" y="180" text-anchor="middle" class="t-muted">creates ReplicaSet</text></g>
+        <g data-step="3"><path d="M115 140 L360 82" class="line" marker-end="url(#a4)"/></g>
+        <g data-step="4"><rect x="230" y="140" width="190" height="50" rx="8" class="box2"/><text x="325" y="162" text-anchor="middle" class="t-bold">ReplicaSet ctrl</text><text x="325" y="180" text-anchor="middle" class="t-muted">creates 2 Pods</text></g>
+        <g data-step="4"><path d="M325 140 L400 82" class="line" marker-end="url(#a4)"/></g>
+        <g data-step="5"><rect x="440" y="140" width="190" height="50" rx="8" class="box2"/><text x="535" y="162" text-anchor="middle" class="t-bold">kube-scheduler</text><text x="535" y="180" text-anchor="middle" class="t-muted">filter · score · bind</text></g>
+        <g data-step="5"><path d="M535 140 L460 82" class="line" marker-end="url(#a4)"/></g>
+        <g data-step="7"><rect x="650" y="140" width="210" height="50" rx="8" class="box2"/><text x="755" y="162" text-anchor="middle" class="t-bold">EndpointSlice ctrl</text><text x="755" y="180" text-anchor="middle" class="t-muted">adds ready Pod IPs</text></g>
+        <g data-step="7"><path d="M720 140 L510 82" class="line" marker-end="url(#a4)"/></g>
+
+        <g data-step="6,7"><rect x="200" y="255" width="170" height="50" rx="8" class="box2"/><text x="285" y="277" text-anchor="middle" class="t-bold">kubelet</text><text x="285" y="295" text-anchor="middle" class="t-muted">watches its Pods</text></g>
+        <g data-step="6,7"><path d="M330 255 L430 214 L430 82" class="line dash" marker-end="url(#a4)" marker-start="url(#a4)"/></g>
+        <g data-step="6"><path d="M370 280 L438 280" class="line accent" marker-end="url(#a4)"/><text x="404" y="272" text-anchor="middle" class="t-muted">CRI</text></g>
+        <g data-step="6"><rect x="440" y="255" width="150" height="50" rx="8" class="box3"/><text x="515" y="277" text-anchor="middle" class="t-bold">containerd</text><text x="515" y="295" text-anchor="middle" class="t-muted">sandbox · pull · start</text></g>
+        <g data-step="6,7"><path d="M590 280 L648 280" class="line" marker-end="url(#a4)"/></g>
+        <g data-step="6,7"><rect x="650" y="255" width="210" height="50" rx="8" class="box4"/><text x="755" y="277" text-anchor="middle" class="t-bold">Pod reliability-api</text><text x="755" y="295" text-anchor="middle" class="t-muted">Running · Ready</text></g>
+        <text x="20" y="226" class="t-muted">controllers run inside kube-controller-manager</text>
+        <text x="20" y="325" class="t-muted">Node: reliability-lab-control-plane</text>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+    <h3>Seeing each step for yourself</h3>
+    <p>Every arrow in the stepper leaves evidence you can inspect:</p>
+    <pre data-title="Inspecting the chain (namespace reliability-lab)"><code>kubectl apply -f deploy/kubernetes/deployment.yaml      <span class="c"># step 1–3</span>
+kubectl get deploy,rs,pods -l app.kubernetes.io/name=reliability-api   <span class="c"># steps 4–5</span>
+kubectl get events --sort-by=.metadata.creationTimestamp  <span class="c"># Scheduled, Pulled, Created, Started</span>
+kubectl get pod &lt;pod&gt; -o jsonpath='{.spec.nodeName}{"\n"}'   <span class="c"># step 6: the binding</span>
+kubectl get pod &lt;pod&gt; -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'</code></pre>
+    <pre data-title="Example output (yours will differ in names/IDs/timings)"><code><span class="o">LAST SEEN   TYPE     REASON              OBJECT                                  MESSAGE
+12s         Normal   ScalingReplicaSet   deployment/reliability-api              Scaled up replica set reliability-api-6d9f7c8b5d from 0 to 2
+12s         Normal   SuccessfulCreate    replicaset/reliability-api-6d9f7c8b5d   Created pod: reliability-api-6d9f7c8b5d-k2x8q
+12s         Normal   Scheduled           pod/reliability-api-6d9f7c8b5d-k2x8q    Successfully assigned reliability-lab/reliability-api-6d9f7c8b5d-k2x8q to reliability-lab-control-plane
+11s         Normal   Pulled              pod/reliability-api-6d9f7c8b5d-k2x8q    Container image "reliability-api:0.1.0" already present on machine
+11s         Normal   Created             pod/reliability-api-6d9f7c8b5d-k2x8q    Created container: reliability-api
+11s         Normal   Started             pod/reliability-api-6d9f7c8b5d-k2x8q    Started container api</span></code></pre>
+    <p>Read the <code>OBJECT</code> column top to bottom: <em>deployment → replicaset → pod</em>. The <code>REASON</code> column names the actor: <code>ScalingReplicaSet</code> is the Deployment controller, <code>SuccessfulCreate</code> the ReplicaSet controller, <code>Scheduled</code> the scheduler, <code>Pulled/Created/Started</code> the kubelet.</p>
+
+    <div class="callout warn"><span class="label">Failure cases along the path</span>
+      <ul>
+        <li><strong>Step 2 fails</strong> (validation/RBAC): kubectl prints an error; nothing exists. Example: a typo like <code>replica: 2</code> is rejected by strict field validation (<code>unknown field "spec.replica"</code>).</li>
+        <li><strong>Step 5 fails</strong> (no node fits): Pod stays <code>Pending</code>; Event <code>FailedScheduling</code> explains why (Module 04).</li>
+        <li><strong>Step 6 fails</strong> (image): <code>ErrImagePull</code> / <code>ImagePullBackOff</code>. In kind the classic cause is forgetting <code>kind load docker-image</code>, or using tag <code>:latest</code>, which defaults <code>imagePullPolicy</code> to <code>Always</code> and makes the kubelet try a registry.</li>
+        <li><strong>Step 7 never completes</strong>: container runs but readiness fails → <code>READY 0/1</code>; or the process exits → <code>CrashLoopBackOff</code>.</li>
+      </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>4. The Kubernetes API and objects</h2>
+    <p><strong>Definition.</strong> A Kubernetes <em>object</em> is a persistent entity stored in the API that represents part of the cluster's state. The docs call an object a <em>"record of intent"</em>: once you create it, the system constantly works to make it exist and match what you described.</p>
+    <p><strong>Problem it solves.</strong> Instead of a sequence of commands ("start container, then add to load balancer…"), the whole cluster is described as data. Data can be stored in Git, diffed, reviewed, validated and replayed. Every tool (kubectl, Helm, CI, controllers you write) uses the same API.</p>
+
+    <h3>Anatomy of an object</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 360" role="img" aria-label="Anatomy of a Kubernetes object: apiVersion, kind, metadata, spec written by you, status written by controllers">
+        <rect x="20" y="16" width="420" height="330" rx="10" class="box"/>
+        <text x="40" y="44" class="t-mono">apiVersion: apps/v1</text>
+        <text x="40" y="66" class="t-mono">kind: Deployment</text>
+        <text x="40" y="94" class="t-mono">metadata:</text>
+        <text x="60" y="114" class="t-mono">name: reliability-api</text>
+        <text x="60" y="134" class="t-mono">namespace: reliability-lab</text>
+        <text x="60" y="154" class="t-mono">labels: {...}</text>
+        <text x="40" y="182" class="t-mono">spec:</text>
+        <text x="60" y="202" class="t-mono">replicas: 2</text>
+        <text x="60" y="222" class="t-mono">selector: {...}</text>
+        <text x="60" y="242" class="t-mono">template: {...}</text>
+        <text x="40" y="270" class="t-mono">status:</text>
+        <text x="60" y="290" class="t-mono">replicas: 2</text>
+        <text x="60" y="310" class="t-mono">readyReplicas: 2</text>
+        <text x="60" y="330" class="t-mono">observedGeneration: 3</text>
+        <path d="M450 30 L460 30 L460 70 L450 70" class="line"/>
+        <rect x="480" y="26" width="360" height="48" rx="8" class="box2"/>
+        <text x="496" y="46" class="t-bold">Type identity</text>
+        <text x="496" y="64" class="t-muted">API group/version + kind → which schema applies</text>
+        <path d="M450 82 L460 82 L460 160 L450 160" class="line"/>
+        <rect x="480" y="96" width="360" height="48" rx="8" class="box2"/>
+        <text x="496" y="116" class="t-bold">metadata — identity &amp; organisation</text>
+        <text x="496" y="134" class="t-muted">name, namespace, uid, labels, annotations, owners</text>
+        <path d="M450 170 L460 170 L460 248 L450 248" class="line accent"/>
+        <rect x="480" y="186" width="360" height="48" rx="8" class="box3"/>
+        <text x="496" y="206" class="t-bold">spec — desired state (written by YOU)</text>
+        <text x="496" y="224" class="t-muted">what you want; lives in Git</text>
+        <path d="M450 258 L460 258 L460 336 L450 336" class="line ok"/>
+        <rect x="480" y="274" width="360" height="48" rx="8" class="box4"/>
+        <text x="496" y="294" class="t-bold">status — observed state (written by controllers)</text>
+        <text x="496" y="312" class="t-muted">never put it in your manifest</text>
+      </svg>
+      <figcaption>Figure 4 — Four required top-level fields (<code>apiVersion</code>, <code>kind</code>, <code>metadata</code>, <code>spec</code>) plus <code>status</code>, which the system fills in.</figcaption>
+    </figure>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Field</th><th>Meaning</th><th>reliability-api example</th></tr></thead>
+      <tbody>
+        <tr><td><code>apiVersion</code></td><td><code>group/version</code>. Core objects (Pod, Service, ConfigMap, Namespace) have no group, so just <code>v1</code>. Workload controllers live in group <code>apps</code>; Jobs in <code>batch</code>; PodDisruptionBudgets in <code>policy</code>.</td><td><code>apps/v1</code> for the Deployment; <code>v1</code> for the Service</td></tr>
+        <tr><td><code>kind</code></td><td>The object type (schema). The URL path uses the lower-case plural <em>resource</em> name: kind <code>Deployment</code> ↔ resource <code>deployments</code>.</td><td><code>Deployment</code></td></tr>
+        <tr><td><code>metadata.name</code></td><td>Unique per kind per namespace.</td><td><code>reliability-api</code></td></tr>
+        <tr><td><code>metadata.namespace</code></td><td>Which namespace (for namespaced kinds).</td><td><code>reliability-lab</code></td></tr>
+        <tr><td><code>metadata.uid</code></td><td>Unique ID generated by the server for this incarnation. Delete and recreate → new uid.</td><td>server-generated</td></tr>
+        <tr><td><code>metadata.labels</code> / <code>annotations</code></td><td>Identifying key/values for selection / non-identifying metadata (section 7).</td><td><code>app.kubernetes.io/name: reliability-api</code></td></tr>
+        <tr><td><code>metadata.ownerReferences</code></td><td>Who owns this object; used by garbage collection (delete a Deployment → its ReplicaSets and Pods go too).</td><td>Pod → ReplicaSet → Deployment</td></tr>
+        <tr><td><code>metadata.resourceVersion</code></td><td>Opaque version used for optimistic concurrency and watches. Changes on every write.</td><td>server-generated</td></tr>
+        <tr><td><code>metadata.generation</code> &amp; <code>status.observedGeneration</code></td><td><code>generation</code> increments when the spec changes; a controller sets <code>observedGeneration</code> when it has processed that spec. If they differ, the controller has not caught up yet.</td><td>check during rollouts</td></tr>
+        <tr><td><code>spec</code></td><td>Desired state; schema differs per kind.</td><td>replicas, selector, Pod template</td></tr>
+        <tr><td><code>status</code></td><td>Current observed state, written by the system.</td><td><code>readyReplicas</code>, <code>conditions</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Discovering the schema: <code>kubectl explain</code></h3>
+    <p>You never need to guess a field name. <code>kubectl explain</code> reads the schema from your cluster's API server, so it matches your exact version:</p>
+    <pre><code>kubectl explain deployment.spec.strategy
+kubectl explain pod.spec.containers.readinessProbe
+kubectl explain deployments --api-version=apps/v1
+kubectl explain pods --recursive --max-depth=2      <span class="c"># field tree, two levels deep</span>
+kubectl api-resources                              <span class="c"># every kind, its short name, group, namespaced?</span></code></pre>
+    <pre data-title="Example output — kubectl explain deployment.spec.replicas (abridged)"><code><span class="o">GROUP:      apps
+KIND:       Deployment
+VERSION:    v1
+
+FIELD: replicas &lt;integer&gt;
+
+DESCRIPTION:
+    Number of desired pods. This is a pointer to distinguish between explicit
+    zero and not specified. Defaults to 1.</span></code></pre>
+
+    <h3>Spec vs status in practice</h3>
+    <p>The split is not cosmetic. <code>spec</code> is yours; <code>status</code> belongs to controllers. If you copy a manifest out of <code>kubectl get -o yaml</code> and commit it, strip <code>status</code>, <code>metadata.uid</code>, <code>resourceVersion</code>, <code>creationTimestamp</code>, <code>managedFields</code> and the <code>last-applied-configuration</code> annotation — those are server-owned.</p>
+    <pre data-title="Reading status fields directly"><code>kubectl get deploy reliability-api -o jsonpath='{.spec.replicas} desired, {.status.readyReplicas} ready{"\n"}'
+kubectl get deploy reliability-api -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}){"\n"}{end}'</code></pre>
+    <pre data-title="Example output (yours will differ)"><code><span class="o">2 desired, 2 ready
+Available=True (MinimumReplicasAvailable)
+Progressing=True (NewReplicaSetAvailable)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>5. Declarative vs imperative management</h2>
+    <p><strong>Imperative</strong>: you tell the system <em>what to do</em> ("create this", "scale to 3", "set image"). <strong>Declarative</strong>: you tell it <em>what you want</em> (a set of files) and let it work out the operations. The official docs list three techniques and warn that <strong>an object should be managed using only one technique</strong> — mixing them gives undefined behaviour.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Technique</th><th>Example</th><th>Operates on</th><th>Good for</th><th>Weakness</th></tr></thead>
+      <tbody>
+        <tr><td>Imperative commands</td><td><code>kubectl create deployment reliability-api --image=reliability-api:0.1.0</code></td><td>Live objects</td><td>Learning, one-off tasks</td><td>No review, no audit trail, no record except what is live</td></tr>
+        <tr><td>Imperative object configuration</td><td><code>kubectl create -f d.yaml</code>, <code>kubectl replace -f d.yaml</code></td><td>Individual files</td><td>Simple production use</td><td><code>replace</code> drops fields changed by others; you must know whether to create or replace</td></tr>
+        <tr><td>Declarative object configuration</td><td><code>kubectl apply -f deploy/kubernetes/</code></td><td>Directories of files</td><td>Production, GitOps, CI</td><td>Harder to reason about merges; needs <code>diff</code> discipline</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>How <code>kubectl apply</code> merges: the three-way merge</h3>
+    <p>Client-side <code>kubectl apply</code> stores the file you applied in the annotation <code>kubectl.kubernetes.io/last-applied-configuration</code>. On the next apply it compares three things: <strong>your new file</strong>, <strong>the live object</strong>, and <strong>the last-applied configuration</strong>. This lets it tell apart "you removed this field from the file" (so delete it) from "someone else, e.g. the HPA, set this field" (so keep it). Maps such as labels are merged; primitive fields are replaced; lists are generally replaced.</p>
+    <div class="callout warn"><span class="label">A real trap with reliability-api</span>
+      <p>In Module 08 the HPA will own <code>spec.replicas</code>. If your manifest still says <code>replicas: 2</code>, every <code>kubectl apply</code> resets the Deployment to 2 and fights the autoscaler. The common fix is to remove <code>replicas</code> from the manifest once an HPA manages the Deployment. This is a direct consequence of the declarative model: <em>whatever is in your file is what you are declaring you want</em>.</p>
+    </div>
+
+    <h3>Preview before you change: <code>diff</code> and server-side dry-run</h3>
+    <pre><code>kubectl diff -f deploy/kubernetes/                    <span class="c"># what would change? exit 0 = none, 1 = differences, &gt;1 = error</span>
+kubectl apply -f deploy/kubernetes/ --dry-run=server  <span class="c"># full server validation + admission, nothing persisted</span>
+kubectl apply -f deploy/kubernetes/ --dry-run=client  <span class="c"># only prints what would be sent; no server checks</span></code></pre>
+    <p><code>--dry-run=server</code> submits the request so it goes through authentication, authorization, admission and validation, but the server does not persist it. It is the honest test of "would this be accepted?". <code>kubectl diff</code> itself uses server-side dry-run to compute the would-be object, so it also shows defaults and mutations the server would add. In CI (Module 09) <code>kubectl diff</code>'s exit code is a convenient drift detector.</p>
+
+    <div class="callout tip"><span class="label">Trade-off</span>
+      <p>Imperative commands are fastest when exploring (<code>kubectl scale</code>, <code>kubectl set image</code>), and <code>kubectl create deployment … --dry-run=client -o yaml</code> is a great way to <em>generate</em> a starter manifest. But for anything you want to reproduce, the manifest in Git is the source of truth. A hand-run <code>kubectl scale</code> is silently undone at the next <code>apply</code>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>6. Controllers and the reconciliation loop</h2>
+    <p><strong>Definition.</strong> A <em>controller</em> is a control loop that watches the state of the cluster and makes or requests changes to move the current state closer to the desired state. The official docs use a thermostat analogy: you set the desired temperature; the thermostat repeatedly measures the room and turns heating on or off.</p>
+    <p><strong>Problem it solves.</strong> Distributed systems fail partially and constantly. A one-shot script that "creates 2 Pods" is wrong the moment a Pod dies. A loop that keeps asking "is reality equal to the spec? if not, take one step closer" handles crashes, deletions, node loss and your own edits with the same code path.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 300" role="img" aria-label="Reconciliation loop: observe actual state, compare with desired state, act through API server, repeat">
+        <defs><marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="300" y="20" width="220" height="56" rx="10" class="box2"/>
+        <text x="410" y="44" text-anchor="middle" class="t-bold">1. Observe</text>
+        <text x="410" y="62" text-anchor="middle" class="t-muted">watch Pods, ReplicaSets…</text>
+        <rect x="560" y="120" width="230" height="56" rx="10" class="box3"/>
+        <text x="675" y="144" text-anchor="middle" class="t-bold">2. Diff</text>
+        <text x="675" y="162" text-anchor="middle" class="t-muted">desired 2 vs actual 1 → need +1</text>
+        <rect x="300" y="222" width="220" height="56" rx="10" class="box4"/>
+        <text x="410" y="246" text-anchor="middle" class="t-bold">3. Act (via API)</text>
+        <text x="410" y="264" text-anchor="middle" class="t-muted">create 1 Pod object</text>
+        <rect x="30" y="120" width="230" height="56" rx="10" class="box"/>
+        <text x="145" y="144" text-anchor="middle" class="t-bold">4. Update status</text>
+        <text x="145" y="162" text-anchor="middle" class="t-muted">readyReplicas, conditions</text>
+        <path d="M520 60 Q 640 70 670 118" class="line" marker-end="url(#a5)"/>
+        <path d="M670 178 Q 640 240 522 250" class="line" marker-end="url(#a5)"/>
+        <path d="M300 250 Q 180 240 150 178" class="line" marker-end="url(#a5)"/>
+        <path d="M150 118 Q 180 60 298 48" class="line" marker-end="url(#a5)"/>
+        <text x="410" y="150" text-anchor="middle" class="t-bold">spec (desired)</text>
+        <text x="410" y="170" text-anchor="middle" class="t-muted">vs. the world (actual)</text>
+      </svg>
+      <figcaption>Figure 5 — Each controller runs this loop for its own kinds. Controllers act <em>through</em> the API server (the ReplicaSet controller creates Pod objects; it never runs containers).</figcaption>
+    </figure>
+
+    <h3>Important properties</h3>
+    <ul>
+      <li><strong>Converge, don't script.</strong> Each pass takes the next step toward desired state. If something changes mid-way (you edit the spec, a node dies), the next pass simply uses the new facts.</li>
+      <li><strong>Small, focused controllers.</strong> The Deployment controller manages ReplicaSets; the ReplicaSet controller manages Pods; the scheduler binds Pods; the kubelet runs containers. None knows the whole story.</li>
+      <li><strong>Never "done".</strong> The docs note the cluster may never reach a stable state, and that is fine: as long as controllers run and can make useful changes, the system keeps converging.</li>
+      <li><strong>Status is how controllers talk back.</strong> <code>status.conditions</code> and Events are where you read what a controller thinks is going on.</li>
+    </ul>
+
+    <div class="widget" id="rec-widget">
+      <div class="w-title">Reconciliation simulator — the ReplicaSet controller</div>
+      <div class="w-sub">Desired state is <code>spec.replicas</code>. Break reality with the buttons and watch the loop converge. Pause the controller to see what happens when kube-controller-manager is down.</div>
+      <div class="row">
+        <label style="margin:0">spec.replicas <input type="number" id="rec-desired" min="0" max="8" value="2" style="width:64px"></label>
+        <button class="btn" id="rec-kill">Delete a Pod</button>
+        <button class="btn" id="rec-stray">Create stray Pod with matching labels</button>
+        <button class="btn" id="rec-pause">Pause controller</button>
+      </div>
+      <div class="rec-pods" id="rec-pods"></div>
+      <div class="rec-log" id="rec-log"></div>
+    </div>
+
+    <div class="callout example"><span class="label">Applied to reliability-api</span>
+      <p>The "stray Pod" button models a real gotcha from the ReplicaSet docs: a ReplicaSet <em>acquires</em> any Pod that matches its selector and has no owner. If you <code>kubectl run</code> a debug Pod and give it the label <code>app.kubernetes.io/name=reliability-api</code> plus the hash label, the ReplicaSet counts it and may delete a real replica (or the debug Pod) to get back to 2. Moral: never hand-create Pods with labels that match a controller's selector.</p>
+    </div>
+
+    <details class="q"><summary>Self-check: You run <code>kubectl scale deploy/reliability-api --replicas=5</code>, then later <code>kubectl apply -f deployment.yaml</code> (which says 2). What happens and why?</summary><div class="a">The Deployment goes back to 2. The manifest declares <code>replicas: 2</code>, and the last-applied annotation also says 2, so apply sets the live value to the file's value. Imperative changes to fields that your manifest owns are overwritten at the next declarative apply.</div></details>
+    <details class="q"><summary>Self-check: Who creates the Pod objects for a Deployment — the Deployment controller or the ReplicaSet controller?</summary><div class="a">The ReplicaSet controller. The Deployment controller creates and scales ReplicaSets; the ReplicaSet controller creates and deletes Pods to match its own <code>replicas</code>. You can see this in Events: <code>ScalingReplicaSet</code> on the Deployment vs <code>SuccessfulCreate</code> on the ReplicaSet.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>7. Namespaces</h2>
+    <p><strong>Definition.</strong> A namespace is a scope for names inside one cluster. Names must be unique within a namespace (per kind), but not across namespaces. Namespaces are also the unit you attach access control (RBAC), quotas and default policies to.</p>
+    <p><strong>Problem it solves.</strong> One cluster, many teams/apps/environments: without namespaces every object name would be global and every permission cluster-wide. In this course <code>reliability-api</code> lives in namespace <code>reliability-lab</code>, and the monitoring stack in <code>monitoring</code>, so you can delete or lock down one without touching the other.</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Built-in namespace</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>default</code></td><td>Where objects go if you do not specify a namespace. Avoid using it for real work.</td></tr>
+        <tr><td><code>kube-system</code></td><td>Objects created by the Kubernetes system (control-plane static Pods, CoreDNS, kube-proxy, network plugin).</td></tr>
+        <tr><td><code>kube-public</code></td><td>Readable by all clients (including unauthenticated); reserved for cluster-wide public info.</td></tr>
+        <tr><td><code>kube-node-lease</code></td><td>Holds one Lease object per node: the kubelet heartbeats used to detect node failure.</td></tr>
+      </tbody>
+    </table></div>
+    <p>Do not create namespaces whose names start with <code>kube-</code>; that prefix is reserved. Since v1.22 every namespace automatically carries the immutable label <code>kubernetes.io/metadata.name: &lt;name&gt;</code>, which is handy for NetworkPolicy selectors (Module 05).</p>
+
+    <h3>Namespaced vs cluster-scoped</h3>
+    <p>Most things you deploy (Pods, Deployments, Services, ConfigMaps, Secrets) are namespaced. Some are <strong>cluster-scoped</strong>: Nodes, PersistentVolumes, StorageClasses, Namespaces themselves, ClusterRoles. Ask the API:</p>
+    <pre><code>kubectl api-resources --namespaced=true    <span class="c"># namespaced kinds</span>
+kubectl api-resources --namespaced=false   <span class="c"># cluster-scoped kinds</span></code></pre>
+
+    <h3>Working with namespaces</h3>
+    <pre><code>kubectl create namespace reliability-lab                    <span class="c"># imperative; or apply a Namespace manifest</span>
+kubectl get pods -n reliability-lab                         <span class="c"># one namespace</span>
+kubectl get pods -A                                         <span class="c"># all namespaces</span>
+kubectl config set-context --current --namespace=reliability-lab   <span class="c"># make it your default</span>
+kubectl config view --minify | grep namespace:              <span class="c"># verify</span></code></pre>
+    <pre data-title="deploy/kubernetes/namespace.yaml"><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: reliability-lab
+  labels:
+    app.kubernetes.io/part-of: kubernetes-reliability-lab</code></pre>
+    <p>Namespaces also show up in DNS: a Service is reachable as <code>&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code>, so <code>reliability-api.reliability-lab.svc.cluster.local</code>. From inside the same namespace, the short name <code>reliability-api</code> is enough (Module 05).</p>
+
+    <div class="callout warn"><span class="label">Failure cases</span>
+      <ul>
+        <li><strong>"No resources found in default namespace."</strong> — the most common beginner confusion. Your Pods exist; you are looking in the wrong namespace. Use <code>-n reliability-lab</code> or set the context namespace.</li>
+        <li><strong>Namespaces are not a security boundary by themselves.</strong> Pods in different namespaces can still talk to each other over the network unless NetworkPolicies say otherwise, and a cluster-admin can do anything everywhere.</li>
+        <li><strong>Deleting a namespace deletes everything in it.</strong> That is a feature for cleaning up labs, and a hazard in production.</li>
+      </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>8. Labels, selectors and annotations</h2>
+    <p><strong>Labels</strong> are key/value pairs on objects that carry <em>identifying</em> information meaningful to you. <strong>Selectors</strong> are queries over labels. <strong>Annotations</strong> are key/value pairs for <em>non-identifying</em> metadata that tools and people read but that you never select on.</p>
+    <p><strong>Problem they solve.</strong> Kubernetes has no hard-coded "this Pod belongs to that Service" pointer. Membership is computed: a Deployment manages the Pods its selector matches; a Service routes to the ready Pods its selector matches; a PodDisruptionBudget protects the Pods its selector matches. Loose coupling through labels is what lets Pods come and go with random names.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Deployment, Service and PodDisruptionBudget each select the same Pods by label; a debug Pod without the label is not selected">
+        <defs><marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="20" y="20" width="250" height="54" rx="8" class="box2"/>
+        <text x="145" y="42" text-anchor="middle" class="t-bold">Deployment selector</text>
+        <text x="145" y="60" text-anchor="middle" class="t-mono">name=reliability-api</text>
+        <rect x="305" y="20" width="250" height="54" rx="8" class="box3"/>
+        <text x="430" y="42" text-anchor="middle" class="t-bold">Service selector</text>
+        <text x="430" y="60" text-anchor="middle" class="t-mono">name=reliability-api</text>
+        <rect x="590" y="20" width="250" height="54" rx="8" class="box"/>
+        <text x="715" y="42" text-anchor="middle" class="t-bold">PDB selector (Module 04)</text>
+        <text x="715" y="60" text-anchor="middle" class="t-mono">name=reliability-api</text>
+        <rect x="60" y="170" width="220" height="80" rx="10" class="box4"/>
+        <text x="170" y="194" text-anchor="middle" class="t-bold">Pod …-k2x8q</text>
+        <text x="170" y="214" text-anchor="middle" class="t-mono">name=reliability-api</text>
+        <text x="170" y="234" text-anchor="middle" class="t-mono">version=0.1.0</text>
+        <rect x="320" y="170" width="220" height="80" rx="10" class="box4"/>
+        <text x="430" y="194" text-anchor="middle" class="t-bold">Pod …-p7w2m</text>
+        <text x="430" y="214" text-anchor="middle" class="t-mono">name=reliability-api</text>
+        <text x="430" y="234" text-anchor="middle" class="t-mono">version=0.1.0</text>
+        <rect x="580" y="170" width="220" height="80" rx="10" class="box" style="stroke-dasharray:5 4"/>
+        <text x="690" y="194" text-anchor="middle" class="t-bold">Pod debug-shell</text>
+        <text x="690" y="214" text-anchor="middle" class="t-mono">run=debug-shell</text>
+        <text x="690" y="234" text-anchor="middle" class="t-muted">not selected by anyone</text>
+        <path d="M145 74 L165 168" class="line" marker-end="url(#a6)"/>
+        <path d="M145 74 L410 168" class="line" marker-end="url(#a6)"/>
+        <path d="M430 74 L190 168" class="line accent" marker-end="url(#a6)"/>
+        <path d="M430 74 L430 168" class="line accent" marker-end="url(#a6)"/>
+        <path d="M715 74 L210 168" class="line ok" marker-end="url(#a6)"/>
+        <path d="M715 74 L460 168" class="line ok" marker-end="url(#a6)"/>
+        <text x="430" y="285" text-anchor="middle" class="t-muted">"name" abbreviates app.kubernetes.io/name; "version" abbreviates app.kubernetes.io/version</text>
+      </svg>
+      <figcaption>Figure 6 — Three different objects find the same Pods through one label. Nothing stores a list of Pod names.</figcaption>
+    </figure>
+
+    <h3>Label syntax rules</h3>
+    <ul>
+      <li>Key = optional <strong>prefix</strong> + <code>/</code> + <strong>name</strong>. Name: ≤ 63 characters, starts and ends with an alphanumeric, may contain <code>-</code>, <code>_</code>, <code>.</code>. Prefix: a DNS subdomain ≤ 253 characters. The prefixes <code>kubernetes.io/</code> and <code>k8s.io/</code> are reserved for Kubernetes core components.</li>
+      <li>Value: ≤ 63 characters, may be empty; if non-empty, starts and ends with an alphanumeric. This is why you cannot put a full Git SHA plus a message into a label — use an annotation.</li>
+    </ul>
+
+    <h3>Recommended labels</h3>
+    <p>Kubernetes documents a shared set under the <code>app.kubernetes.io/</code> prefix so that tools (Helm, dashboards) can understand your objects. We use them for <code>reliability-api</code>:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Label</th><th>Meaning</th><th>Our value</th></tr></thead>
+      <tbody>
+        <tr><td><code>app.kubernetes.io/name</code></td><td>Name of the application</td><td><code>reliability-api</code> (also our selector)</td></tr>
+        <tr><td><code>app.kubernetes.io/instance</code></td><td>Unique instance name</td><td>Helm sets this to the release name (Module 06)</td></tr>
+        <tr><td><code>app.kubernetes.io/version</code></td><td>Current app version</td><td><code>"0.1.0"</code> (quoted — YAML would read some versions as numbers)</td></tr>
+        <tr><td><code>app.kubernetes.io/component</code></td><td>Component within the architecture</td><td><code>api</code></td></tr>
+        <tr><td><code>app.kubernetes.io/part-of</code></td><td>Higher-level application</td><td><code>kubernetes-reliability-lab</code></td></tr>
+        <tr><td><code>app.kubernetes.io/managed-by</code></td><td>Tool managing it</td><td><code>kubectl</code> now, <code>Helm</code> later</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Selector types</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Type</th><th>CLI syntax (<code>-l</code>)</th><th>YAML form</th><th>Supported by</th></tr></thead>
+      <tbody>
+        <tr><td>Equality-based</td><td><code>app.kubernetes.io/name=reliability-api</code>, <code>tier!=frontend</code></td><td><code>matchLabels: {key: value}</code></td><td>Everything, including Services (Services support <em>only</em> this, as a plain map under <code>spec.selector</code>)</td></tr>
+        <tr><td>Set-based</td><td><code>'env in (dev,qa)'</code>, <code>'tier notin (cache)'</code>, <code>partition</code> (exists), <code>'!partition'</code> (does not exist)</td><td><code>matchExpressions: [{key, operator: In|NotIn|Exists|DoesNotExist, values}]</code></td><td>Deployments, ReplicaSets, Jobs, DaemonSets, and other newer resources</td></tr>
+      </tbody>
+    </table></div>
+    <p>Comma means <strong>AND</strong>: <code>-l 'app.kubernetes.io/name=reliability-api,app.kubernetes.io/version=0.1.0'</code> selects only Pods with both labels. There is no OR across different keys; use set-based <code>in</code> for OR over values of one key.</p>
+
+    <div class="widget" id="sel-widget">
+      <div class="w-title">Label selector playground</div>
+      <div class="w-sub">Type a selector in <code>kubectl -l</code> syntax. Matching Pods light up. Supports <code>=</code>, <code>==</code>, <code>!=</code>, <code>in (…)</code>, <code>notin (…)</code>, <code>key</code> (exists) and <code>!key</code>. Comma = AND.</div>
+      <div class="row">
+        <input type="text" id="sel-input" style="flex:1;min-width:260px" value="app.kubernetes.io/name=reliability-api" aria-label="label selector">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" data-sel="app.kubernetes.io/name=reliability-api">Deployment / Service</button>
+        <button class="btn" data-sel="app.kubernetes.io/name=reliability-api,app.kubernetes.io/version=0.2.0">only v0.2.0</button>
+        <button class="btn" data-sel="app.kubernetes.io/version in (0.1.0,0.2.0),track!=canary">set-based</button>
+        <button class="btn" data-sel="!app.kubernetes.io/name">no app label</button>
+        <button class="btn" data-sel="app=reliability-api">typo trap</button>
+      </div>
+      <div id="sel-pods" style="margin-top:10px"></div>
+      <div class="out" id="sel-out"></div>
+    </div>
+
+    <h3>Annotations</h3>
+    <p>Annotations hold arbitrary non-identifying data: build info (Git SHA, CI run URL), tool configuration, ownership contacts, change reasons. Keys follow the same prefix/name rules as labels, but values can be large structured strings. Examples you will meet in this course:</p>
+    <ul>
+      <li><code>kubernetes.io/change-cause</code> — copied into <code>kubectl rollout history</code> as CHANGE-CAUSE (Module 04).</li>
+      <li><code>kubectl.kubernetes.io/last-applied-configuration</code> — written by client-side <code>kubectl apply</code> (section 5).</li>
+      <li><code>deployment.kubernetes.io/revision</code> — set by the Deployment controller on ReplicaSets.</li>
+      <li>Tool-specific keys from Helm, Prometheus operators, ingress controllers etc. — always check the tool's docs.</li>
+    </ul>
+    <div class="callout tip"><span class="label">Rule of thumb</span><p>If you will ever <em>select</em> on it → label (short, stable). If you only want to <em>record</em> it → annotation. Labels on Pods that change every build (like a Git SHA) are fine on the Pod template, but never put them in a Deployment's <code>selector</code> — selectors in <code>apps/v1</code> are immutable.</p></div>
+
+    <h3>Failure case: the selector/label mismatch</h3>
+    <p>A Service whose selector says <code>app: reliability-api</code> while Pods carry <code>app.kubernetes.io/name: reliability-api</code> matches nothing. The Service exists, has a ClusterIP, and returns connection errors because it has no endpoints. Diagnose with <code>kubectl get endpointslices -l kubernetes.io/service-name=reliability-api</code> and <code>kubectl get pods --show-labels</code>. (For Deployments the API server rejects a selector that does not match the template labels — see Lab 3.)</p>
+
+    <!-- ============================================================ -->
+    <h2>9. Pods</h2>
+    <p><strong>Definition.</strong> A Pod is the smallest deployable unit in Kubernetes: a group of one or more containers that share network and storage and are always scheduled together on the same node. The docs describe a Pod as an application-specific "logical host".</p>
+    <p><strong>Problem it solves.</strong> Some processes are so tightly coupled they must live together: a web server plus a helper that refreshes its files, or an app plus a proxy. If they were separate scheduling units they might land on different machines. The Pod is the unit of co-location, shared fate and shared networking.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="Inside a Pod: sandbox holding a shared network namespace with one IP; init container runs first; app container and sidecar share localhost and a volume">
+        <defs><marker id="a7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="20" y="20" width="820" height="290" rx="14" class="zone"/>
+        <text x="36" y="44" class="t-bold">Pod reliability-api-…-k2x8q</text>
+        <text x="300" y="44" class="t-muted">IP 10.244.0.12 · one network namespace · one port space</text>
+        <rect x="40" y="62" width="780" height="40" rx="8" class="box2"/>
+        <text x="430" y="87" text-anchor="middle">Pod sandbox (many runtimes use a tiny "pause" container to hold the namespaces)</text>
+        <rect x="40" y="126" width="190" height="80" rx="8" class="box" style="stroke-dasharray:5 4"/>
+        <text x="135" y="150" text-anchor="middle" class="t-bold">init container</text>
+        <text x="135" y="170" text-anchor="middle" class="t-muted">runs to completion</text>
+        <text x="135" y="188" text-anchor="middle" class="t-muted">before the others</text>
+        <path d="M230 166 L268 166" class="line" marker-end="url(#a7)"/>
+        <rect x="270" y="120" width="260" height="92" rx="10" class="box4"/>
+        <text x="400" y="146" text-anchor="middle" class="t-bold">reliability-api (app)</text>
+        <text x="400" y="166" text-anchor="middle" class="t-mono">reliability-api:0.1.0</text>
+        <text x="400" y="186" text-anchor="middle" class="t-mono">listens 0.0.0.0:8000</text>
+        <rect x="570" y="120" width="250" height="92" rx="10" class="box3"/>
+        <text x="695" y="146" text-anchor="middle" class="t-bold">sidecar (optional)</text>
+        <text x="695" y="166" text-anchor="middle" class="t-mono">curl localhost:8000</text>
+        <text x="695" y="186" text-anchor="middle" class="t-muted">same IP, same localhost</text>
+        <path d="M570 166 L532 166" class="line accent" marker-end="url(#a7)"/>
+        <rect x="270" y="236" width="550" height="50" rx="8" class="box"/>
+        <text x="545" y="258" text-anchor="middle" class="t-bold">shared volume (e.g. emptyDir)</text>
+        <text x="545" y="276" text-anchor="middle" class="t-muted">mounted into any container that lists it</text>
+        <path d="M400 212 L400 234" class="line dash"/>
+        <path d="M695 212 L695 234" class="line dash"/>
+      </svg>
+      <figcaption>Figure 7 — Containers in a Pod share one IP and port space (they reach each other on <code>localhost</code>) and can share volumes. Each container still has its own filesystem image, process tree and resource limits.</figcaption>
+    </figure>
+
+    <h3>How a Pod works</h3>
+    <ol>
+      <li><strong>Sandbox first.</strong> The kubelet asks the runtime to create a Pod sandbox: the network namespace (with an IP from the network plugin) and other shared namespaces. The Pod condition <code>PodReadyToStartContainers</code> becomes True when the sandbox and networking are ready. Many runtimes implement the sandbox with a hidden "pause" container; the Pod-lifecycle docs mention the kubelet cleaning it up "if that container runtime uses one".</li>
+      <li><strong>Init containers</strong> run one at a time, in order, each to successful completion, before any app container starts. If one fails, the kubelet retries it (unless the Pod's <code>restartPolicy</code> is <code>Never</code>). <code>kubectl get pods</code> shows progress as <code>Init:0/2</code>, <code>Init:1/2</code>. Init containers do not support liveness/readiness/startup probes.</li>
+      <li><strong>App containers</strong> start. Each has its own image, command, env, resources and probes.</li>
+      <li><strong>Sidecars</strong> are init containers with <code>restartPolicy: Always</code> (stable since v1.29). They start before the app containers, keep running alongside them, and are stopped <em>after</em> the main containers during termination.</li>
+    </ol>
+
+    <h3>Pods are ephemeral — don't create them directly</h3>
+    <p>A Pod is bound to one node for its whole life. If the node dies, the Pod is gone; it is never "moved". Replacement means a <em>new</em> Pod with a new name and new IP, created by a controller. This is why the docs say Pods are usually not created directly; you create a Deployment (stateless), StatefulSet (stable identity), Job (run-to-completion) or DaemonSet (one per node). Note also that <strong>restarting a container is not the same as replacing the Pod</strong>: a liveness failure restarts the container in place (same Pod name, same IP, restart count +1).</p>
+
+    <h3>A bare Pod for learning (do not use in production)</h3>
+    <pre data-title="lab/pod-basic.yaml"><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: reliability-api-bare
+  namespace: reliability-lab
+  labels:
+    run: reliability-api-bare          <span class="c"># deliberately NOT app.kubernetes.io/name (see section 6)</span>
+spec:
+  containers:
+    - name: reliability-api
+      image: reliability-api:0.1.0
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 8000
+      env:
+        - name: LOG_LEVEL
+          value: "debug"</code></pre>
+
+    <h3>Multi-container and init example</h3>
+    <p>This Pod demonstrates three facts at once: the init container runs first; the sidecar reaches the app on <code>localhost</code>; and both share a volume.</p>
+    <pre data-title="lab/pod-multi.yaml"><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: reliability-api-multi
+  namespace: reliability-lab
+  labels:
+    run: reliability-api-multi
+spec:
+  volumes:
+    - name: scratch
+      emptyDir: {}
+  initContainers:
+    - name: prepare
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'prepared at' $(date) &gt; /scratch/init.txt; sleep 5"]
+      volumeMounts:
+        - { name: scratch, mountPath: /scratch }
+  containers:
+    - name: reliability-api
+      image: reliability-api:0.1.0
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 8000
+    - name: poller                      <span class="c"># a plain second container sharing the network namespace</span>
+      image: busybox:1.36
+      command: ["sh", "-c", "cat /scratch/init.txt; while true; do wget -qO- http://localhost:8000/health; echo; sleep 5; done"]
+      volumeMounts:
+        - { name: scratch, mountPath: /scratch }</code></pre>
+
+    <div class="callout warn"><span class="label">Failure cases &amp; diagnosis</span>
+      <ul>
+        <li><strong><code>Init:CrashLoopBackOff</code></strong> — an init container keeps failing; app containers never start. <code>kubectl logs &lt;pod&gt; -c prepare</code>.</li>
+        <li><strong>Port clash</strong> — two containers in one Pod both binding 8000 fail exactly like two processes on one host (shared port space). The second gets "address already in use".</li>
+        <li><strong>Wrong container in logs/exec</strong> — with several containers, <code>kubectl logs</code> picks a default; always pass <code>-c reliability-api</code>.</li>
+        <li><strong>Over-packing a Pod</strong> — putting the API and a database in one Pod forces them to scale together and die together. Use separate workloads unless they are truly coupled.</li>
+      </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>10. ReplicaSet</h2>
+    <p><strong>Definition.</strong> A ReplicaSet maintains a stable set of replica Pods: it has a <strong>selector</strong> (which Pods it counts), a <strong>replicas</strong> number, and a Pod <strong>template</strong> (what to create when it needs more).</p>
+    <p><strong>Problem it solves.</strong> "Keep N identical copies alive." It is the controller that recreates a Pod you delete.</p>
+    <p><strong>How it works.</strong> Each loop iteration it counts Pods that match its selector and are not terminating. Too few → create from template. Too many → delete some. Pods it creates get <code>metadata.ownerReferences</code> pointing back to it; it also <em>acquires</em> matching Pods that have no owner (the stray-Pod trap). The official docs recommend using Deployments instead of creating ReplicaSets directly, because a ReplicaSet never updates existing Pods when you change its template — it only uses the template for <em>new</em> Pods.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Ownership chain: Deployment owns two ReplicaSets (current and previous revision) identified by pod-template-hash; current ReplicaSet owns two Pods">
+        <defs><marker id="a8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="300" y="16" width="260" height="56" rx="10" class="box2"/>
+        <text x="430" y="40" text-anchor="middle" class="t-bold">Deployment reliability-api</text>
+        <text x="430" y="58" text-anchor="middle" class="t-muted">replicas: 2 · template v0.2.0</text>
+        <rect x="80" y="120" width="300" height="60" rx="10" class="box3"/>
+        <text x="230" y="144" text-anchor="middle" class="t-bold">RS reliability-api-6d9f7c8b5d</text>
+        <text x="230" y="164" text-anchor="middle" class="t-muted">revision 2 · replicas 2 (current)</text>
+        <rect x="480" y="120" width="300" height="60" rx="10" class="box" style="stroke-dasharray:5 4"/>
+        <text x="630" y="144" text-anchor="middle" class="t-bold">RS reliability-api-5c4b8f7d9</text>
+        <text x="630" y="164" text-anchor="middle" class="t-muted">revision 1 · replicas 0 (kept for undo)</text>
+        <path d="M400 72 L260 118" class="line" marker-end="url(#a8)"/>
+        <path d="M460 72 L600 118" class="line dash" marker-end="url(#a8)"/>
+        <rect x="40" y="226" width="180" height="56" rx="10" class="box4"/>
+        <text x="130" y="250" text-anchor="middle" class="t-bold">Pod …-k2x8q</text>
+        <text x="130" y="268" text-anchor="middle" class="t-mono">hash=6d9f7c8b5d</text>
+        <rect x="240" y="226" width="180" height="56" rx="10" class="box4"/>
+        <text x="330" y="250" text-anchor="middle" class="t-bold">Pod …-p7w2m</text>
+        <text x="330" y="268" text-anchor="middle" class="t-mono">hash=6d9f7c8b5d</text>
+        <path d="M200 180 L140 224" class="line" marker-end="url(#a8)"/>
+        <path d="M260 180 L320 224" class="line" marker-end="url(#a8)"/>
+        <text x="630" y="240" text-anchor="middle" class="t-muted">Arrows = ownerReferences (child → parent)</text>
+        <text x="630" y="260" text-anchor="middle" class="t-muted">drawn parent → child for readability.</text>
+        <text x="630" y="280" text-anchor="middle" class="t-muted">Delete the parent → children are garbage-collected.</text>
+      </svg>
+      <figcaption>Figure 8 — The Deployment controller adds a <code>pod-template-hash</code> label to each ReplicaSet and its Pods so that ReplicaSets for different revisions never select each other's Pods.</figcaption>
+    </figure>
+
+    <details class="q"><summary>Self-check: You edit a ReplicaSet's template to use image 0.2.0. What happens to its two running Pods?</summary><div class="a">Nothing. A ReplicaSet only uses its template to create new Pods. The existing 0.1.0 Pods keep running until something deletes them. This is exactly the gap the Deployment fills: it creates a <em>new</em> ReplicaSet for the new template and shifts replicas across gradually.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>11. Deployment</h2>
+    <p><strong>Definition.</strong> A Deployment declares a desired set of interchangeable Pods and manages them through ReplicaSets, providing declarative updates (rolling updates), rollout status, history and rollback.</p>
+    <p><strong>Problem it solves.</strong> ReplicaSets keep N copies alive but cannot change them. A Deployment adds <em>versioning</em>: every change to the Pod template creates a new ReplicaSet (a new revision), and the Deployment controller scales the new one up and the old one down according to its strategy. Scaling alone (changing <code>replicas</code>) does not create a new revision.</p>
+    <p><strong>How it works (summary; rollout mechanics are in Module 04).</strong></p>
+    <ol>
+      <li>Hash the Pod template → <code>pod-template-hash</code>. Find the ReplicaSet with that hash or create it.</li>
+      <li>If there are older ReplicaSets with Pods, move replicas from old to new within <code>maxSurge</code>/<code>maxUnavailable</code>, waiting for new Pods to become available.</li>
+      <li>Keep up to <code>revisionHistoryLimit</code> (default 10) old ReplicaSets at 0 replicas so <code>kubectl rollout undo</code> can scale one back up.</li>
+      <li>Report progress in <code>status.conditions</code> (<code>Available</code>, <code>Progressing</code>), and mark the rollout failed if no progress is made within <code>progressDeadlineSeconds</code> (default 600).</li>
+    </ol>
+
+    <h3>The reliability-api Deployment, fully annotated</h3>
+    <p>This is the manifest you will apply in Lab 2 and refine in Module 04. Every field is explained in the table below it.</p>
+    <pre data-title="deploy/kubernetes/deployment.yaml"><code>apiVersion: apps/v1                            <span class="c"># (1)</span>
+kind: Deployment                               <span class="c"># (2)</span>
+metadata:
+  name: reliability-api                        <span class="c"># (3)</span>
+  namespace: reliability-lab                   <span class="c"># (4)</span>
+  labels:                                      <span class="c"># (5)</span>
+    app.kubernetes.io/name: reliability-api
+    app.kubernetes.io/part-of: kubernetes-reliability-lab
+    app.kubernetes.io/managed-by: kubectl
+  annotations:
+    kubernetes.io/change-cause: "deploy 0.1.0" <span class="c"># (6)</span>
+spec:
+  replicas: 2                                  <span class="c"># (7)</span>
+  revisionHistoryLimit: 10                     <span class="c"># (8)</span>
+  selector:                                    <span class="c"># (9)</span>
+    matchLabels:
+      app.kubernetes.io/name: reliability-api
+  strategy:                                    <span class="c"># (10)</span>
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:                                    <span class="c"># (11)</span>
+    metadata:
+      labels:                                  <span class="c"># (12)</span>
+        app.kubernetes.io/name: reliability-api
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/component: api
+    spec:
+      terminationGracePeriodSeconds: 30        <span class="c"># (13)</span>
+      containers:
+        - name: reliability-api                            <span class="c"># (14)</span>
+          image: reliability-api:0.1.0         <span class="c"># (15)</span>
+          imagePullPolicy: IfNotPresent        <span class="c"># (16)</span>
+          ports:
+            - name: http                       <span class="c"># (17)</span>
+              containerPort: 8000
+              protocol: TCP
+          env:                                 <span class="c"># (18)</span>
+            - name: APP_MODE
+              value: "normal"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: READY_DELAY_SECONDS
+              value: "5"
+          resources:                           <span class="c"># (19)</span>
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:                      <span class="c"># (20)</span>
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:                       <span class="c"># (21)</span>
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3</code></pre>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>#</th><th>Field</th><th>What it means / why this value</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>apiVersion: apps/v1</code></td><td>Deployments live in API group <code>apps</code>, version <code>v1</code> (stable).</td></tr>
+        <tr><td>2</td><td><code>kind: Deployment</code></td><td>Selects the Deployment schema and the Deployment controller.</td></tr>
+        <tr><td>3</td><td><code>metadata.name</code></td><td>Unique within the namespace. ReplicaSets and Pods derive their names from it (<code>reliability-api-&lt;hash&gt;-&lt;suffix&gt;</code>).</td></tr>
+        <tr><td>4</td><td><code>metadata.namespace</code></td><td>Pins the object to <code>reliability-lab</code> regardless of your kubectl context. Omit it if you prefer to choose the namespace at apply time (<code>-n</code>); do not mix both styles.</td></tr>
+        <tr><td>5</td><td><code>metadata.labels</code></td><td>Labels on the <em>Deployment object itself</em> (for <code>kubectl get deploy -l …</code> and tooling). They do not affect which Pods it manages.</td></tr>
+        <tr><td>6</td><td><code>kubernetes.io/change-cause</code></td><td>Annotation copied into the new revision and shown as CHANGE-CAUSE in <code>kubectl rollout history</code>. Update it with each change. (The old <code>--record</code> flag is deprecated.)</td></tr>
+        <tr><td>7</td><td><code>spec.replicas: 2</code></td><td>Desired number of Pods. Defaults to 1 if omitted. Two gives you one spare during crashes and rollouts. Remove this field once an HPA manages scaling (Module 08).</td></tr>
+        <tr><td>8</td><td><code>revisionHistoryLimit: 10</code></td><td>How many old ReplicaSets to keep for rollback. 10 is the default; written explicitly here for teaching. Setting 0 makes rollback impossible.</td></tr>
+        <tr><td>9</td><td><code>spec.selector</code></td><td>Which Pods this Deployment owns. Must match the template labels (12) or the API rejects the object. <strong>Immutable</strong> in <code>apps/v1</code>: to change it you must delete and recreate the Deployment. Keep it minimal and stable — just the app name.</td></tr>
+        <tr><td>10</td><td><code>strategy</code></td><td><code>RollingUpdate</code> (default) or <code>Recreate</code>. With only 2 replicas, the defaults (25%/25%) give <code>maxSurge</code> = ceil(0.5) = 1 and <code>maxUnavailable</code> = floor(0.5) = 0. We write those values explicitly so the intent is visible: <em>add one new Pod, never go below 2 available</em>. Module 04 explains the arithmetic.</td></tr>
+        <tr><td>11</td><td><code>spec.template</code></td><td>A full Pod spec plus metadata. <em>Any</em> change here (image, env, probes, labels) creates a new revision and triggers a rollout.</td></tr>
+        <tr><td>12</td><td><code>template.metadata.labels</code></td><td>Labels every Pod gets. Must include the selector labels. Extra labels (version, component) are allowed and useful for queries and dashboards, but keep them out of the selector.</td></tr>
+        <tr><td>13</td><td><code>terminationGracePeriodSeconds: 30</code></td><td>Time between SIGTERM and SIGKILL when a Pod is deleted. 30 is the default; shown explicitly because Module 04's graceful shutdown depends on it.</td></tr>
+        <tr><td>14</td><td><code>containers[].name: reliability-api</code></td><td>Container name used by <code>kubectl logs -c reliability-api</code>, <code>exec -c reliability-api</code>, and in events. Must be unique within the Pod.</td></tr>
+        <tr><td>15</td><td><code>image</code></td><td>The image built in Module 02. In CI it becomes <code>ghcr.io/&lt;you&gt;/reliability-api:&lt;git-sha&gt;</code>. Never use <code>:latest</code> for anything you want to roll back.</td></tr>
+        <tr><td>16</td><td><code>imagePullPolicy: IfNotPresent</code></td><td>Use the image already on the node if present. Essential with kind, where you <code>kind load</code> the image instead of pushing it. If the tag is <code>:latest</code> or omitted, the default becomes <code>Always</code>, which fails in kind for local-only images.</td></tr>
+        <tr><td>17</td><td><code>ports[].name: http</code>, <code>containerPort: 8000</code></td><td>Informational for the container port (it does not open or publish anything — the app already listens on 0.0.0.0:8000), but naming it lets probes and Services refer to <code>http</code> instead of a number.</td></tr>
+        <tr><td>18</td><td><code>env</code></td><td>The three app settings. <code>READY_DELAY_SECONDS: "5"</code> simulates warm-up so readiness is observable. Values must be strings — quote them. Module 05 moves these into ConfigMap <code>reliability-api-config</code>.</td></tr>
+        <tr><td>19</td><td><code>resources</code></td><td>Requests are what the scheduler reserves (100m CPU = 0.1 core, 128Mi memory). Memory limit 256Mi caps a leak (OOMKill). No CPU limit, deliberately — Module 04 discusses the throttling trade-off.</td></tr>
+        <tr><td>20</td><td><code>readinessProbe</code></td><td>Kubelet calls <code>GET /ready</code> every 5 s; Pod receives Service traffic only while it passes. With 5 s warm-up, a new Pod becomes Ready after ~5–10 s.</td></tr>
+        <tr><td>21</td><td><code>livenessProbe</code></td><td><code>GET /health</code> every 10 s; 3 consecutive failures (each allowed 2 s) → container restart. Deliberately <em>not</em> <code>/ready</code>: a warming-up or overloaded Pod should be taken out of rotation, not killed. Full analysis in Module 04.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>What the API server adds (defaults)</h3>
+    <p>Run <code>kubectl get deploy reliability-api -o yaml</code> after applying and compare with your file. You will see fields you did not write: <code>progressDeadlineSeconds: 600</code>, <code>minReadySeconds</code> absent (0), <code>restartPolicy: Always</code>, <code>dnsPolicy: ClusterFirst</code>, <code>schedulerName: default-scheduler</code>, <code>terminationMessagePath</code>, probe defaults (<code>successThreshold: 1</code>, <code>timeoutSeconds: 1</code> on readiness) and more. That is the API server's defaulting. It is why <code>kubectl diff</code> against a live object is more trustworthy than eyeballing YAML.</p>
+
+    <h3>Deployment status columns</h3>
+    <pre data-title="Example output (yours will differ)"><code><span class="o">$ kubectl get deploy reliability-api
+NAME              READY   UP-TO-DATE   AVAILABLE   AGE
+reliability-api   2/2     2            2           3m</span></code></pre>
+    <ul>
+      <li><strong>READY</strong> — ready Pods / desired replicas.</li>
+      <li><strong>UP-TO-DATE</strong> — Pods running the latest template.</li>
+      <li><strong>AVAILABLE</strong> — Pods that have been ready for at least <code>minReadySeconds</code> (0 by default), i.e. available to users.</li>
+    </ul>
+
+    <div class="callout warn"><span class="label">Failure cases &amp; diagnosis</span>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Symptom</th><th>Cause</th><th>Check</th></tr></thead>
+        <tbody>
+          <tr><td>Apply rejected: <code>selector does not match template labels</code></td><td>(9) and (12) disagree</td><td>Fix labels; the API validates this</td></tr>
+          <tr><td>Apply rejected: <code>field is immutable</code> on <code>spec.selector</code></td><td>You changed the selector of an existing Deployment</td><td>Revert, or delete &amp; recreate deliberately</td></tr>
+          <tr><td><code>READY 0/2</code>, Pods <code>ErrImagePull</code></td><td>Image not loaded into kind, or wrong tag</td><td><code>kubectl describe pod</code> Events; <code>docker exec reliability-lab-control-plane crictl images</code></td></tr>
+          <tr><td><code>READY 0/2</code>, Pods <code>Running</code></td><td>Readiness failing (wrong path/port)</td><td><code>kubectl describe pod</code> → <code>Readiness probe failed</code></td></tr>
+          <tr><td>RESTARTS keeps growing</td><td>Process exits or liveness fails</td><td><code>kubectl logs --previous</code>, <code>describe</code> → Last State</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+
+    <h3>Trade-offs</h3>
+    <ul>
+      <li><strong>Deployment vs bare Pod:</strong> always Deployment for long-running stateless services; bare Pods only for throwaway debugging.</li>
+      <li><strong>Deployment vs StatefulSet:</strong> <code>reliability-api</code> is stateless (no local data, any replica can serve any request), so Deployment. Databases needing stable identity/storage use StatefulSets (Module 04 overview).</li>
+      <li><strong>Explicit vs default fields:</strong> writing defaults explicitly (like <code>revisionHistoryLimit</code>) documents intent but adds noise. We do it here for teaching; in your repo, be explicit about anything reliability-critical (strategy, probes, resources, grace period).</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>12. kubectl essentials</h2>
+    <p><code>kubectl</code> is just an HTTP client for the API server. It reads <code>~/.kube/config</code> (or <code>$KUBECONFIG</code>) for the cluster URL, credentials, and current context/namespace. kind created the context <code>kind-reliability-lab</code> for you.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="Debugging decision flow with kubectl: get pods, then depending on status use describe, logs previous, or exec and port-forward">
+        <defs><marker id="a9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="310" y="14" width="240" height="44" rx="8" class="box2"/>
+        <text x="430" y="41" text-anchor="middle" class="t-mono">kubectl get pods -o wide</text>
+        <rect x="20" y="110" width="190" height="54" rx="8" class="box3"/>
+        <text x="115" y="133" text-anchor="middle" class="t-bold">Pending</text>
+        <text x="115" y="151" text-anchor="middle" class="t-muted">not scheduled / pulling</text>
+        <rect x="230" y="110" width="190" height="54" rx="8" class="box3"/>
+        <text x="325" y="133" text-anchor="middle" class="t-bold">ImagePullBackOff</text>
+        <text x="325" y="151" text-anchor="middle" class="t-muted">image name / load</text>
+        <rect x="440" y="110" width="190" height="54" rx="8" class="box3"/>
+        <text x="535" y="133" text-anchor="middle" class="t-bold">CrashLoopBackOff</text>
+        <text x="535" y="151" text-anchor="middle" class="t-muted">process keeps exiting</text>
+        <rect x="650" y="110" width="190" height="54" rx="8" class="box3"/>
+        <text x="745" y="133" text-anchor="middle" class="t-bold">Running, 0/1 READY</text>
+        <text x="745" y="151" text-anchor="middle" class="t-muted">readiness failing</text>
+        <path d="M380 58 L115 108" class="line" marker-end="url(#a9)"/>
+        <path d="M410 58 L325 108" class="line" marker-end="url(#a9)"/>
+        <path d="M450 58 L535 108" class="line" marker-end="url(#a9)"/>
+        <path d="M480 58 L745 108" class="line" marker-end="url(#a9)"/>
+        <rect x="20" y="210" width="400" height="44" rx="8" class="box"/>
+        <text x="220" y="237" text-anchor="middle" class="t-mono">kubectl describe pod &lt;p&gt;   → Events</text>
+        <rect x="440" y="210" width="190" height="44" rx="8" class="box"/>
+        <text x="535" y="237" text-anchor="middle" class="t-mono">logs &lt;p&gt; --previous</text>
+        <rect x="650" y="210" width="190" height="44" rx="8" class="box"/>
+        <text x="745" y="237" text-anchor="middle" class="t-mono">describe → probe msg</text>
+        <path d="M115 164 L115 208" class="line" marker-end="url(#a9)"/>
+        <path d="M325 164 L325 208" class="line" marker-end="url(#a9)"/>
+        <path d="M535 164 L535 208" class="line" marker-end="url(#a9)"/>
+        <path d="M745 164 L745 208" class="line" marker-end="url(#a9)"/>
+        <rect x="160" y="276" width="540" height="44" rx="8" class="box4"/>
+        <text x="430" y="297" text-anchor="middle">Running &amp; Ready but wrong answers?</text>
+        <text x="430" y="313" text-anchor="middle" class="t-mono">logs -f · exec · port-forward + curl</text>
+      </svg>
+      <figcaption>Figure 9 — A first-response decision tree. <code>describe</code> (Events) answers "why isn't it running?"; <code>logs --previous</code> answers "why did it die?".</figcaption>
+    </figure>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Command</th><th>What it is for</th></tr></thead>
+      <tbody>
+        <tr><td><code>kubectl get pods -o wide</code></td><td>Status, restarts, Pod IP, node.</td></tr>
+        <tr><td><code>kubectl get deploy,rs,pods --show-labels</code></td><td>The whole ownership chain and labels in one view.</td></tr>
+        <tr><td><code>kubectl get pod &lt;p&gt; -o yaml</code></td><td>The full live object: spec as defaulted by the server <em>and</em> status (conditions, containerStatuses, lastState).</td></tr>
+        <tr><td><code>kubectl get pod &lt;p&gt; -o jsonpath='{.status.phase}'</code></td><td>Extract one field (scripts, CI).</td></tr>
+        <tr><td><code>kubectl get pods -w</code></td><td>Watch changes live (stream of updates).</td></tr>
+        <tr><td><code>kubectl describe pod &lt;p&gt;</code></td><td>Human summary + <strong>Events</strong>: scheduling, pulls, probe failures, kills.</td></tr>
+        <tr><td><code>kubectl get events --sort-by=.metadata.creationTimestamp</code></td><td>Namespace-wide timeline. Events are kept only for a limited time (one hour by default in kube-apiserver).</td></tr>
+        <tr><td><code>kubectl logs &lt;p&gt; [-c reliability-api] [-f] [--tail=50]</code></td><td>Container stdout/stderr. <code>-f</code> follows.</td></tr>
+        <tr><td><code>kubectl logs &lt;p&gt; --previous</code></td><td>Logs of the <em>previous</em> container instance — essential for crashes.</td></tr>
+        <tr><td><code>kubectl logs deploy/reliability-api</code></td><td>Logs from one Pod of the Deployment (use <code>-l</code> with <code>--prefix</code> for all).</td></tr>
+        <tr><td><code>kubectl exec -it &lt;p&gt; -c reliability-api -- sh</code></td><td>Shell inside a running container (only if the image has a shell).</td></tr>
+        <tr><td><code>kubectl port-forward deploy/reliability-api 8000:8000</code></td><td>Tunnel localhost:8000 to a Pod — quick testing without a Service (Module 05).</td></tr>
+        <tr><td><code>kubectl explain &lt;kind.field&gt;</code></td><td>Field documentation from your cluster's schema.</td></tr>
+        <tr><td><code>kubectl diff -f &lt;dir&gt;</code></td><td>Show what apply would change.</td></tr>
+        <tr><td><code>kubectl apply -f &lt;dir&gt; --dry-run=server</code></td><td>Full server-side validation without persisting.</td></tr>
+        <tr><td><code>kubectl delete -f &lt;file&gt;</code></td><td>Delete what a file declares.</td></tr>
+        <tr><td><code>kubectl api-resources</code> / <code>api-versions</code></td><td>What kinds and versions this cluster serves.</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="callout note"><span class="label">Output formats worth memorising</span>
+      <p><code>-o wide</code> (extra columns), <code>-o yaml</code> / <code>-o json</code> (full object), <code>-o name</code> (just <code>kind/name</code>, great for piping), <code>-o jsonpath='…'</code> (one field), <code>-o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName</code> (your own table), <code>--show-labels</code>, <code>-L app.kubernetes.io/version</code> (labels as columns).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>13. Labs on the kind cluster <code>reliability-lab</code></h2>
+    <p>Prerequisites: Docker running, <code>kind</code> and <code>kubectl</code> installed (installation details in Module 06), and the image <code>reliability-api:0.1.0</code> built in Module 02 from the repo root <code>kubernetes-reliability-lab/</code>.</p>
+
+    <section class="lab"><header>Lab 1 — Meet the control plane</header><div class="body">
+      <p><strong>Goal:</strong> see every component from Figure 2 as a real process, and confirm the hub-and-spoke model.</p>
+      <ol class="steps">
+        <li>Create the cluster (single node) and check the context:
+<pre><code>kind create cluster --name reliability-lab
+kubectl config current-context          <span class="c"># kind-reliability-lab</span>
+kubectl cluster-info
+kubectl get nodes -o wide</code></pre>
+<pre data-title="Example output (yours will differ in versions/IPs/ages)"><code><span class="o">NAME                            STATUS   ROLES           AGE   VERSION   INTERNAL-IP   ...
+reliability-lab-control-plane   Ready    control-plane   60s   v1.3x.y   172.18.0.2    ...</span></code></pre></li>
+        <li>List the system Pods and match each to a component:
+<pre><code>kubectl get pods -n kube-system -o wide</code></pre>
+<pre data-title="Example output (names of random suffixes will differ)"><code><span class="o">NAME                                                    READY   STATUS    RESTARTS   AGE
+coredns-xxxxxxxxxx-aaaaa                                1/1     Running   0          2m
+coredns-xxxxxxxxxx-bbbbb                                1/1     Running   0          2m
+etcd-reliability-lab-control-plane                      1/1     Running   0          2m
+kindnet-ccccc                                           1/1     Running   0          2m
+kube-apiserver-reliability-lab-control-plane            1/1     Running   0          2m
+kube-controller-manager-reliability-lab-control-plane   1/1     Running   0          2m
+kube-proxy-ddddd                                        1/1     Running   0          2m
+kube-scheduler-reliability-lab-control-plane            1/1     Running   0          2m</span></code></pre>
+          <p>Pods suffixed with the node name are <strong>static Pods</strong>; <code>coredns</code> is a Deployment; <code>kindnet</code> and <code>kube-proxy</code> are DaemonSets (one per node). Verify: <code>kubectl get deploy,ds -n kube-system</code>.</p></li>
+        <li>Look inside the "node" (a Docker container) at the static Pod manifests and the runtime:
+<pre><code>docker exec reliability-lab-control-plane ls /etc/kubernetes/manifests
+docker exec reliability-lab-control-plane crictl ps</code></pre>
+<pre data-title="Example output (abridged)"><code><span class="o">etcd.yaml
+kube-apiserver.yaml
+kube-controller-manager.yaml
+kube-scheduler.yaml
+
+CONTAINER      IMAGE          CREATED        STATE     NAME                      ATTEMPT   POD ID    POD
+3f2a…          …              3 minutes ago  Running   kube-scheduler            0         9c1e…     kube-scheduler-reliability-lab-control-plane
+…</span></code></pre>
+          <p><code>crictl</code> talks to containerd over CRI — the same API the kubelet uses. You are one level below Kubernetes here.</p></li>
+        <li>See the node heartbeat (Lease) and namespaces:
+<pre><code>kubectl get lease -n kube-node-lease
+kubectl get namespaces</code></pre></li>
+        <li><strong>Thought experiment, then test:</strong> what happens to a running Pod if the scheduler is gone? In kind you can move the static Pod manifest away and back (the kubelet watches that directory):
+<pre><code>docker exec reliability-lab-control-plane mv /etc/kubernetes/manifests/kube-scheduler.yaml /tmp/
+kubectl -n kube-system get pods | grep scheduler      <span class="c"># gone after a few seconds</span>
+kubectl run sched-test --image=busybox:1.36 -n default -- sleep 3600
+kubectl get pod sched-test -n default                  <span class="c"># stays Pending: nobody binds it</span>
+docker exec reliability-lab-control-plane mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/
+kubectl get pod sched-test -n default -w               <span class="c"># scheduled once the scheduler is back</span>
+kubectl delete pod sched-test -n default</code></pre>
+          <div class="callout warn"><span class="label">Lab-only</span><p>Never do this on a shared cluster. It is safe here because the kind cluster is disposable: <code>kind delete cluster --name reliability-lab</code> resets everything.</p></div></li>
+      </ol>
+      <p><strong>Done when:</strong> you can point at each line of <code>kubectl get pods -n kube-system</code> and say which box of Figure 2 it is, and you have seen a Pod stay Pending without a scheduler.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 2 — Deploy reliability-api and watch it self-heal</header><div class="body">
+      <ol class="steps">
+        <li>Load the image into the kind node (it is not in any registry):
+<pre><code>kind load docker-image reliability-api:0.1.0 --name reliability-lab
+docker exec reliability-lab-control-plane crictl images | grep reliability-api</code></pre></li>
+        <li>Create the namespace and make it your default:
+<pre><code>kubectl apply -f deploy/kubernetes/namespace.yaml
+kubectl config set-context --current --namespace=reliability-lab</code></pre></li>
+        <li>Preview, then apply the Deployment from section 11:
+<pre><code>kubectl diff -f deploy/kubernetes/deployment.yaml          <span class="c"># whole object shown as new</span>
+kubectl apply -f deploy/kubernetes/deployment.yaml --dry-run=server
+kubectl apply -f deploy/kubernetes/deployment.yaml
+kubectl rollout status deploy/reliability-api</code></pre>
+<pre data-title="Example output"><code><span class="o">deployment.apps/reliability-api created (server dry run)
+deployment.apps/reliability-api created
+Waiting for deployment "reliability-api" rollout to finish: 0 of 2 updated replicas are available...
+Waiting for deployment "reliability-api" rollout to finish: 1 of 2 updated replicas are available...
+deployment "reliability-api" successfully rolled out</span></code></pre>
+          <p>Notice the wait: with <code>READY_DELAY_SECONDS=5</code> each Pod reports 503 on <code>/ready</code> for its first 5 seconds.</p></li>
+        <li>Inspect the ownership chain:
+<pre><code>kubectl get deploy,rs,pods --show-labels
+POD=$(kubectl get pods -l app.kubernetes.io/name=reliability-api -o name | head -1)
+kubectl get $POD -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'
+RS=$(kubectl get rs -l app.kubernetes.io/name=reliability-api -o name | head -1)
+kubectl get $RS -o jsonpath='{.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'</code></pre>
+<pre data-title="Example output"><code><span class="o">ReplicaSet/reliability-api-6d9f7c8b5d
+Deployment/reliability-api</span></code></pre></li>
+        <li>Talk to it through a port-forward (Services come in Module 05):
+<pre><code>kubectl port-forward deploy/reliability-api 8000:8000     <span class="c"># terminal A, leave running</span>
+curl -s localhost:8000/health; echo                        <span class="c"># terminal B</span>
+curl -s localhost:8000/ready; echo
+curl -s "localhost:8000/work?ms=50"; echo</code></pre>
+<pre data-title="Example output"><code><span class="o">{"status":"ok"}
+{"ready":true}
+{"worked_ms":50.0}</span></code></pre></li>
+        <li><strong>Self-healing.</strong> In terminal A (stop the port-forward first) watch Pods; in terminal B delete one:
+<pre><code>kubectl get pods -l app.kubernetes.io/name=reliability-api -w     <span class="c"># terminal A</span>
+kubectl delete pod &lt;one-of-the-pod-names&gt;                       <span class="c"># terminal B</span></code></pre>
+<pre data-title="Example output of the watch (abridged; yours will differ)"><code><span class="o">NAME                               READY   STATUS              RESTARTS   AGE
+reliability-api-6d9f7c8b5d-k2x8q   1/1     Running             0          5m
+reliability-api-6d9f7c8b5d-p7w2m   1/1     Running             0          5m
+reliability-api-6d9f7c8b5d-k2x8q   1/1     Terminating         0          5m
+reliability-api-6d9f7c8b5d-z9c4v   0/1     Pending             0          0s
+reliability-api-6d9f7c8b5d-z9c4v   0/1     ContainerCreating   0          0s
+reliability-api-6d9f7c8b5d-z9c4v   0/1     Running             0          1s
+reliability-api-6d9f7c8b5d-z9c4v   1/1     Running             0          7s</span></code></pre>
+          <p>The replacement has a <em>new name</em> and (check with <code>-o wide</code>) a new IP. It shows <code>0/1</code> for ~5 s: that is readiness doing its job.</p></li>
+        <li><strong>The stray-Pod experiment.</strong> Create an unowned Pod with the app label, then with the hash label too:
+<pre><code>HASH=$(kubectl get rs -l app.kubernetes.io/name=reliability-api -o jsonpath='{.items[0].metadata.labels.pod-template-hash}')
+kubectl run stray --image=reliability-api:0.1.0 --image-pull-policy=IfNotPresent \
+  --labels="app.kubernetes.io/name=reliability-api"
+kubectl get pods -l app.kubernetes.io/name=reliability-api      <span class="c"># 3 Pods; stray is not adopted (no hash label)</span>
+kubectl label pod stray pod-template-hash=$HASH
+kubectl get pods -l app.kubernetes.io/name=reliability-api -w   <span class="c"># RS adopts it, sees 3 &gt; 2, deletes one</span></code></pre>
+          <p>Expected behaviour: the ReplicaSet selector includes <code>pod-template-hash</code>, so the first stray Pod is ignored. After labelling, the ReplicaSet acquires it (check its <code>ownerReferences</code>) and terminates one of the three to return to 2. Which one it removes is an implementation detail — do not depend on it. Clean up whatever remains of <code>stray</code> with <code>kubectl delete pod stray --ignore-not-found</code>.</p></li>
+      </ol>
+      <p><strong>Done when:</strong> you can explain each line of the watch output and why the stray Pod was ignored, then adopted.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 3 — Break it on purpose: validation, immutability, preview</header><div class="body">
+      <p><strong>Goal:</strong> learn what the API server protects you from, and how to see changes before making them. Work on copies of the manifest.</p>
+      <ol class="steps">
+        <li><strong>Selector does not match template.</strong> Copy the manifest to <code>/tmp/bad-selector.yaml</code>, change the template label to <code>app.kubernetes.io/name: reliability-api-v2</code> (leave the selector alone) and rename the Deployment to <code>reliability-api-bad</code>:
+<pre><code>kubectl apply -f /tmp/bad-selector.yaml --dry-run=server</code></pre>
+<pre data-title="Example output (wording may vary by version)"><code><span class="o">The Deployment "reliability-api-bad" is invalid: spec.template.metadata.labels: Invalid value: map[string]string{...}: `selector` does not match template `labels`</span></code></pre></li>
+        <li><strong>Typo in a field name.</strong> In another copy change <code>replicas: 2</code> to <code>replica: 2</code>:
+<pre><code>kubectl apply -f /tmp/typo.yaml --dry-run=server</code></pre>
+          <p>Expected: an error mentioning <code>unknown field "spec.replica"</code>. Strict server-side field validation is the kubectl default; with <code>--validate=false</code>/<code>ignore</code> the typo would be silently dropped and you would get the default of 1 replica — a classic silent misconfiguration.</p></li>
+        <li><strong>Immutable selector.</strong> Edit the <em>real</em> manifest so both selector and template use an extra label <code>tier: web</code>, then:
+<pre><code>kubectl apply -f deploy/kubernetes/deployment.yaml --dry-run=server</code></pre>
+          <p>Expected: rejected with a message that <code>spec.selector</code> is immutable (<code>field is immutable</code>). Revert the edit.</p></li>
+        <li><strong>Preview a real change.</strong> Change <code>LOG_LEVEL</code> to <code>"debug"</code> and the change-cause annotation to <code>"log level debug"</code>, then:
+<pre><code>kubectl diff -f deploy/kubernetes/deployment.yaml; echo "exit=$?"</code></pre>
+<pre data-title="Example output (abridged)"><code><span class="o">-  kubernetes.io/change-cause: deploy 0.1.0
++  kubernetes.io/change-cause: log level debug
+...
+-          value: info
++          value: debug
+...
+exit=1</span></code></pre>
+          <p>Note that <code>generation</code> also changes in the diff: the server would bump it because the spec changed. Apply it, run <code>kubectl get rs</code>, and observe a <em>second</em> ReplicaSet — an env change is a template change, so it is a new revision. Then revert to <code>info</code> and apply again.</p></li>
+        <li><strong>Wrong namespace confusion.</strong>
+<pre><code>kubectl get pods -n default        <span class="c"># "No resources found in default namespace."</span>
+kubectl get pods -A -l app.kubernetes.io/name=reliability-api</code></pre></li>
+      </ol>
+      <p><strong>Done when:</strong> you can name which protections came from the API server (validation, immutability) and which you must provide yourself (reviewing diffs, not mixing imperative edits with apply).</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 4 — Inside a Pod: init container, shared localhost, shared volume</header><div class="body">
+      <ol class="steps">
+        <li>Apply <code>lab/pod-multi.yaml</code> from section 9 and watch the init phase:
+<pre><code>kubectl apply -f lab/pod-multi.yaml
+kubectl get pod reliability-api-multi -w</code></pre>
+<pre data-title="Example output"><code><span class="o">NAME                    READY   STATUS            RESTARTS   AGE
+reliability-api-multi   0/2     Init:0/1          0          2s
+reliability-api-multi   0/2     PodInitializing   0          7s
+reliability-api-multi   2/2     Running           0          9s</span></code></pre></li>
+        <li>Prove the poller reaches the API over <code>localhost</code> and reads the file the init container wrote:
+<pre><code>kubectl logs reliability-api-multi -c poller --tail=3
+kubectl logs reliability-api-multi -c prepare</code></pre>
+<pre data-title="Example output"><code><span class="o">prepared at Thu Oct 29 10:00:00 UTC 2026
+{"status":"ok"}
+{"status":"ok"}</span></code></pre></li>
+        <li>Prove the network namespace is shared: both containers see the same IP.
+<pre><code>kubectl get pod reliability-api-multi -o jsonpath='{.status.podIP}{"\n"}'
+kubectl exec reliability-api-multi -c poller -- ip addr show eth0</code></pre></li>
+        <li>Clean up: <code>kubectl delete pod reliability-api-multi</code>.</li>
+      </ol>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>14. Troubleshooting quick reference</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Symptom</th><th>Possible cause</th><th>First diagnostic step</th></tr></thead>
+      <tbody>
+        <tr><td><code>No resources found in default namespace.</code></td><td>Wrong namespace</td><td><code>kubectl get pods -A</code>; set context namespace</td></tr>
+        <tr><td>Connection refused to API</td><td>Wrong context, kind container stopped</td><td><code>kubectl config get-contexts</code>, <code>docker ps</code></td></tr>
+        <tr><td>Pod <code>Pending</code></td><td>Unschedulable (resources, selectors, taints) or no scheduler</td><td><code>kubectl describe pod</code> → Events (<code>FailedScheduling</code>)</td></tr>
+        <tr><td><code>ErrImagePull</code> / <code>ImagePullBackOff</code></td><td>Image not loaded in kind; typo in tag; <code>:latest</code> → pull policy Always</td><td><code>describe pod</code>; <code>crictl images</code> inside the node</td></tr>
+        <tr><td><code>CrashLoopBackOff</code></td><td>App exits (bad command, missing env, import error) or liveness kills it</td><td><code>kubectl logs --previous</code>; <code>describe</code> → Last State / exit code</td></tr>
+        <tr><td><code>Running</code> but <code>0/1</code> READY</td><td>Readiness probe failing</td><td><code>describe</code> → <code>Readiness probe failed: …</code></td></tr>
+        <tr><td>Deleted Pod not replaced</td><td>Bare Pod (no controller) or controller-manager down</td><td>Check <code>ownerReferences</code>; <code>kubectl get pods -n kube-system</code></td></tr>
+        <tr><td>Changes revert after a while</td><td>Something else manages the object (Helm, CI apply, HPA)</td><td><code>kubectl get … -o yaml --show-managed-fields</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Task</th><th>Command</th></tr></thead>
+      <tbody>
+        <tr><td>Create / delete lab cluster</td><td><code>kind create cluster --name reliability-lab</code> / <code>kind delete cluster --name reliability-lab</code></td></tr>
+        <tr><td>Load local image</td><td><code>kind load docker-image reliability-api:0.1.0 --name reliability-lab</code></td></tr>
+        <tr><td>Default namespace</td><td><code>kubectl config set-context --current --namespace=reliability-lab</code></td></tr>
+        <tr><td>Preview / validate / apply</td><td><code>kubectl diff -f deploy/kubernetes/</code> · <code>kubectl apply -f deploy/kubernetes/ --dry-run=server</code> · <code>kubectl apply -f deploy/kubernetes/</code></td></tr>
+        <tr><td>Everything for the app</td><td><code>kubectl get deploy,rs,pods -l app.kubernetes.io/name=reliability-api -o wide</code></td></tr>
+        <tr><td>Full live object</td><td><code>kubectl get deploy reliability-api -o yaml</code></td></tr>
+        <tr><td>One field</td><td><code>kubectl get pod &lt;p&gt; -o jsonpath='{.spec.nodeName}'</code></td></tr>
+        <tr><td>Why not running?</td><td><code>kubectl describe pod &lt;p&gt;</code> · <code>kubectl get events --sort-by=.metadata.creationTimestamp</code></td></tr>
+        <tr><td>Why did it die?</td><td><code>kubectl logs &lt;p&gt; -c reliability-api --previous</code></td></tr>
+        <tr><td>Logs from all replicas</td><td><code>kubectl logs -l app.kubernetes.io/name=reliability-api --prefix --tail=20</code></td></tr>
+        <tr><td>Shell / command in container</td><td><code>kubectl exec -it &lt;p&gt; -c reliability-api -- sh</code></td></tr>
+        <tr><td>Quick local access</td><td><code>kubectl port-forward deploy/reliability-api 8000:8000</code></td></tr>
+        <tr><td>Field docs</td><td><code>kubectl explain deployment.spec.template.spec.containers.livenessProbe</code></td></tr>
+        <tr><td>Kinds &amp; scope</td><td><code>kubectl api-resources --namespaced=false</code></td></tr>
+        <tr><td>Label queries</td><td><code>kubectl get pods -l 'app.kubernetes.io/version in (0.1.0,0.2.0)' -L app.kubernetes.io/version</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>Cluster</dt><dd>A control plane plus one or more nodes that run Pods.</dd>
+      <dt>Control plane</dt><dd>kube-apiserver, etcd, kube-scheduler, kube-controller-manager (and optionally cloud-controller-manager): stores state and makes global decisions.</dd>
+      <dt>Node</dt><dd>A machine (VM, physical, or in kind a Docker container) running kubelet, a container runtime and usually kube-proxy.</dd>
+      <dt>kubelet</dt><dd>Node agent that makes the containers described by Pods bound to its node actually run, runs probes and reports status.</dd>
+      <dt>CRI</dt><dd>Container Runtime Interface: the gRPC API between kubelet (client) and runtime (server, e.g. containerd).</dd>
+      <dt>Object</dt><dd>A persistent record of intent in the API, with metadata, spec (desired) and status (observed).</dd>
+      <dt>Resource vs kind</dt><dd>Kind is the type name (<code>Deployment</code>); resource is the API path name (<code>deployments</code>).</dd>
+      <dt>Controller</dt><dd>A control loop that moves actual state toward desired state for some kinds of objects.</dd>
+      <dt>Reconciliation</dt><dd>The repeated observe → diff → act cycle a controller performs.</dd>
+      <dt>Declarative</dt><dd>You describe the desired end state (files + <code>apply</code>); the system works out operations.</dd>
+      <dt>Namespace</dt><dd>A naming and policy scope inside a cluster.</dd>
+      <dt>Label / selector</dt><dd>Identifying key/value metadata / a query over labels used to define membership.</dd>
+      <dt>Annotation</dt><dd>Non-identifying key/value metadata for tools and humans; not selectable.</dd>
+      <dt>Pod</dt><dd>Smallest deployable unit: one or more containers sharing network namespace and volumes, scheduled together.</dd>
+      <dt>Pod sandbox / pause</dt><dd>The runtime's holder of a Pod's shared namespaces; many runtimes use a tiny "pause" container.</dd>
+      <dt>Init container</dt><dd>Runs to completion, in order, before app containers start.</dd>
+      <dt>Sidecar container</dt><dd>An init container with <code>restartPolicy: Always</code>; runs alongside the app for the Pod's life.</dd>
+      <dt>Static Pod</dt><dd>A Pod defined by a file on a node and run directly by that node's kubelet (how kind/kubeadm run the control plane).</dd>
+      <dt>ReplicaSet</dt><dd>Keeps N Pods matching a selector running.</dd>
+      <dt>Deployment</dt><dd>Manages ReplicaSets to give declarative, versioned, rolling updates and rollback.</dd>
+      <dt>ownerReferences</dt><dd>Metadata linking a child to its owner; drives garbage collection and adoption.</dd>
+      <dt>pod-template-hash</dt><dd>Label the Deployment controller adds to each ReplicaSet and its Pods to keep revisions apart.</dd>
+      <dt>generation / observedGeneration</dt><dd>Spec version counter / the generation a controller has acted on.</dd>
+      <dt>Server-side dry run</dt><dd>A request fully validated and admitted by the API server but not persisted.</dd>
+    </dl>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. Name the five control-plane components and the three node components, with one sentence each.</summary><div class="a">kube-apiserver (HTTP API front door, the only etcd client), etcd (consistent key-value store of all cluster data), kube-scheduler (binds unscheduled Pods to nodes), kube-controller-manager (runs built-in control loops), cloud-controller-manager (optional cloud integrations). Node: kubelet (runs Pods' containers via CRI, probes, status), kube-proxy (optional; programs Service networking rules), container runtime (containerd/CRI-O: actually runs containers).</div></details>
+    <details class="q"><summary>2. etcd becomes unavailable for two minutes. What do users of reliability-api notice?</summary><div class="a">Probably nothing for requests already being served: Pods keep running and existing networking rules stay in place. But the API cannot persist changes, so nothing new happens: no scaling, no rollouts, no replacement Pods, probe-driven readiness changes cannot be recorded, and kubectl fails. If a Pod crashes during that window, the kubelet can still restart its container locally, but a lost Pod cannot be replaced.</div></details>
+    <details class="q"><summary>3. Put these in order for <code>kubectl apply</code> of a new Deployment: scheduler binds, ReplicaSet created, etcd write, Pod objects created, kubelet starts container, admission.</summary><div class="a">Admission → etcd write → ReplicaSet created (Deployment controller) → Pod objects created (ReplicaSet controller) → scheduler binds → kubelet starts container (via CRI).</div></details>
+    <details class="q"><summary>4. What is the difference between <code>spec</code> and <code>status</code>, and why should <code>status</code> never be in your Git manifests?</summary><div class="a"><code>spec</code> is desired state written by you; <code>status</code> is observed state written by controllers. Status in Git is meaningless (it describes a past moment) and it is ignored/overwritten by the system; including it only adds noise and confusion.</div></details>
+    <details class="q"><summary>5. Why does a Deployment-managed ReplicaSet not adopt a Pod that only has <code>app.kubernetes.io/name: reliability-api</code>?</summary><div class="a">Its selector also requires <code>pod-template-hash=&lt;hash&gt;</code>, which the Deployment controller adds. A Pod without that label does not match, so it is not counted or adopted.</div></details>
+    <details class="q"><summary>6. A Service has selector <code>app: reliability-api</code>; Pods have <code>app.kubernetes.io/name: reliability-api</code>. What happens and how do you prove it?</summary><div class="a">The Service selects zero Pods, so it has no endpoints and requests fail. Prove with <code>kubectl get endpointslices -l kubernetes.io/service-name=reliability-api</code> (no addresses) and <code>kubectl get pods --show-labels</code>. Unlike Deployments, the API cannot reject this because a Service selecting nothing is valid.</div></details>
+    <details class="q"><summary>7. When would you use an annotation instead of a label? Give two reliability-api examples.</summary><div class="a">When the data is not used for selection, or is too long/irregular for label value rules. Examples: <code>kubernetes.io/change-cause</code> describing a rollout; the CI run URL or full Git commit message that produced the image.</div></details>
+    <details class="q"><summary>8. Two containers in one Pod. Can container B reach container A at <code>localhost:8000</code>? Can they both listen on port 8000?</summary><div class="a">Yes to the first: they share the Pod's network namespace. No to the second: they share one port space, so the second bind fails with "address already in use".</div></details>
+    <details class="q"><summary>9. Why are Pods "not moved" when a node fails?</summary><div class="a">A Pod is bound to a node for its whole life. When a node is lost, its Pods are lost; the owning controller (ReplicaSet) sees fewer matching Pods and creates new Pods, with new names and IPs, which the scheduler places on healthy nodes.</div></details>
+    <details class="q"><summary>10. What does <code>--dry-run=server</code> catch that <code>--dry-run=client</code> does not?</summary><div class="a">Everything the API server checks: authentication and RBAC, admission (mutating and validating, including policies and webhooks), schema and strict field validation, immutability rules, selector/label consistency. Client dry-run just prints the object kubectl would send.</div></details>
+    <details class="q"><summary>11. You changed only <code>replicas</code> from 2 to 3. Is that a new revision? What about changing <code>LOG_LEVEL</code>?</summary><div class="a">Scaling is not a new revision: the same ReplicaSet just scales. Changing an env var changes the Pod template, so the Deployment creates a new ReplicaSet (new <code>pod-template-hash</code>) and performs a rolling update.</div></details>
+    <details class="q"><summary>12. In kind, why does <code>image: reliability-api:latest</code> without a pull policy fail while <code>:0.1.0</code> works?</summary><div class="a">For the <code>:latest</code> tag (or no tag) the default <code>imagePullPolicy</code> is <code>Always</code>, so the kubelet tries to pull from a registry where the image does not exist. With a specific tag the default is <code>IfNotPresent</code>, and the image you <code>kind load</code>-ed is used.</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://kubernetes.io/docs/concepts/overview/">Overview — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/overview/components/">Kubernetes Components — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/architecture/nodes/">Nodes (heartbeats, node controller) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/containers/cri/">Container Runtime Interface (CRI) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/architecture/controller/">Controllers — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/security/controlling-access/">Controlling Access to the Kubernetes API — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/">Objects In Kubernetes — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/object-management/">Kubernetes Object Management — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/manage-kubernetes-objects/declarative-config/">Declarative Management of Kubernetes Objects Using Configuration Files — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/">Namespaces — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/">Labels and Selectors — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/">Recommended Labels — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/">Annotations — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/">Pods — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/">Pod Lifecycle (sandbox / pause container, conditions) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/init-containers/">Init Containers — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/">Sidecar Containers — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/">ReplicaSet — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Deployments — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/kubectl/quick-reference/">kubectl Quick Reference — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/kubectl/generated/kubectl_apply/">kubectl apply (--dry-run) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/kubectl/generated/kubectl_diff/">kubectl diff (exit status) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/kubectl/generated/kubectl_explain/">kubectl explain — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/kubectl/generated/kubectl_logs/">kubectl logs (--previous, --prefix) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/command-line-tools-reference/kube-apiserver/">kube-apiserver reference (--event-ttl default 1h) — kubernetes.io</a></li>
+      <li><a href="https://kind.sigs.k8s.io/docs/user/quick-start/">kind Quick Start (load docker-image, multi-node config) — kind.sigs.k8s.io</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="02-docker.html"><small>◀ Previous</small>Module 02 · Docker &amp; Containers</a>
+      <a class="next" href="04-kubernetes-workloads.html"><small>Next ▶</small>Module 04 · Workloads: Probes, Resources, Scheduling &amp; Rollouts</a>
+    </nav>
+  </article></main>
+</div>
+<script>
+/* ---------- Reconciliation simulator ---------- */
+(function () {
+  var desiredEl = document.getElementById("rec-desired");
+  var podsEl = document.getElementById("rec-pods");
+  var logEl = document.getElementById("rec-log");
+  var pauseBtn = document.getElementById("rec-pause");
+  if (!desiredEl) return;
+  var chars = "abcdefghjkmnpqrstuvwxz23456789";
+  function suffix() { var s = ""; for (var i = 0; i < 5; i++) s += chars[Math.floor(Math.random() * chars.length)]; return s; }
+  var pods = [];
+  var paused = false, tick = 0;
+  function mk(state, stray) { return { name: stray ? "stray" : "reliability-api-6d9f7c8b5d-" + suffix(), state: state, stray: !!stray }; }
+  pods.push(mk("running")); pods.push(mk("running"));
+  function log(msg) {
+    logEl.textContent = "[t=" + tick + "] " + msg + "\n" + logEl.textContent;
+    var lines = logEl.textContent.split("\n"); if (lines.length > 40) logEl.textContent = lines.slice(0, 40).join("\n");
+  }
+  function render() {
+    podsEl.innerHTML = "";
+    pods.forEach(function (p) {
+      var d = document.createElement("span");
+      d.className = "rec-pod" + (p.state === "pending" ? " pending" : p.state === "terminating" ? " dying" : "");
+      d.textContent = p.name + " · " + (p.state === "running" ? "Running" : p.state === "pending" ? "ContainerCreating" : "Terminating");
+      podsEl.appendChild(d);
+    });
+    var live = pods.filter(function (p) { return p.state !== "terminating"; }).length;
+    var head = document.createElement("div");
+    head.style.width = "100%"; head.style.fontSize = "13px"; head.style.color = "var(--muted)";
+    head.textContent = "desired=" + desiredEl.value + " · counted (not terminating)=" + live + (paused ? " · CONTROLLER PAUSED" : "");
+    podsEl.insertBefore(head, podsEl.firstChild);
+  }
+  function reconcile() {
+    tick++;
+    // kubelet-side progress happens even if the controller is paused
+    pods = pods.filter(function (p) { if (p.state === "terminating") { log("kubelet: " + p.name + " terminated and removed"); return false; } return true; });
+    pods.forEach(function (p) { if (p.state === "pending") { p.state = "running"; log("kubelet: " + p.name + " is Running"); } });
+    if (!paused) {
+      var desired = Math.max(0, Math.min(8, parseInt(desiredEl.value, 10) || 0));
+      var live = pods.filter(function (p) { return p.state !== "terminating"; });
+      var diff = desired - live.length;
+      if (diff > 0) {
+        for (var i = 0; i < diff; i++) { var np = mk("pending"); pods.push(np); log("ReplicaSet controller: observed " + live.length + ", desired " + desired + " → create " + np.name); }
+      } else if (diff < 0) {
+        // prefer deleting not-yet-running pods, then the newest
+        var victims = live.slice().sort(function (a, b) { return (a.state === "pending" ? 0 : 1) - (b.state === "pending" ? 0 : 1); }).slice(0, -diff);
+        victims.forEach(function (v) { v.state = "terminating"; log("ReplicaSet controller: observed " + live.length + ", desired " + desired + " → delete " + v.name); });
+      }
+    }
+    render();
+  }
+  document.getElementById("rec-kill").addEventListener("click", function () {
+    var live = pods.filter(function (p) { return p.state === "running"; });
+    if (!live.length) { log("you: no running Pod to delete"); return; }
+    var v = live[Math.floor(Math.random() * live.length)];
+    v.state = "terminating"; log("you: kubectl delete pod " + v.name); render();
+  });
+  document.getElementById("rec-stray").addEventListener("click", function () {
+    if (pods.some(function (p) { return p.stray && p.state !== "terminating"; })) { log("you: stray Pod already exists"); return; }
+    pods.push(mk("running", true)); log("you: created Pod 'stray' with matching labels and no owner → ReplicaSet will adopt it"); render();
+  });
+  pauseBtn.addEventListener("click", function () {
+    paused = !paused; pauseBtn.textContent = paused ? "Resume controller" : "Pause controller";
+    log(paused ? "kube-controller-manager stopped: no reconciliation" : "kube-controller-manager running again"); render();
+  });
+  desiredEl.addEventListener("change", function () { log("you: spec.replicas = " + desiredEl.value); render(); });
+  render();
+  setInterval(reconcile, 1500);
+})();
+
+/* ---------- Label selector playground ---------- */
+(function () {
+  var input = document.getElementById("sel-input");
+  if (!input) return;
+  var pods = [
+    { name: "reliability-api-6d9f-k2x8q", labels: { "app.kubernetes.io/name": "reliability-api", "app.kubernetes.io/version": "0.1.0", "pod-template-hash": "6d9f" } },
+    { name: "reliability-api-6d9f-p7w2m", labels: { "app.kubernetes.io/name": "reliability-api", "app.kubernetes.io/version": "0.1.0", "pod-template-hash": "6d9f" } },
+    { name: "reliability-api-7b1c-x4n8r", labels: { "app.kubernetes.io/name": "reliability-api", "app.kubernetes.io/version": "0.2.0", "pod-template-hash": "7b1c" } },
+    { name: "reliability-api-canary", labels: { "app.kubernetes.io/name": "reliability-api", "app.kubernetes.io/version": "0.2.0", "track": "canary" } },
+    { name: "debug-shell", labels: { "run": "debug-shell" } },
+    { name: "prometheus-0", labels: { "app.kubernetes.io/name": "prometheus", "app.kubernetes.io/version": "3.x" } }
+  ];
+  function splitTop(s) { // split on commas not inside parentheses
+    var out = [], depth = 0, cur = "";
+    for (var i = 0; i < s.length; i++) { var c = s[i]; if (c === "(") depth++; if (c === ")") depth--; if (c === "," && depth === 0) { out.push(cur); cur = ""; } else cur += c; }
+    if (cur.trim()) out.push(cur); return out.map(function (x) { return x.trim(); }).filter(Boolean);
+  }
+  function parse(req) {
+    var m;
+    if ((m = req.match(/^([^\s!=]+)\s+(in|notin)\s*\(([^)]*)\)$/))) return { key: m[1], op: m[2], vals: m[3].split(",").map(function (v) { return v.trim(); }) };
+    if ((m = req.match(/^([^\s!=]+)\s*!=\s*(\S*)$/))) return { key: m[1], op: "!=", vals: [m[2]] };
+    if ((m = req.match(/^([^\s!=]+)\s*==?\s*(\S*)$/))) return { key: m[1], op: "=", vals: [m[2]] };
+    if ((m = req.match(/^!\s*([^\s!=]+)$/))) return { key: m[1], op: "!exists" };
+    if ((m = req.match(/^([^\s!=(),]+)$/))) return { key: m[1], op: "exists" };
+    throw new Error("cannot parse requirement: " + req);
+  }
+  function matches(labels, r) {
+    var has = Object.prototype.hasOwnProperty.call(labels, r.key), v = labels[r.key];
+    switch (r.op) {
+      case "=": return has && v === r.vals[0];
+      case "!=": return !has || v !== r.vals[0];
+      case "in": return has && r.vals.indexOf(v) >= 0;
+      case "notin": return !has || r.vals.indexOf(v) < 0;
+      case "exists": return has;
+      case "!exists": return !has;
+    }
+    return false;
+  }
+  function run() {
+    var holder = document.getElementById("sel-pods"), out = document.getElementById("sel-out");
+    holder.innerHTML = "";
+    var reqs;
+    try { reqs = splitTop(input.value).map(parse); } catch (e) { out.textContent = e.message; return; }
+    var n = 0;
+    pods.forEach(function (p) {
+      var ok = reqs.length > 0 && reqs.every(function (r) { return matches(p.labels, r); });
+      if (ok) n++;
+      var chip = document.createElement("span");
+      chip.className = "pod-chip " + (ok ? "match" : "nomatch");
+      chip.textContent = p.name;
+      var sm = document.createElement("small");
+      sm.textContent = Object.keys(p.labels).map(function (k) { return k + "=" + p.labels[k]; }).join("  ");
+      chip.appendChild(sm);
+      holder.appendChild(chip);
+    });
+    var note = "";
+    if (/^app=/.test(input.value.trim())) note = "\nNote: these Pods use app.kubernetes.io/name, not app — a classic selector typo that matches nothing.";
+    if (reqs.some(function (r) { return r.op === "!=" || r.op === "notin"; })) note += "\nNote: != and notin also match Pods that do not have the key at all.";
+    out.textContent = n + " of " + pods.length + " Pods match " + reqs.length + " requirement(s) (AND)." + note;
+  }
+  input.addEventListener("input", run);
+  document.querySelectorAll("#sel-widget [data-sel]").forEach(function (b) {
+    b.addEventListener("click", function () { input.value = b.getAttribute("data-sel"); run(); });
+  });
+  run();
+})();
+</script>
+</body>
+</html>

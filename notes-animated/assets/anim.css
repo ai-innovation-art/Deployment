@@ -1,0 +1,46 @@
+/* Animated edition — extra styles layered on top of style.css (which is unchanged from the original notes). */
+
+/* ---------- diagram animation toolbar ---------- */
+.anim-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center; margin-top: 10px; }
+.anim-bar .btn { font-size: 13px; padding: 4px 10px; }
+.anim-bar .hint { font-size: 12px; color: var(--muted); }
+figure.diagram.anim-ready { position: relative; }
+figure.diagram .anim-badge {
+  position: absolute; top: 8px; right: 10px; font-size: 11px; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--accent); background: var(--accent-soft); padding: 2px 8px; border-radius: 999px; pointer-events: none;
+}
+
+/* flowing data dots along arrows */
+svg .anim-flow { fill: var(--warn); pointer-events: none; }
+svg .anim-flow-glow { fill: var(--warn); opacity: .28; pointer-events: none; }
+
+/* marching ants for dashed connectors while flowing */
+svg.anim-flowing .line.dash, svg.anim-flowing .zone { animation: anim-march 1.2s linear infinite; }
+@keyframes anim-march { to { stroke-dashoffset: -20; } }
+
+/* ---------- explainer video block ---------- */
+.explainer { margin: 20px 0 8px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
+.explainer > header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; background: var(--surface-2); border-bottom: 1px solid var(--border); font-weight: 700; }
+.explainer > header .pill { font-weight: 600; white-space: nowrap; flex-shrink: 0; }
+.explainer video { display: block; width: 100%; height: auto; background: #141413; aspect-ratio: 16 / 9; }
+.explainer .ex-foot { padding: 8px 16px 12px; font-size: 13.5px; color: var(--muted); }
+.explainer .ex-foot strong { color: var(--text); }
+
+/* ---------- scroll reveal for content blocks ---------- */
+.reveal { opacity: 0; transform: translateY(14px); transition: opacity .55s ease, transform .55s ease; }
+.reveal.in { opacity: 1; transform: none; }
+
+/* ---------- gallery ---------- */
+.gallery { display: grid; gap: 18px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.gallery .explainer { margin: 0; }
+
+.edition-banner { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border: 1px dashed var(--accent); border-radius: var(--radius); padding: 10px 14px; margin: 0 0 18px; background: var(--accent-soft); font-size: 14.5px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal { opacity: 1; transform: none; transition: none; }
+  svg.anim-flowing .line.dash, svg.anim-flowing .zone { animation: none; }
+}
+@media print {
+  .anim-bar, .anim-badge, .explainer video { display: none !important; }
+  .reveal { opacity: 1 !important; transform: none !important; }
+}

@@ -1,0 +1,1280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 01 · Linux &amp; Networking Foundations — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 01 · Linux &amp; Networking Foundations</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="01"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 01 · Linux &amp; Networking Foundations</h1>
+    <p class="lede">Docker and Kubernetes do not replace Linux. They sit on top of it. When <code>reliability-api</code> fails in a container or a Pod, the cause usually comes down to a few things: a process that exited, a signal that was ignored, a file the app could not read, an environment variable that was missing, a socket bound to the wrong address, a DNS name that did not resolve, or an HTTP status that meant something other than you thought. This module covers each of those ideas in depth, using the same running app throughout. It ends with namespaces and cgroups, the two kernel features that make containers possible.</p>
+    <div class="meta"><span class="pill accent">Prereq: none (comfortable in a terminal)</span><span class="pill">≈ 5 h study + 3 h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+
+    <div class="callout note"><span class="label">You are on macOS?</span>
+      <p>Several commands here (<code>ss</code>, <code>free</code>, <code>journalctl</code>, <code>/proc</code>) exist only on Linux. You have three options: (1) use a Linux VM (UTM, Multipass, a cloud VM); (2) once Docker is installed (Module 02), open a throwaway Linux shell with <code>docker run --rm -it python:3.12-slim bash</code> and install tools with <code>apt-get update &amp;&amp; apt-get install -y iproute2 procps curl dnsutils lsof</code>; (3) use the macOS equivalents shown in the notes (<code>lsof -nP -iTCP -sTCP:LISTEN</code> instead of <code>ss -ltnp</code>, <code>vm_stat</code> instead of <code>free</code>). Containers and Kubernetes nodes run Linux, so learn the Linux versions.</p>
+    </div>
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Explain what a process is, how it gets a PID, who its parent is, and why <strong>PID 1</strong> is special (this is the key to understanding container shutdown).</li>
+      <li>Tell <strong>SIGTERM</strong> apart from <strong>SIGKILL</strong>, predict what each does to <code>reliability-api</code>, and explain why graceful shutdown matters during rolling updates.</li>
+      <li>Decode any exit code, including <code>137 = 128 + 9</code> (killed by SIGKILL, often an out-of-memory kill) and <code>143 = 128 + 15</code>.</li>
+      <li>Read and set file permissions, and explain why the app should run as a non-root user.</li>
+      <li>Use environment variables for configuration, and send logs to stdout and stderr where platforms can collect them.</li>
+      <li>Describe the TCP/IP layers, ports, and sockets well enough to explain <em>connection refused</em> versus <em>timeout</em>.</li>
+      <li>Predict who can reach a server bound to <code>127.0.0.1</code> versus <code>0.0.0.0</code>. This is the most common reason a container "works inside but not outside".</li>
+      <li>Trace a DNS lookup and an HTTP request/response, and read status codes the way probes and load balancers do.</li>
+      <li>Use <code>ps</code>, <code>top</code>, <code>ss</code>, <code>lsof</code>, <code>curl -v</code>, <code>dig</code>, <code>df</code>/<code>du</code>/<code>free</code>, and <code>journalctl</code> to collect evidence.</li>
+      <li>Explain how namespaces (what a process can <em>see</em>) and cgroups (what it can <em>use</em>) combine into a container.</li>
+    </ul>
+
+    <h2>The big picture: what sits under reliability-api</h2>
+    <p>The app is a few dozen lines of Python. Running it pulls in a whole stack: an interpreter <strong>process</strong>, a <strong>user</strong> it runs as, an <strong>environment</strong> it reads, <strong>file descriptors</strong> it writes logs to, a <strong>listening socket</strong> on a port, and the kernel's <strong>TCP/IP stack</strong>, which turns network packets into the HTTP requests FastAPI sees. Every later module adds layers on top (container, Pod, Service, Ingress), but the stack in this picture stays underneath all of them.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 400" role="img" aria-label="Layered stack: reliability-api code, Uvicorn, Python process, kernel services, hardware">
+        <defs><marker id="m1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="40" y="20" width="520" height="50" rx="8"/>
+        <text x="300" y="42" text-anchor="middle" class="t-bold">reliability-api (app/main.py)</text>
+        <text x="300" y="60" text-anchor="middle" class="t-muted">/health  /ready  /work  /metrics   reads APP_MODE, LOG_LEVEL, READY_DELAY_SECONDS</text>
+        <rect class="box" x="40" y="80" width="520" height="44" rx="8"/>
+        <text x="300" y="100" text-anchor="middle" class="t-bold">FastAPI + Uvicorn (ASGI server)</text>
+        <text x="300" y="116" text-anchor="middle" class="t-muted">parses HTTP, handles SIGTERM, writes logs to stdout/stderr</text>
+        <rect class="box3" x="40" y="134" width="520" height="54" rx="8"/>
+        <text x="300" y="155" text-anchor="middle" class="t-bold">Linux process  (PID, parent PID, UID/GID, env, cwd, fds 0/1/2)</text>
+        <text x="300" y="174" text-anchor="middle" class="t-muted">python3 …/uvicorn app.main:app --host 0.0.0.0 --port 8000</text>
+        <rect class="zone" x="30" y="200" width="540" height="140" rx="10"/>
+        <text x="46" y="218" class="t-muted">Linux kernel</text>
+        <rect class="box" x="46" y="228" width="160" height="96" rx="8"/>
+        <text x="126" y="252" text-anchor="middle" class="t-bold">Scheduler</text>
+        <text x="126" y="272" text-anchor="middle" class="t-muted">processes, signals</text>
+        <text x="126" y="290" text-anchor="middle" class="t-muted">exit codes</text>
+        <rect class="box" x="216" y="228" width="160" height="96" rx="8"/>
+        <text x="296" y="252" text-anchor="middle" class="t-bold">VFS + permissions</text>
+        <text x="296" y="272" text-anchor="middle" class="t-muted">files, users, rwx</text>
+        <text x="296" y="290" text-anchor="middle" class="t-muted">/proc, /etc/hosts</text>
+        <rect class="box" x="386" y="228" width="168" height="96" rx="8"/>
+        <text x="470" y="252" text-anchor="middle" class="t-bold">TCP/IP stack</text>
+        <text x="470" y="272" text-anchor="middle" class="t-muted">sockets, ports</text>
+        <text x="470" y="290" text-anchor="middle" class="t-muted">interfaces (lo, eth0)</text>
+        <rect class="box4" x="40" y="350" width="520" height="36" rx="8"/>
+        <text x="300" y="373" text-anchor="middle">Hardware: CPU · memory · disk · NIC</text>
+        <rect class="box4" x="600" y="134" width="200" height="190" rx="10"/>
+        <text x="700" y="158" text-anchor="middle" class="t-bold">Namespaces + cgroups</text>
+        <text x="700" y="182" text-anchor="middle" class="t-muted">wrap the same process</text>
+        <text x="700" y="200" text-anchor="middle" class="t-muted">so it sees its own PIDs,</text>
+        <text x="700" y="218" text-anchor="middle" class="t-muted">network, hostname, mounts</text>
+        <text x="700" y="236" text-anchor="middle" class="t-muted">and gets capped CPU/memory</text>
+        <text x="700" y="268" text-anchor="middle" class="t-bold">= a container</text>
+        <text x="700" y="290" text-anchor="middle" class="t-muted">(end of this module,</text>
+        <text x="700" y="306" text-anchor="middle" class="t-muted">all of Module 02)</text>
+        <path class="line dash" d="M560 160 L598 160" marker-end="url(#m1a)"/>
+      </svg>
+      <figcaption>Every concept in this module is one of these layers. A container is the same process with namespaces and cgroups applied. It is not a separate machine.</figcaption>
+    </figure>
+
+    <h3>The canonical app you will run</h3>
+    <p>This is the exact <code>app/main.py</code> used in every module. Save it now. You will run it natively in this module's labs and in a container in Module 02.</p>
+<pre data-title="app/main.py"><code>import os, time, logging
+from fastapi import FastAPI, Response
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
+READY_DELAY = float(os.getenv("READY_DELAY_SECONDS", "0"))
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reliability-api")
+
+REQUESTS = Counter("http_requests_total", "Total HTTP requests", ["path", "status"])
+LATENCY = Histogram("http_request_duration_seconds", "Request latency", ["path"])
+
+app = FastAPI()
+STARTED = time.monotonic()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/ready")
+def ready(response: Response):
+    if time.monotonic() - STARTED &lt; READY_DELAY:
+        response.status_code = 503
+        return {"ready": False}
+    return {"ready": True}
+
+@app.get("/work")
+def work(ms: int = 50):
+    start = time.perf_counter()
+    while (time.perf_counter() - start) * 1000 &lt; ms:
+        pass                                   # burn CPU deliberately
+    elapsed = time.perf_counter() - start
+    LATENCY.labels("/work").observe(elapsed)
+    REQUESTS.labels("/work", "200").inc()
+    return {"worked_ms": round(elapsed * 1000, 1)}
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)</code></pre>
+<pre data-title="requirements.txt (example pins — check PyPI for current versions)"><code>fastapi==0.115.0
+uvicorn==0.30.6
+prometheus-client==0.20.0</code></pre>
+    <p>Each line of the app maps to a topic in this module. <code>os.getenv</code> reads <a href="#s-env">environment variables</a>. <code>logging.basicConfig</code> writes to <a href="#s-std">stderr by default</a>. <code>/ready</code> returns <a href="#s-http">HTTP 503</a> during warm-up. <code>/work</code> burns CPU, which you will watch in <code>top</code>. Uvicorn is the process that owns the <a href="#s-bind">listening socket</a>.</p>
+
+    <!-- ============================================================ PROCESSES -->
+    <h2 id="s-proc">Processes and PIDs</h2>
+    <p><strong>Definition.</strong> A <em>process</em> is a running instance of a program. The kernel keeps a record for each one, identified by a numeric <strong>PID</strong> (process ID). The record holds the program's memory, its open files (as numbered <em>file descriptors</em>), its current working directory, its user and group IDs, its environment variables, and its parent's PID (<strong>PPID</strong>).</p>
+    <p><strong>Problem it solves.</strong> Many programs need to share one CPU and one kernel. Processes give each program its own memory and identity. The kernel can schedule them, account for their resources, deliver signals to them, and report how each one ended.</p>
+
+    <h3>How a process is born: fork + exec</h3>
+    <p>On Linux a new process is created in two steps:</p>
+    <ol>
+      <li><strong>fork</strong>: an existing process (for example your shell, <code>zsh</code> or <code>bash</code>) makes a copy of itself. The copy is the <em>child</em> and gets a new PID. Its PPID is the shell's PID. As <code>environ(7)</code> says, the child <em>"inherits a copy of its parent's environment"</em>.</li>
+      <li><strong>exec</strong>: the child replaces its program image with a new program (here the Python interpreter running Uvicorn). The PID stays the same. The code is now different.</li>
+    </ol>
+    <p>The result is a <strong>process tree</strong>. Every process has a parent, up to PID 1 (on most Linux hosts, <code>systemd</code>), which the kernel starts at boot.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 300" role="img" aria-label="Process tree from systemd PID 1 to shell to uvicorn">
+        <defs><marker id="m1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box4" x="20" y="120" width="150" height="56" rx="8"/>
+        <text x="95" y="143" text-anchor="middle" class="t-bold">systemd</text>
+        <text x="95" y="162" text-anchor="middle" class="t-mono">PID 1</text>
+        <rect class="box" x="220" y="40" width="160" height="56" rx="8"/>
+        <text x="300" y="63" text-anchor="middle" class="t-bold">sshd / terminal</text>
+        <text x="300" y="82" text-anchor="middle" class="t-mono">PID 1180</text>
+        <rect class="box" x="220" y="200" width="160" height="56" rx="8"/>
+        <text x="300" y="223" text-anchor="middle" class="t-bold">journald, cron…</text>
+        <text x="300" y="242" text-anchor="middle" class="t-mono">other services</text>
+        <rect class="box" x="430" y="40" width="150" height="56" rx="8"/>
+        <text x="505" y="63" text-anchor="middle" class="t-bold">bash (shell)</text>
+        <text x="505" y="82" text-anchor="middle" class="t-mono">PID 2210</text>
+        <rect class="box2" x="630" y="30" width="176" height="76" rx="8"/>
+        <text x="718" y="54" text-anchor="middle" class="t-bold">uvicorn (python3)</text>
+        <text x="718" y="73" text-anchor="middle" class="t-mono">PID 4321</text>
+        <text x="718" y="92" text-anchor="middle" class="t-mono">PPID 2210</text>
+        <path class="line" d="M170 140 L218 72" marker-end="url(#m1b)"/>
+        <path class="line" d="M170 158 L218 226" marker-end="url(#m1b)"/>
+        <path class="line" d="M380 68 L428 68" marker-end="url(#m1b)"/>
+        <path class="line accent" d="M580 68 L628 68" marker-end="url(#m1b)"/>
+        <text x="604" y="128" text-anchor="middle" class="t-muted">fork → exec</text>
+        <rect class="zone" x="430" y="140" width="376" height="120" rx="10"/>
+        <text x="446" y="162" class="t-bold">What the child inherits</text>
+        <text x="446" y="184" class="t-muted">• copy of environment (APP_MODE, LOG_LEVEL…)</text>
+        <text x="446" y="203" class="t-muted">• UID/GID (the user you are logged in as)</text>
+        <text x="446" y="222" class="t-muted">• cwd, open fds 0/1/2 (your terminal)</text>
+        <text x="446" y="241" class="t-muted">• NOT the parent's PID: it gets a new one</text>
+      </svg>
+      <figcaption>Typical host tree. Inside a container, Module 02 shows that <code>uvicorn</code> itself becomes PID 1, and that one change alters how signals are handled.</figcaption>
+    </figure>
+
+    <h3>Process states you will see in <code>ps</code></h3>
+    <div class="table-wrap"><table>
+      <tr><th>STAT</th><th>Meaning (from <code>ps(1)</code>)</th><th>What it tells you about reliability-api</th></tr>
+      <tr><td><code>R</code></td><td>running or runnable (on run queue)</td><td>Burning CPU. You will see this while <code>/work?ms=2000</code> is busy-looping.</td></tr>
+      <tr><td><code>S</code></td><td>interruptible sleep (waiting for an event)</td><td>Normal idle state: waiting on the socket for the next request.</td></tr>
+      <tr><td><code>D</code></td><td>uninterruptible sleep (usually I/O)</td><td>Stuck on disk or network-filesystem I/O. Even SIGKILL waits until the I/O returns.</td></tr>
+      <tr><td><code>T</code></td><td>stopped by job control signal</td><td>Someone pressed <kbd>Ctrl</kbd>+<kbd>Z</kbd> or sent SIGSTOP. The app is frozen and serves nothing.</td></tr>
+      <tr><td><code>Z</code></td><td>defunct ("zombie"): terminated but not reaped by its parent</td><td>A child exited and the parent never collected its exit status. Containers whose PID 1 does not reap children collect these (Module 02, <code>--init</code>).</td></tr>
+    </table></div>
+    <p>BSD-style extra characters also appear, for example <code>s</code> (session leader), <code>l</code> (multi-threaded), and <code>+</code> (foreground process group).</p>
+
+    <h3>Inspecting a process</h3>
+<pre data-title="Find the reliability-api process and its parent"><code><span class="c"># -o picks columns; pgrep -f matches against the full command line</span>
+$ ps -o pid,ppid,user,stat,etime,args -p "$(pgrep -f 'uvicorn app.main:app')"
+<span class="o">  PID  PPID USER     STAT     ELAPSED COMMAND
+ 4321  2210 dev      Sl+        02:13 /home/dev/lab/.venv/bin/python3 /home/dev/lab/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000</span>
+<span class="c"># Example output (yours will differ in names/IDs/timings)</span>
+
+<span class="c"># Everything the kernel knows lives under /proc/&lt;PID&gt;</span>
+$ ls /proc/4321
+<span class="o">cmdline  cwd  environ  exe  fd  limits  status  cgroup  ns  …</span>
+$ cat /proc/4321/status | grep -E 'State|PPid|Uid|VmRSS|Threads'
+<span class="o">State:  S (sleeping)
+PPid:   2210
+Uid:    1000    1000    1000    1000
+VmRSS:     46212 kB
+Threads:        2</span></code></pre>
+
+    <div class="callout tip"><span class="label">Mental model</span>
+      <p><code>/proc/&lt;PID&gt;/</code> is the kernel's view of one process, exposed as files. <code>ns/</code> lists the process's namespaces and <code>cgroup</code> names its control group. These two entries return in the last section, because they are what make a process "a container".</p>
+    </div>
+
+    <h3>Failure cases &amp; diagnosis</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Likely cause</th><th>First command</th></tr>
+      <tr><td>Port 8000 does not answer, no process found</td><td>The process crashed or never started</td><td><code>pgrep -af uvicorn</code>, then read its log output and <code>echo $?</code></td></tr>
+      <tr><td>Process exists but requests hang</td><td>Stuck in a busy loop (<code>R</code>, 100% CPU) or blocked (<code>D</code>)</td><td><code>top -p PID</code>, <code>cat /proc/PID/status</code></td></tr>
+      <tr><td>Many <code>&lt;defunct&gt;</code> entries</td><td>Parent not reaping children</td><td><code>ps -eo pid,ppid,stat,args | awk '$3 ~ /Z/'</code></td></tr>
+      <tr><td>"Address already in use" on start</td><td>Another process (often an old copy of the app) holds the port</td><td><code>ss -ltnp 'sport = :8000'</code> or <code>lsof -i :8000</code></td></tr>
+    </table></div>
+
+    <details class="q"><summary>Self-check: you start Uvicorn from bash, then close the terminal. What happens to the Uvicorn process, and why?</summary><div class="a">Closing the terminal sends <strong>SIGHUP</strong> (hang-up) to the session. Its default action is to terminate, so Uvicorn usually dies. That is why services run under a supervisor (systemd, Docker, Kubernetes) and not from an interactive shell. The supervisor becomes the parent, restarts the process, and collects its exit code.</div></details>
+
+    <!-- ============================================================ SIGNALS -->
+    <h2 id="s-sig">Signals: SIGTERM vs SIGKILL</h2>
+    <p><strong>Definition.</strong> A <em>signal</em> is a small asynchronous notification the kernel delivers to a process. It carries no data beyond its number. Each signal has a <em>default action</em> (terminate, core dump, ignore, stop, continue). A process can install a <em>handler</em> to run its own code instead, except for two signals that can never be caught.</p>
+    <p><strong>Problem it solves.</strong> The OS, a supervisor, or a human needs a standard way to say "please shut down", "reload config", or "stop right now". Every orchestrator you will use stops your app with signals: systemd, <code>docker stop</code>, and the Kubernetes kubelet during a rolling update or scale-down.</p>
+
+    <div class="table-wrap"><table>
+      <tr><th>Signal</th><th>No. (x86/ARM)</th><th>Default action</th><th>Can be caught?</th><th>Who sends it to reliability-api</th></tr>
+      <tr><td><code>SIGHUP</code></td><td>1</td><td>Term</td><td>Yes</td><td>Terminal closed; some daemons treat it as "reload config"</td></tr>
+      <tr><td><code>SIGINT</code></td><td>2</td><td>Term</td><td>Yes</td><td>You press <kbd>Ctrl</kbd>+<kbd>C</kbd></td></tr>
+      <tr><td><code>SIGQUIT</code></td><td>3</td><td>Core</td><td>Yes</td><td><kbd>Ctrl</kbd>+<kbd>\</kbd></td></tr>
+      <tr><td><code>SIGKILL</code></td><td>9</td><td>Term</td><td><strong>No</strong></td><td>Kernel OOM killer; <code>docker stop</code> / kubelet after the grace period; <code>kill -9</code></td></tr>
+      <tr><td><code>SIGTERM</code></td><td>15</td><td>Term</td><td>Yes</td><td><code>kill PID</code> (default), <code>docker stop</code>, kubelet at Pod termination, systemd stop</td></tr>
+      <tr><td><code>SIGCHLD</code></td><td>17</td><td>Ign</td><td>Yes</td><td>Kernel, when a child process exits (parent should reap it)</td></tr>
+      <tr><td><code>SIGSTOP</code></td><td>19</td><td>Stop</td><td><strong>No</strong></td><td><code>kill -STOP</code>, debuggers (note: <kbd>Ctrl</kbd>+<kbd>Z</kbd> sends the catchable SIGTSTP)</td></tr>
+    </table></div>
+    <p>From <code>signal(7)</code>: <em>"The signals SIGKILL and SIGSTOP cannot be caught, blocked, or ignored."</em> Signal numbers vary by CPU architecture. The ones above are for x86 and ARM, which covers almost every laptop and cloud node. Use names (<code>kill -TERM</code>) instead of numbers in scripts.</p>
+    
+
+    <h3>Graceful vs forced shutdown, step by step</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="Timeline comparing graceful shutdown on SIGTERM with forced kill after grace period">
+        <defs><marker id="m1c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="20" y="28" class="t-bold">A. App handles SIGTERM (Uvicorn does)</text>
+        <path class="line" d="M40 70 L830 70" marker-end="url(#m1c)"/>
+        <circle class="dot-accent" cx="70" cy="70" r="7"/>
+        <text x="70" y="52" text-anchor="middle" class="t-mono">SIGTERM</text>
+        <rect class="box2" x="100" y="80" width="330" height="40" rx="6"/>
+        <text x="265" y="99" text-anchor="middle">stop accepting · finish in-flight requests</text>
+        <text x="265" y="114" text-anchor="middle" class="t-muted">run shutdown hooks, flush logs</text>
+        <circle class="dot-ok" cx="450" cy="70" r="7"/>
+        <text x="450" y="52" text-anchor="middle" class="t-mono">exit</text>
+        <text x="470" y="100" class="t-muted">clean exit before the deadline, no dropped requests</text>
+        <text x="20" y="170" class="t-bold">B. App ignores SIGTERM (or SIGTERM never reaches it)</text>
+        <path class="line" d="M40 212 L830 212" marker-end="url(#m1c)"/>
+        <circle class="dot-accent" cx="70" cy="212" r="7"/>
+        <text x="70" y="194" text-anchor="middle" class="t-mono">SIGTERM</text>
+        <rect class="box3" x="100" y="222" width="560" height="40" rx="6"/>
+        <text x="380" y="241" text-anchor="middle">nothing happens… keeps serving or hangs</text>
+        <text x="380" y="256" text-anchor="middle" class="t-muted">grace period: docker stop 10 s · Kubernetes default 30 s</text>
+        <circle class="dot-bad" cx="680" cy="212" r="7"/>
+        <text x="680" y="194" text-anchor="middle" class="t-mono">SIGKILL</text>
+        <text x="690" y="245" class="t-muted">killed instantly:</text>
+        <text x="690" y="262" class="t-muted">in-flight requests cut,</text>
+        <text x="690" y="279" class="t-muted">exit code 137</text>
+        <path class="line dash" d="M680 220 L680 300"/>
+        <text x="680" y="318" text-anchor="middle" class="t-muted">deadline</text>
+      </svg>
+      <figcaption>Every supervisor follows this pattern: polite signal, wait, then force. Only the grace period changes (<code>docker stop</code>: 10 s on Linux; Kubernetes <code>terminationGracePeriodSeconds</code>: 30 s by default).</figcaption>
+    </figure>
+    <ol>
+      <li>The supervisor sends <strong>SIGTERM</strong> to the process. In a container this is PID 1. Kubernetes' kubelet <em>"triggers the container runtime to send a TERM signal to process 1 inside each container"</em>.</li>
+      <li>If the process has a handler, the handler runs. Uvicorn's handler (it registers SIGINT and SIGTERM) stops accepting new connections, waits for in-flight requests (bounded by <code>--timeout-graceful-shutdown</code> if set), runs FastAPI shutdown events, and exits. You see log lines such as <code>Shutting down</code>, <code>Waiting for application shutdown.</code>, <code>Application shutdown complete.</code>, <code>Finished server process [4321]</code>.</li>
+      <li>If the process is still alive when the grace period ends, the supervisor sends <strong>SIGKILL</strong>. The kernel destroys the process immediately. No handler runs, buffers are not flushed, and open connections are reset.</li>
+    </ol>
+
+    <h3>Why this matters so much for containers</h3>
+    <p>On a normal host, a process with no SIGTERM handler takes the <em>default action</em>, which is terminate. That makes SIGTERM look harmless. Inside a container, the main process is <strong>PID 1 of its PID namespace</strong>, and the kernel gives PID 1 a special rule. From <code>pid_namespaces(7)</code>:</p>
+    <blockquote><em>"Only signals for which the "init" process has established a signal handler can be sent to the "init" process by other members of the PID namespace. … a process in an ancestor namespace can … send signals to the "init" process of a child PID namespace only if the "init" process has established a handler for that signal. … SIGKILL or SIGSTOP are treated exceptionally: these signals are forcibly delivered when sent from an ancestor PID namespace."</em></blockquote>
+    <p>Consequence: if the PID 1 process has <strong>no SIGTERM handler</strong>, SIGTERM is simply <strong>not delivered</strong>. Nothing happens. The process does not get the default "terminate". It keeps running until SIGKILL arrives at the deadline. You see a 10-second <code>docker stop</code> (or a 30-second Pod termination) and exit code 137. Two common ways to end up there:</p>
+    <ul>
+      <li>The container's PID 1 is a shell (<code>/bin/sh -c "uvicorn …"</code>, from a shell-form <code>CMD</code>). The shell may not forward the signal to Uvicorn.</li>
+      <li>PID 1 is a plain Python script that never registered a SIGTERM handler. Python installs a handler for SIGINT (raising <code>KeyboardInterrupt</code>) but not for SIGTERM.</li>
+    </ul>
+    <p>Uvicorn <em>does</em> register SIGTERM and SIGINT handlers, so if Uvicorn itself is PID 1 (exec-form <code>CMD</code>, Module 02) you get graceful shutdown.</p>
+
+    <div class="callout danger"><span class="label">Failure case: requests dropped on every deploy</span>
+      <p>During a Kubernetes rolling update, old Pods are terminated. If <code>reliability-api</code> ignores SIGTERM, every old Pod is SIGKILLed after 30 s, and any requests in flight at that moment fail. If it exits <em>instantly</em> on SIGTERM without finishing in-flight work, those requests fail too. The fix is a SIGTERM handler that drains and then exits, plus readiness going false so new traffic stops arriving (Module 04).</p>
+    </div>
+
+<pre data-title="Sending signals by hand"><code>$ kill -l                       <span class="c"># list signal names and numbers</span>
+$ kill 4321                     <span class="c"># same as kill -TERM 4321 (SIGTERM is kill's default)</span>
+$ kill -INT 4321                <span class="c"># like Ctrl+C</span>
+$ kill -KILL 4321               <span class="c"># last resort: no cleanup possible</span>
+$ grep -E 'SigCgt|SigIgn' /proc/4321/status   <span class="c"># bitmasks of caught / ignored signals</span></code></pre>
+    <p><code>SigCgt</code> is a hexadecimal bitmask of the signals the process has handlers for. Bit <em>n−1</em> stands for signal <em>n</em>. For SIGTERM (15), check bit 14, which is value <code>0x4000</code>. It is a quick way to check, without reading code, whether a PID 1 will react to SIGTERM.</p>
+
+    <h3>Trade-offs</h3>
+    <ul>
+      <li><strong>Longer grace period</strong>: more time to drain slow requests, but slower deploys and slower node drains. <strong>Shorter</strong>: faster rollouts, but more risk of cut requests.</li>
+      <li><strong>SIGKILL as routine</strong> (<code>kill -9</code> in scripts) skips cleanup: buffered logs and metrics are lost and temp files are left behind. Use it only when SIGTERM failed.</li>
+    </ul>
+    <details class="q"><summary>Self-check: <code>docker stop</code> on your container always takes exactly ~10 seconds and the exit code is 137. What is the most likely cause?</summary><div class="a">SIGTERM is not reaching a process that handles it. Usually PID 1 is a shell from a shell-form <code>CMD</code>, or a program with no SIGTERM handler. Because PID 1 ignores signals it has no handler for, nothing happens until Docker's 10 s timeout, then SIGKILL gives 128+9 = 137. The fix is an exec-form <code>CMD</code> so Uvicorn is PID 1, or <code>--init</code> / a tiny init that forwards signals.</div></details>
+
+    <!-- ============================================================ EXIT CODES -->
+    <h2 id="s-exit">Exit codes</h2>
+    <p><strong>Definition.</strong> When a process ends, the kernel keeps a small status for its parent to collect with <code>wait()</code>. Either the process <em>exited</em> with a number from 0 to 255 (its own <code>exit(n)</code>, where only the low 8 bits are kept), or it was <em>terminated by a signal</em>. Shells merge the two into one number. From <code>bash(1)</code>: <em>"When a command terminates on a fatal signal N, bash uses the value of 128+N as the exit status."</em> Docker and Kubernetes report container exit codes the same way.</p>
+    <p><strong>Problem it solves.</strong> The exit code is the cheapest diagnostic you will ever get. Before reading a single log line, it tells you whether the app chose to quit (an error path), could not start at all, or was killed from outside.</p>
+
+    <div class="table-wrap"><table>
+      <tr><th>Code</th><th>Meaning</th><th>Typical reliability-api cause</th></tr>
+      <tr><td><code>0</code></td><td>Success</td><td>Clean shutdown after SIGTERM / Ctrl+C (Uvicorn finished draining)</td></tr>
+      <tr><td><code>1</code></td><td>Generic failure chosen by the program</td><td>Unhandled Python exception at import (e.g. <code>float("abc")</code> from a bad <code>READY_DELAY_SECONDS</code>), port already in use</td></tr>
+      <tr><td><code>2</code></td><td>Misuse / bad CLI arguments (convention; bash builtins use it)</td><td>Typo in a Uvicorn flag (Click-based CLIs exit 2 on usage errors)</td></tr>
+      <tr><td><code>126</code></td><td>Command found but not executable</td><td>Script missing the <code>+x</code> bit, or wrong interpreter. Docker uses 126 for "contained command can't be invoked"</td></tr>
+      <tr><td><code>127</code></td><td>Command not found</td><td><code>uvicorn</code> not on <code>PATH</code> (venv not activated / not copied into the image)</td></tr>
+      <tr><td><code>125</code></td><td>(Docker only) error in the Docker daemon itself</td><td>Bad <code>docker run</code> flag, port already allocated on host</td></tr>
+      <tr><td><code>130</code></td><td>128 + 2: killed by SIGINT</td><td>You pressed Ctrl+C on a program without a handler</td></tr>
+      <tr><td><code>137</code></td><td>128 + 9: killed by <strong>SIGKILL</strong></td><td>Out-of-memory kill (memory limit hit), or SIGTERM ignored until the grace period ended, or <code>kill -9</code></td></tr>
+      <tr><td><code>143</code></td><td>128 + 15: killed by <strong>SIGTERM</strong> (no handler)</td><td>A process without a SIGTERM handler, not PID 1, got <code>kill</code> or <code>docker stop</code>. Newer Uvicorn versions also re-raise SIGTERM after graceful cleanup, so a clean drain can show 143 instead of 0</td></tr>
+    </table></div>
+
+    <div class="callout warn"><span class="label">137 does not automatically mean "out of memory"</span>
+      <p>137 only says "SIGKILL". To tell an OOM kill from a grace-period kill, look for extra evidence. Docker sets <code>State.OOMKilled</code> in <code>docker inspect</code>. Kubernetes shows <code>Reason: OOMKilled</code> in <code>kubectl describe pod</code> (Module 04). On a host, the kernel log has <code>Out of memory: Killed process …</code> (<code>journalctl -k</code> or <code>dmesg</code>). If none of those appear and the shutdown took exactly the grace period, the app ignored SIGTERM.</p>
+    </div>
+
+    <div class="widget" id="exitw">
+      <div class="w-title">Exit-code decoder</div>
+      <div class="w-sub">Type the code you saw (from <code>echo $?</code>, <code>docker ps -a</code>, or Kubernetes <code>Last State: Terminated, Exit Code</code>). Pick the context.</div>
+      <div class="row">
+        <input type="number" id="exit-in" value="137" min="-300" max="1000" style="width:110px" aria-label="Exit code">
+        <select id="exit-ctx" aria-label="Context">
+          <option value="shell">Shell / host process</option>
+          <option value="docker">docker run / docker ps</option>
+          <option value="k8s">Kubernetes container status</option>
+        </select>
+        <button class="btn primary" id="exit-go">Decode</button>
+        <button class="btn" data-code="0">0</button><button class="btn" data-code="1">1</button><button class="btn" data-code="127">127</button><button class="btn" data-code="143">143</button><button class="btn" data-code="139">139</button>
+      </div>
+      <div class="out" id="exit-out" aria-live="polite"></div>
+    </div>
+
+<pre data-title="Seeing exit codes"><code>$ python3 -c 'import sys; sys.exit(3)'; echo "exit=$?"
+<span class="o">exit=3</span>
+$ sleep 100 &amp; kill -TERM $!; wait $!; echo "exit=$?"
+<span class="o">exit=143</span>                         <span class="c"># 128 + 15 (sleep has no SIGTERM handler)</span>
+$ sleep 100 &amp; kill -KILL $!; wait $!; echo "exit=$?"
+<span class="o">exit=137</span>                         <span class="c"># 128 + 9
+# Example output from bash; job-control messages such as "Terminated" may also print</span></code></pre>
+    <details class="q"><summary>Self-check: a Python program calls <code>sys.exit(256)</code>. What exit code does the shell show, and why?</summary><div class="a"><strong>0</strong>. Only the low 8 bits of the status survive (256 mod 256 = 0). Exit codes are 0–255, so never use values outside that range to mean anything.</div></details>
+
+    <!-- ============================================================ USERS & PERMS -->
+    <h2 id="s-perm">Users, groups, and file permissions</h2>
+    <p><strong>Definition.</strong> Every process runs with a set of <em>credentials</em>: a user ID (UID), a primary group ID (GID), and supplementary groups (see <code>credentials(7)</code>). Every file has an owner UID, an owner GID, and a 9-bit <em>mode</em>: read/write/execute for <strong>u</strong>ser (owner), <strong>g</strong>roup, and <strong>o</strong>thers. UID <strong>0 is root</strong>, which bypasses most permission checks.</p>
+    <p><strong>Problem it solves.</strong> Least privilege. If an attacker gets code execution inside <code>reliability-api</code>, the damage is limited to what the process's UID can touch. Running as root means the attacker can modify system files. In a container it also makes kernel-escape bugs more dangerous.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 260" role="img" aria-label="Breakdown of ls -l permission string and octal value">
+        <text x="20" y="34" class="t-mono">-rwxr-x---  1  app  app   812  Oct 29 10:02  start.sh</text>
+        <rect class="box" x="20" y="60" width="40" height="44" rx="6"/>
+        <text x="40" y="88" text-anchor="middle" class="t-mono">-</text>
+        <rect class="box2" x="70" y="60" width="150" height="44" rx="6"/>
+        <text x="145" y="88" text-anchor="middle" class="t-mono">r  w  x</text>
+        <rect class="box3" x="230" y="60" width="150" height="44" rx="6"/>
+        <text x="305" y="88" text-anchor="middle" class="t-mono">r  -  x</text>
+        <rect class="box4" x="390" y="60" width="150" height="44" rx="6"/>
+        <text x="465" y="88" text-anchor="middle" class="t-mono">-  -  -</text>
+        <text x="40" y="126" text-anchor="middle" class="t-muted">type</text>
+        <text x="145" y="126" text-anchor="middle" class="t-bold">user (owner)</text>
+        <text x="305" y="126" text-anchor="middle" class="t-bold">group</text>
+        <text x="465" y="126" text-anchor="middle" class="t-bold">others</text>
+        <text x="145" y="150" text-anchor="middle" class="t-mono">4+2+1 = 7</text>
+        <text x="305" y="150" text-anchor="middle" class="t-mono">4+0+1 = 5</text>
+        <text x="465" y="150" text-anchor="middle" class="t-mono">0+0+0 = 0</text>
+        <text x="300" y="186" text-anchor="middle" class="t-bold">chmod 750 start.sh</text>
+        <rect class="zone" x="570" y="50" width="236" height="190" rx="10"/>
+        <text x="584" y="74" class="t-bold">r = 4   w = 2   x = 1</text>
+        <text x="584" y="100" class="t-muted">on a file:</text>
+        <text x="584" y="118" class="t-muted"> r read · w modify · x run</text>
+        <text x="584" y="144" class="t-muted">on a directory:</text>
+        <text x="584" y="162" class="t-muted"> r list names</text>
+        <text x="584" y="180" class="t-muted"> w create/delete entries</text>
+        <text x="584" y="198" class="t-muted"> x enter / traverse (cd)</text>
+        <text x="20" y="222" class="t-muted">The kernel checks one class only: owner if UID matches, else group if a GID matches, else others.</text>
+      </svg>
+      <figcaption>Reading <code>ls -l</code>. Type <code>-</code> = file, <code>d</code> = directory, <code>l</code> = symlink.</figcaption>
+    </figure>
+
+    <h3>How a permission check works</h3>
+    <ol>
+      <li>The process (e.g. Uvicorn running as UID 10001) asks to open <code>/app/app/main.py</code> for reading.</li>
+      <li>The kernel walks the path. Every directory along it needs <code>x</code> for the matching class.</li>
+      <li>On the final file it picks <em>one</em> class: owner if UIDs match, otherwise group if one of the process's groups matches, otherwise others. It then checks the requested bit. Classes are not combined.</li>
+      <li>If the bit is missing, the call fails with <code>EACCES</code>, which Python raises as <code>PermissionError: [Errno 13] Permission denied</code>.</li>
+    </ol>
+
+    <h3>Applied to reliability-api</h3>
+    <ul>
+      <li>The app only needs to <em>read</em> its code and <em>execute</em> Python. It never needs to write to <code>/app</code>. So in Module 02 the image creates a dedicated non-root user (UID 10001), and code is owned by root and readable by everyone (mode 644 for files, 755 for directories). The app cannot modify its own code even if compromised.</li>
+      <li>Port 8000 is above 1024. From <code>ip(7)</code>: <em>"port numbers below 1024 are called privileged ports … Only a privileged process (on Linux: a process that has the CAP_NET_BIND_SERVICE capability …) may bind(2) to these sockets."</em> Choosing 8000 means no extra privilege is needed. The Kubernetes Service maps port 80 to it later.</li>
+    </ul>
+<pre data-title="Commands"><code>$ id                                   <span class="c"># who am I?</span>
+<span class="o">uid=1000(dev) gid=1000(dev) groups=1000(dev),27(sudo)</span>
+$ ls -l app/
+<span class="o">-rw-r--r-- 1 dev dev 1342 Oct 29 10:02 main.py</span>
+$ chmod 640 app/main.py                <span class="c"># owner rw, group r, others nothing</span>
+$ sudo chown root:root app/main.py     <span class="c"># change owner (needs privilege)</span>
+$ ps -o user,uid,pid,args -p 4321      <span class="c"># which user is the app running as?</span>
+<span class="c"># Example output (yours will differ in names/IDs/timings)</span></code></pre>
+
+    <div class="callout danger"><span class="label">Failure cases</span>
+      <ul>
+        <li><strong>PermissionError at startup</strong>: files were copied as root with mode 600, and the app runs as UID 10001. Diagnose with <code>ls -ln</code> (numeric IDs) and <code>id</code> inside the container.</li>
+        <li><strong>Cannot write a log/temp file</strong>: the app tries to write into a root-owned directory. Fix: write logs to stdout instead; use <code>/tmp</code> or a mounted volume for scratch files.</li>
+        <li><strong>"Fixing" it with <code>chmod 777</code></strong>: this makes the error go away and silently gives write access to everyone. Fix ownership instead.</li>
+      </ul>
+    </div>
+    <details class="q"><summary>Self-check: directory <code>/data</code> is <code>drw-r--r--</code> owned by your user. Can you <code>cat /data/file.txt</code>?</summary><div class="a">No. Reading a file inside a directory requires <code>x</code> (traverse) on the directory. Without <code>x</code> you may be able to list the names (with <code>r</code>), but you cannot access entries. You get "Permission denied".</div></details>
+
+    <!-- ============================================================ ENV VARS -->
+    <h2 id="s-env">Environment variables</h2>
+    <p><strong>Definition.</strong> A list of <code>NAME=value</code> strings handed to a program when it starts (<code>execve</code>). Child processes <em>"inherit a copy of [their] parent's environment"</em> (<code>environ(7)</code>). Changes made in a child never flow back to the parent.</p>
+    <p><strong>Problem it solves.</strong> The same build of a program can behave differently per environment (laptop, CI, production) without code changes. This is the basis of "build once, configure at deploy time". The same image runs everywhere; only <code>-e</code> flags (Docker) or a ConfigMap/Secret (Kubernetes) differ.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 230" role="img" aria-label="How environment variables flow from shell or orchestrator into reliability-api">
+        <defs><marker id="m1d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box" x="20" y="20" width="200" height="56" rx="8"/>
+        <text x="120" y="44" text-anchor="middle" class="t-bold">Shell (this module)</text>
+        <text x="120" y="63" text-anchor="middle" class="t-mono">export LOG_LEVEL=debug</text>
+        <rect class="box" x="20" y="88" width="200" height="56" rx="8"/>
+        <text x="120" y="112" text-anchor="middle" class="t-bold">Docker (Module 02)</text>
+        <text x="120" y="131" text-anchor="middle" class="t-mono">-e LOG_LEVEL=debug</text>
+        <rect class="box" x="20" y="156" width="200" height="56" rx="8"/>
+        <text x="120" y="180" text-anchor="middle" class="t-bold">Kubernetes (Module 05)</text>
+        <text x="120" y="199" text-anchor="middle" class="t-mono">env / envFrom ConfigMap</text>
+        <rect class="box3" x="300" y="70" width="200" height="90" rx="8"/>
+        <text x="400" y="96" text-anchor="middle" class="t-bold">execve(…, envp)</text>
+        <text x="400" y="118" text-anchor="middle" class="t-muted">environment fixed at</text>
+        <text x="400" y="135" text-anchor="middle" class="t-muted">process start</text>
+        <rect class="box2" x="580" y="40" width="260" height="150" rx="8"/>
+        <text x="710" y="64" text-anchor="middle" class="t-bold">reliability-api</text>
+        <text x="596" y="92" class="t-mono">APP_MODE            normal</text>
+        <text x="596" y="114" class="t-mono">LOG_LEVEL           info</text>
+        <text x="596" y="136" class="t-mono">READY_DELAY_SECONDS 0</text>
+        <text x="596" y="168" class="t-muted">defaults used when unset (os.getenv)</text>
+        <path class="line" d="M220 48 L298 100" marker-end="url(#m1d)"/>
+        <path class="line" d="M220 116 L298 116" marker-end="url(#m1d)"/>
+        <path class="line" d="M220 184 L298 134" marker-end="url(#m1d)"/>
+        <path class="line accent" d="M500 115 L578 115" marker-end="url(#m1d)"/>
+      </svg>
+      <figcaption>Three ways to set the same variables. The app code never changes. The environment is read once at startup, so changing it means restarting the process.</figcaption>
+    </figure>
+
+    <h3>reliability-api's configuration contract</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Variable</th><th>Default</th><th>Read by</th><th>Effect</th></tr>
+      <tr><td><code>APP_MODE</code></td><td><code>normal</code></td><td>(reserved for later failure-injection modes)</td><td>Selects behaviour profile</td></tr>
+      <tr><td><code>LOG_LEVEL</code></td><td><code>info</code></td><td><code>logging.basicConfig(level=…)</code></td><td><code>debug</code> shows more, <code>warning</code> less. An invalid value raises at import, and the process exits with code 1.</td></tr>
+      <tr><td><code>READY_DELAY_SECONDS</code></td><td><code>0</code></td><td><code>/ready</code></td><td>Simulates warm-up: <code>/ready</code> returns 503 for this many seconds after start</td></tr>
+    </table></div>
+<pre data-title="Setting and inspecting env vars"><code>$ LOG_LEVEL=debug READY_DELAY_SECONDS=10 uvicorn app.main:app --port 8000   <span class="c"># only for this command</span>
+$ export LOG_LEVEL=debug        <span class="c"># for this shell and every child started after this</span>
+$ env | grep -E 'APP_MODE|LOG_LEVEL|READY'
+$ tr '\0' '\n' &lt; /proc/4321/environ | grep LOG_LEVEL   <span class="c"># what the RUNNING process actually got</span>
+<span class="o">LOG_LEVEL=debug</span></code></pre>
+
+    <div class="callout warn"><span class="label">Env vars are not secret storage</span>
+      <p>Anyone who can read <code>/proc/PID/environ</code> (same user or root), run <code>docker inspect</code>, or read the Pod spec can see them. They also leak into crash dumps and debug pages. Never bake secrets into an image with <code>ENV</code>. Inject them at runtime from a secret store (Kubernetes Secret, Module 05; CI secrets, Module 09) and keep their scope small.</p>
+    </div>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>"I exported it but the app does not see it"</strong>: you exported it in a different shell, or after the process started. Check <code>/proc/PID/environ</code>, not your shell.</li>
+      <li><strong>Typo in the name</strong> (<code>LOGLEVEL</code>): <code>os.getenv</code> silently falls back to the default. Log the effective config at startup so this is visible.</li>
+      <li><strong>Bad value</strong> (<code>READY_DELAY_SECONDS=ten</code>): <code>float()</code> raises <code>ValueError</code> at import and the app exits with 1. In Kubernetes this becomes CrashLoopBackOff.</li>
+    </ul>
+
+    <!-- ============================================================ STDOUT/STDERR -->
+    <h2 id="s-std">stdout, stderr, and logs</h2>
+    <p><strong>Definition.</strong> Every process starts with three open file descriptors: <strong>0 = stdin</strong>, <strong>1 = stdout</strong> (normal output), and <strong>2 = stderr</strong> (diagnostics). They are just numbers pointing at whatever the parent connected: a terminal, a file, a pipe, or (in Docker) a log driver.</p>
+    <p><strong>Problem it solves.</strong> The program does not need to know where its output goes. The platform decides. That is why the modern rule for services is to <strong>log to stdout/stderr and let the platform collect it</strong>. <code>docker logs</code>, <code>kubectl logs</code>, and <code>journalctl</code> all read exactly these streams.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 220" role="img" aria-label="File descriptors 0 1 2 of reliability-api routed to different collectors">
+        <defs><marker id="m1e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="50" width="220" height="120" rx="8"/>
+        <text x="130" y="76" text-anchor="middle" class="t-bold">reliability-api</text>
+        <text x="40" y="104" class="t-mono">fd 0 stdin</text>
+        <text x="40" y="128" class="t-mono">fd 1 stdout  ← access log</text>
+        <text x="40" y="152" class="t-mono">fd 2 stderr  ← app logs</text>
+        <path class="line" d="M240 124 L330 70" marker-end="url(#m1e)"/>
+        <path class="line" d="M240 124 L330 124" marker-end="url(#m1e)"/>
+        <path class="line" d="M240 124 L330 178" marker-end="url(#m1e)"/>
+        <rect class="box" x="332" y="46" width="200" height="46" rx="8"/>
+        <text x="432" y="66" text-anchor="middle" class="t-bold">terminal</text>
+        <text x="432" y="83" text-anchor="middle" class="t-muted">this module</text>
+        <rect class="box" x="332" y="102" width="200" height="46" rx="8"/>
+        <text x="432" y="122" text-anchor="middle" class="t-bold">systemd journal</text>
+        <text x="432" y="139" text-anchor="middle" class="t-muted">journalctl -u …</text>
+        <rect class="box" x="332" y="158" width="200" height="46" rx="8"/>
+        <text x="432" y="178" text-anchor="middle" class="t-bold">container runtime</text>
+        <text x="432" y="195" text-anchor="middle" class="t-muted">docker logs / kubectl logs</text>
+        <rect class="zone" x="570" y="46" width="236" height="158" rx="10"/>
+        <text x="584" y="70" class="t-bold">Shell redirection</text>
+        <text x="584" y="94" class="t-mono">cmd &gt; out.log</text>
+        <text x="584" y="114" class="t-mono">cmd 2&gt; err.log</text>
+        <text x="584" y="134" class="t-mono">cmd &gt; all.log 2&gt;&amp;1</text>
+        <text x="584" y="154" class="t-mono">cmd 2&gt;&amp;1 | grep ERROR</text>
+        <text x="584" y="182" class="t-muted">2&gt;&amp;1 = "point fd 2 where</text>
+        <text x="584" y="198" class="t-muted">fd 1 points now"</text>
+      </svg>
+      <figcaption>Same process, three different collectors. Python's <code>logging.basicConfig</code> and Uvicorn's server messages ("Started server process", errors) write to <strong>stderr</strong>. Uvicorn's default config sends its <em>access</em> log lines (<code>"GET /health HTTP/1.1" 200</code>) to <strong>stdout</strong>.</figcaption>
+    </figure>
+    <ul>
+      <li><strong>Buffering</strong>: when stdout is a pipe or file rather than a terminal, Python buffers output in blocks. Logs can then appear late, or be lost if the process is SIGKILLed. Containers set <code>PYTHONUNBUFFERED=1</code> to avoid this (Module 02).</li>
+      <li><strong>Order matters in redirection</strong>: <code>cmd &gt; f 2&gt;&amp;1</code> sends both to <code>f</code>. <code>cmd 2&gt;&amp;1 &gt; f</code> sends stderr to the <em>old</em> stdout (the terminal) and only stdout to <code>f</code>.</li>
+      <li><strong>Do not log to files inside a container</strong>: they fill the writable layer, disappear when the container is replaced, and are invisible to <code>kubectl logs</code>.</li>
+    </ul>
+    <details class="q"><summary>Self-check: you run <code>uvicorn app.main:app &gt; app.log</code>. Startup messages still print to the terminal, while <code>app.log</code> only collects request lines. Why?</summary><div class="a"><code>&gt;</code> redirects only fd 1 (stdout). With Uvicorn's default logging config, the access log goes to stdout, while server messages and Python <code>logging</code> output go to <strong>stderr</strong> (fd 2), which still points at the terminal. Use <code>&gt; app.log 2&gt;&amp;1</code> to capture both.</div></details>
+
+    <!-- ============================================================ TCP/IP -->
+    <h2 id="s-tcpip">TCP/IP layers (simplified)</h2>
+    <p><strong>Definition.</strong> Network communication is split into layers. Each layer solves one problem and relies on the layer below. For DevOps work, four layers are enough:</p>
+    <div class="table-wrap"><table>
+      <tr><th>Layer</th><th>Question it answers</th><th>Identifier</th><th>Where you meet it with reliability-api</th></tr>
+      <tr><td><strong>Application</strong> (HTTP, DNS)</td><td>What does the message mean?</td><td>URL path, headers, DNS name</td><td><code>GET /ready</code> → <code>503</code></td></tr>
+      <tr><td><strong>Transport</strong> (TCP, UDP)</td><td>Which program on the host, and is delivery reliable?</td><td><strong>port</strong></td><td>Uvicorn listens on TCP <code>8000</code></td></tr>
+      <tr><td><strong>Network</strong> (IP)</td><td>Which host, and how do packets get there?</td><td><strong>IP address</strong></td><td><code>127.0.0.1</code>, container IP <code>172.17.0.2</code>, Pod IP</td></tr>
+      <tr><td><strong>Link</strong> (Ethernet, Wi-Fi, loopback, veth)</td><td>Which physical/virtual interface carries the bits?</td><td>interface name / MAC</td><td><code>lo</code>, <code>eth0</code>, Docker's <code>docker0</code> bridge, veth pairs</td></tr>
+    </table></div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Encapsulation of an HTTP request inside TCP segment inside IP packet inside link frame">
+        <rect class="box4" x="20" y="30" width="820" height="230" rx="10"/>
+        <text x="36" y="52" class="t-bold">Link frame</text>
+        <text x="824" y="52" text-anchor="end" class="t-muted">e.g. Ethernet on eth0, or nothing special on lo</text>
+        <rect class="box3" x="40" y="66" width="780" height="180" rx="10"/>
+        <text x="56" y="88" class="t-bold">IP packet</text>
+        <text x="804" y="88" text-anchor="end" class="t-mono">src 10.0.0.5 → dst 10.0.0.9</text>
+        <rect class="box2" x="60" y="102" width="740" height="130" rx="10"/>
+        <text x="76" y="124" class="t-bold">TCP segment</text>
+        <text x="784" y="124" text-anchor="end" class="t-mono">src port 51544 → dst port 8000</text>
+        <rect class="box" x="80" y="138" width="700" height="80" rx="8"/>
+        <text x="96" y="160" class="t-bold">HTTP (application data)</text>
+        <text x="96" y="182" class="t-mono">GET /work?ms=50 HTTP/1.1</text>
+        <text x="96" y="202" class="t-mono">Host: 10.0.0.9:8000</text>
+        <text x="764" y="182" text-anchor="end" class="t-muted">FastAPI only ever sees this part</text>
+        <text x="430" y="285" text-anchor="middle" class="t-muted">Each layer wraps the one above with its own header (encapsulation). The receiver unwraps in reverse.</text>
+      </svg>
+      <figcaption>Debugging walks these layers bottom-up. Is the interface up? Is there a route to the IP? Is anything listening on the port? Is the HTTP response correct?</figcaption>
+    </figure>
+
+    <h3>Ports and sockets</h3>
+    <p>A <strong>port</strong> is a 16-bit number (0–65535) that lets one IP address host many services. A <strong>socket</strong> is the kernel object a program uses to talk over the network. It is a file descriptor, so <code>lsof</code> lists it next to files. Two kinds of TCP socket matter:</p>
+    <ul>
+      <li><strong>Listening socket</strong>: created by <code>socket() → bind(addr, port) → listen()</code>. Uvicorn has one, bound to <code>(0.0.0.0, 8000)</code>. It accepts nothing on its own. It is a queue of incoming connections (the <em>backlog</em>).</li>
+      <li><strong>Connected socket</strong>: created by <code>accept()</code> for each client. It is identified by the <strong>4-tuple</strong> <code>(src IP, src port, dst IP, dst port)</code>. That is how 1,000 clients can all talk to port 8000 at once: each connection differs by client IP or client (ephemeral) port.</li>
+    </ul>
+
+    <h3>The TCP handshake and the two errors you will see most</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="TCP three-way handshake and the difference between connection refused and timeout">
+        <defs><marker id="m1f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="20" y="22" class="t-bold">1. Listener present</text>
+        <text x="300" y="22" class="t-bold">2. Nothing listening on port</text>
+        <text x="590" y="22" class="t-bold">3. Packets dropped (firewall)</text>
+        <!-- col1 -->
+        <text x="40" y="48" class="t-muted">client</text><text x="220" y="48" class="t-muted">server :8000</text>
+        <path class="line" d="M50 56 L50 300"/><path class="line" d="M240 56 L240 300"/>
+        <path class="line accent" d="M50 80 L238 105" marker-end="url(#m1f)"/><text x="145" y="84" text-anchor="middle" class="t-mono">SYN</text>
+        <path class="line accent" d="M240 125 L52 150" marker-end="url(#m1f)"/><text x="145" y="130" text-anchor="middle" class="t-mono">SYN-ACK</text>
+        <path class="line accent" d="M50 170 L238 195" marker-end="url(#m1f)"/><text x="145" y="174" text-anchor="middle" class="t-mono">ACK</text>
+        <path class="line ok" d="M50 225 L238 250" marker-end="url(#m1f)"/><text x="145" y="228" text-anchor="middle" class="t-mono">GET /health</text>
+        <path class="line ok" d="M240 262 L52 287" marker-end="url(#m1f)"/><text x="145" y="268" text-anchor="middle" class="t-mono">200 OK</text>
+        <!-- col2 -->
+        <text x="320" y="48" class="t-muted">client</text><text x="500" y="48" class="t-muted">host :8001</text>
+        <path class="line" d="M330 56 L330 300"/><path class="line" d="M520 56 L520 300"/>
+        <path class="line accent" d="M330 80 L518 105" marker-end="url(#m1f)"/><text x="425" y="84" text-anchor="middle" class="t-mono">SYN</text>
+        <path class="line bad" d="M520 125 L332 150" marker-end="url(#m1f)"/><text x="425" y="130" text-anchor="middle" class="t-mono">RST</text>
+        <text x="425" y="190" text-anchor="middle" class="t-bold">fails instantly</text>
+        <text x="425" y="210" text-anchor="middle" class="t-mono">Connection refused</text>
+        <text x="425" y="236" text-anchor="middle" class="t-muted">host reachable, wrong port</text>
+        <text x="425" y="252" text-anchor="middle" class="t-muted">or app not running</text>
+        <text x="425" y="268" text-anchor="middle" class="t-muted">or bound to other address</text>
+        <!-- col3 -->
+        <text x="610" y="48" class="t-muted">client</text><text x="790" y="48" class="t-muted">server</text>
+        <path class="line" d="M620 56 L620 300"/><path class="line dash" d="M810 56 L810 300"/>
+        <path class="line bad" d="M620 80 L740 96"/><text x="760" y="100" class="t-mono">✕</text>
+        <path class="line bad" d="M620 120 L740 136"/><text x="760" y="140" class="t-mono">✕</text>
+        <text x="715" y="190" text-anchor="middle" class="t-bold">hangs, then fails</text>
+        <text x="715" y="210" text-anchor="middle" class="t-mono">Connection timed out</text>
+        <text x="715" y="236" text-anchor="middle" class="t-muted">firewall/security group,</text>
+        <text x="715" y="252" text-anchor="middle" class="t-muted">no route, wrong IP,</text>
+        <text x="715" y="268" text-anchor="middle" class="t-muted">NetworkPolicy (Module 05)</text>
+      </svg>
+      <figcaption><strong>Refused</strong> is fast and means "the host answered: nobody is here". <strong>Timeout</strong> is slow and means "nobody answered at all". These point to different layers. Knowing which one you got cuts debugging time in half.</figcaption>
+    </figure>
+
+    <!-- ============================================================ BINDING -->
+    <h2 id="s-bind">Binding: 127.0.0.1 vs 0.0.0.0</h2>
+    <p><strong>Definition.</strong> When a server calls <code>bind()</code>, it chooses <em>which local IP address</em> (and port) the listening socket accepts connections on.</p>
+    <ul>
+      <li><code>127.0.0.1</code> (<em>localhost</em>, the loopback interface <code>lo</code>): only connections that <em>originate on the same network stack</em> can reach it. Same machine, or (inside a container) the same container.</li>
+      <li><code>0.0.0.0</code> (<code>INADDR_ANY</code>): from <code>ip(7)</code>, <em>"When INADDR_ANY is specified in the bind call, the socket will be bound to all local interfaces."</em> That covers loopback and every real or virtual interface (<code>eth0</code>, the container's veth, Wi-Fi). <code>::</code> is the IPv6 equivalent.</li>
+      <li>A specific address such as <code>192.168.1.20</code>: only connections arriving at that one interface.</li>
+    </ul>
+    <p><strong>Problem it solves.</strong> Binding is a security and exposure control. A dev database bound to 127.0.0.1 is invisible to the coffee-shop Wi-Fi. It is also the single most common reason a containerized app "works inside but not from outside".</p>
+
+    <div class="callout danger"><span class="label">The trap that bites everyone</span>
+      <p><strong>Uvicorn's default <code>--host</code> is <code>127.0.0.1</code></strong> (Uvicorn settings docs: <em>"Default: '127.0.0.1'"</em>, default <code>--port</code> 8000). That is a safe default on a laptop, but inside a container "localhost" means <em>the container's own</em> loopback. Docker's port forwarding and Kubernetes Services deliver traffic to the container's <code>eth0</code> address, not its loopback. With the default, every request from outside the container is refused. That is why <code>reliability-api</code> always runs with <code>--host 0.0.0.0</code>.</p>
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 360" role="img" aria-label="Which clients reach a server bound to 127.0.0.1 versus 0.0.0.0">
+        <defs><marker id="m1g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="215" y="24" text-anchor="middle" class="t-bold">bind 127.0.0.1:8000</text>
+        <text x="645" y="24" text-anchor="middle" class="t-bold">bind 0.0.0.0:8000</text>
+        <!-- left host -->
+        <rect class="zone" x="20" y="36" width="390" height="230" rx="10"/>
+        <text x="34" y="56" class="t-muted">host / container network stack</text>
+        <rect class="box2" x="150" y="70" width="140" height="44" rx="8"/>
+        <text x="220" y="97" text-anchor="middle" class="t-bold">uvicorn</text>
+        <rect class="box4" x="60" y="160" width="120" height="40" rx="6"/>
+        <text x="120" y="185" text-anchor="middle" class="t-mono">lo 127.0.0.1</text>
+        <rect class="box" x="240" y="160" width="140" height="40" rx="6"/>
+        <text x="310" y="185" text-anchor="middle" class="t-mono">eth0 10.0.0.9</text>
+        <path class="line ok" d="M120 160 L190 116" marker-end="url(#m1g)"/>
+        <path class="line bad dash" d="M310 160 L250 116"/>
+        <text x="300" y="140" class="t-mono">✕</text>
+        <rect class="box" x="60" y="220" width="120" height="34" rx="6"/>
+        <text x="120" y="242" text-anchor="middle" class="t-muted">curl localhost ✓</text>
+        <path class="line ok" d="M120 220 L120 202" marker-end="url(#m1g)"/>
+        <rect class="box3" x="240" y="300" width="160" height="44" rx="8"/>
+        <text x="320" y="320" text-anchor="middle">other machine /</text>
+        <text x="320" y="336" text-anchor="middle">docker -p / Service</text>
+        <path class="line bad" d="M320 298 L312 202" marker-end="url(#m1g)"/>
+        <text x="150" y="330" class="t-muted">→ RST: refused</text>
+        <!-- right host -->
+        <rect class="zone" x="450" y="36" width="390" height="230" rx="10"/>
+        <text x="464" y="56" class="t-muted">host / container network stack</text>
+        <rect class="box2" x="580" y="70" width="140" height="44" rx="8"/>
+        <text x="650" y="97" text-anchor="middle" class="t-bold">uvicorn</text>
+        <rect class="box4" x="490" y="160" width="120" height="40" rx="6"/>
+        <text x="550" y="185" text-anchor="middle" class="t-mono">lo 127.0.0.1</text>
+        <rect class="box4" x="670" y="160" width="140" height="40" rx="6"/>
+        <text x="740" y="185" text-anchor="middle" class="t-mono">eth0 10.0.0.9</text>
+        <path class="line ok" d="M550 160 L620 116" marker-end="url(#m1g)"/>
+        <path class="line ok" d="M740 160 L680 116" marker-end="url(#m1g)"/>
+        <rect class="box" x="490" y="220" width="120" height="34" rx="6"/>
+        <text x="550" y="242" text-anchor="middle" class="t-muted">curl localhost ✓</text>
+        <path class="line ok" d="M550 220 L550 202" marker-end="url(#m1g)"/>
+        <rect class="box3" x="670" y="300" width="160" height="44" rx="8"/>
+        <text x="750" y="320" text-anchor="middle">other machine /</text>
+        <text x="750" y="336" text-anchor="middle">docker -p / Service</text>
+        <path class="line ok" d="M750 298 L742 202" marker-end="url(#m1g)"/>
+        <text x="580" y="330" class="t-muted">→ 200 OK ✓</text>
+      </svg>
+      <figcaption>The bind address filters by <em>which interface the connection arrived on</em>. Inside a container, Docker's <code>-p</code> forwarding and Kubernetes Service traffic arrive on <code>eth0</code>.</figcaption>
+    </figure>
+
+    <div class="widget" id="bindw">
+      <div class="w-title">Binding explorer</div>
+      <div class="w-sub">Choose where reliability-api runs, what it binds to, and who is calling. See whether the connection succeeds and why.</div>
+      <div class="row">
+        <label style="margin:0">Runs in&nbsp;<select id="b-where"><option value="host">a Linux host (no container)</option><option value="ctr">a Docker container with -p 8000:8000</option></select></label>
+      </div>
+      <div class="row">
+        <label style="margin:0">--host&nbsp;<select id="b-bind"><option value="127.0.0.1">127.0.0.1 (Uvicorn default)</option><option value="0.0.0.0" selected>0.0.0.0</option><option value="lan">192.168.1.20 (one specific interface)</option></select></label>
+      </div>
+      <div class="row">
+        <label style="margin:0">Client&nbsp;<select id="b-client">
+          <option value="same-lo">curl http://127.0.0.1:8000 from the same host</option>
+          <option value="same-lan">curl http://192.168.1.20:8000 from the same host</option>
+          <option value="other">curl from another laptop on the LAN</option>
+          <option value="inside">curl localhost:8000 from INSIDE the container (docker exec)</option>
+        </select></label>
+      </div>
+      <div class="out" id="b-out" aria-live="polite"></div>
+    </div>
+
+    <h3>Applied to reliability-api</h3>
+<pre data-title="Verify the binding, not just the port"><code>$ ss -ltnp 'sport = :8000'
+<span class="o">State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+LISTEN 0      2048        127.0.0.1:8000      0.0.0.0:*     users:(("uvicorn",pid=4321,fd=6))</span>
+<span class="c">#                         ^^^^^^^^^ loopback only: unreachable from outside this network stack</span>
+<span class="c"># After restarting with --host 0.0.0.0:</span>
+<span class="o">LISTEN 0      2048          0.0.0.0:8000      0.0.0.0:*     users:(("uvicorn",pid=4410,fd=6))</span>
+<span class="c"># Example output (yours will differ in names/IDs/timings)</span></code></pre>
+    <h3>Trade-offs</h3>
+    <ul>
+      <li><code>0.0.0.0</code> on a laptop exposes the app to your whole network. That is fine inside a container (the container's network is isolated and only published ports are forwarded), but think twice on a bare host.</li>
+      <li>Docker's <code>-p 8000:8000</code> itself publishes on all host addresses by default. To keep a container reachable only from your laptop, use <code>-p 127.0.0.1:8000:8000</code> (Module 02). There are two separate binding decisions: the app's inside the container, and Docker's on the host.</li>
+    </ul>
+    <details class="q"><summary>Self-check: inside the container <code>curl localhost:8000/health</code> works, but from your laptop <code>curl localhost:8000/health</code> gives "connection reset" or "empty reply". The container was run with <code>-p 8000:8000</code>. Most likely cause?</summary><div class="a">Uvicorn is bound to <code>127.0.0.1</code> inside the container (the default). Docker forwards host:8000 to the container's eth0 address, where nothing listens. Restart with <code>--host 0.0.0.0</code>. The exact client error varies by Docker setup ("connection reset", "empty reply from server", or "refused"). The diagnosis is the same: run <code>ss -ltn</code> inside the container.</div></details>
+
+    <!-- ============================================================ DNS -->
+    <h2 id="s-dns">DNS resolution</h2>
+    <p><strong>Definition.</strong> DNS (Domain Name System, RFC 1034/1035) is a distributed, cached database that maps names to records: <code>A</code> (IPv4), <code>AAAA</code> (IPv6), <code>CNAME</code> (alias), and others. Each answer has a <strong>TTL</strong>, the number of seconds it may be cached.</p>
+    <p><strong>Problem it solves.</strong> IPs change: containers are replaced, Pods get new IPs, cloud load balancers move. Names stay stable. In Kubernetes your load generator will call <code>http://reliability-api.reliability-lab.svc.cluster.local</code> and never an IP (Module 05). On a Docker user-defined network it calls <code>http://reliability-api:8000</code> (Module 02).</p>
+
+    <h3>How a lookup flows (click through)</h3>
+    <div class="widget stepper" data-steps='[
+      {"title":"The app asks the OS","html":"Python calls &lt;code&gt;getaddrinfo(\"api.example.com\")&lt;/code&gt; (curl, requests, and httpx all do this). The app does not speak DNS itself. It asks the C library resolver."},
+      {"title":"Local sources first: /etc/hosts","html":"The resolver follows &lt;code&gt;/etc/nsswitch.conf&lt;/code&gt; (typically &lt;code&gt;hosts: files dns&lt;/code&gt;). &lt;em&gt;files&lt;/em&gt; means &lt;code&gt;/etc/hosts&lt;/code&gt;. A match there wins and no packet is sent. This is where &lt;code&gt;localhost → 127.0.0.1&lt;/code&gt; comes from."},
+      {"title":"Stub resolver reads /etc/resolv.conf","html":"For DNS, the stub reads &lt;code&gt;nameserver&lt;/code&gt; lines (up to 3, tried in order) and &lt;code&gt;search&lt;/code&gt; domains. Short names like &lt;code&gt;reliability-api&lt;/code&gt; get search suffixes appended. Kubernetes and Docker write this file for you."},
+      {"title":"Query the recursive resolver","html":"A UDP packet to port 53 goes to the configured nameserver (your router, a cloud resolver, Docker embedded DNS at &lt;code&gt;127.0.0.11&lt;/code&gt;, or CoreDNS in Kubernetes). If it has a cached, unexpired answer, it replies immediately."},
+      {"title":"Cache miss: walk the hierarchy","html":"The recursive resolver asks a &lt;strong&gt;root&lt;/strong&gt; server (referral to &lt;code&gt;.com&lt;/code&gt;), then the &lt;strong&gt;TLD&lt;/strong&gt; server (referral to example.com servers), then the &lt;strong&gt;authoritative&lt;/strong&gt; server, which returns the A record."},
+      {"title":"Answer flows back and is cached","html":"The answer (with TTL) is cached by the recursive resolver and often by local caches. &lt;code&gt;getaddrinfo&lt;/code&gt; returns the IPs. The app now opens a TCP connection to the IP. DNS is finished, and everything after this is TCP and HTTP."}
+    ]'>
+      <div class="w-title">DNS lookup walk-through</div>
+      <svg viewBox="0 0 860 280" role="img" aria-label="DNS resolution path from application through stub resolver to recursive and authoritative servers">
+        <defs><marker id="m1h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <g data-step="0,5"><rect class="box2" x="20" y="110" width="130" height="60" rx="8"/><text x="85" y="135" text-anchor="middle" class="t-bold">app / curl</text><text x="85" y="154" text-anchor="middle" class="t-mono">getaddrinfo()</text></g>
+        <g data-step="1"><rect class="box" x="190" y="30" width="150" height="50" rx="8"/><text x="265" y="52" text-anchor="middle" class="t-bold">/etc/hosts</text><text x="265" y="70" text-anchor="middle" class="t-muted">via nsswitch.conf</text></g>
+        <g data-step="2"><rect class="box" x="190" y="200" width="150" height="50" rx="8"/><text x="265" y="222" text-anchor="middle" class="t-bold">/etc/resolv.conf</text><text x="265" y="240" text-anchor="middle" class="t-muted">nameserver, search</text></g>
+        <g data-step="3,5"><rect class="box3" x="390" y="110" width="160" height="60" rx="8"/><text x="470" y="134" text-anchor="middle" class="t-bold">recursive resolver</text><text x="470" y="153" text-anchor="middle" class="t-muted">cache · UDP/TCP 53</text></g>
+        <g data-step="4"><rect class="box4" x="620" y="20" width="220" height="50" rx="8"/><text x="730" y="50" text-anchor="middle">root servers  →  "ask .com"</text></g>
+        <g data-step="4"><rect class="box4" x="620" y="115" width="220" height="50" rx="8"/><text x="730" y="145" text-anchor="middle">TLD .com  →  "ask ns1.example"</text></g>
+        <g data-step="4,5"><rect class="box4" x="620" y="210" width="220" height="50" rx="8"/><text x="730" y="232" text-anchor="middle" class="t-bold">authoritative server</text><text x="730" y="250" text-anchor="middle" class="t-mono">A 203.0.113.10 TTL 300</text></g>
+        <path class="line" data-step="1" d="M150 125 L188 62" marker-end="url(#m1h)"/>
+        <path class="line" data-step="2" d="M150 155 L188 220" marker-end="url(#m1h)"/>
+        <path class="line accent" data-step="3" d="M340 222 L405 172" marker-end="url(#m1h)"/>
+        <path class="line accent" data-step="4" d="M550 125 L618 48" marker-end="url(#m1h)"/>
+        <path class="line accent" data-step="4" d="M550 140 L618 140" marker-end="url(#m1h)"/>
+        <path class="line accent" data-step="4" d="M550 155 L618 232" marker-end="url(#m1h)"/>
+        <path class="line ok" data-step="5" d="M390 140 L152 140" marker-end="url(#m1h)"/>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+<pre data-title="Inspecting DNS"><code>$ cat /etc/resolv.conf
+<span class="o">nameserver 10.0.0.2
+search lan</span>
+$ dig +noall +answer example.com A          <span class="c"># just the answer section</span>
+<span class="o">example.com.        287   IN   A   203.0.113.10</span>
+<span class="c">#                    ^^^ remaining TTL in seconds (counts down in caches)</span>
+$ dig @1.1.1.1 example.com A +short        <span class="c"># ask a specific resolver, bypassing resolv.conf</span>
+$ nslookup example.com                     <span class="c"># older, simpler tool; also available on macOS</span>
+$ getent hosts example.com                 <span class="c"># uses the same path as apps: /etc/hosts AND DNS</span>
+<span class="c"># Example output: real IPs for example.com differ; 203.0.113.0/24 is a documentation range</span></code></pre>
+    <div class="callout tip"><span class="label">dig vs getent</span><p><code>dig</code> and <code>nslookup</code> talk to DNS directly and <strong>skip <code>/etc/hosts</code></strong>. <code>getent hosts</code> goes through nsswitch like your app does. If <code>dig</code> works and the app fails (or the reverse), compare them. The difference is usually <code>/etc/hosts</code> or the search domains.</p></div>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>NXDOMAIN</strong> ("Name or service not known" in Python): the name does not exist. Check for typos, the wrong namespace in Kubernetes, or a missing search domain.</li>
+      <li><strong>SERVFAIL / timeout</strong>: the resolver is unreachable or broken. In Kubernetes, check CoreDNS Pods (Module 05).</li>
+      <li><strong>Stale answer</strong>: the IP changed but a cache still holds the old record until its TTL expires. Clients that cache forever (some JVMs, long-lived connection pools) keep using dead IPs.</li>
+      <li><strong>Containers on Docker's default bridge cannot resolve each other by name</strong>. Only user-defined networks get embedded DNS (Module 02).</li>
+    </ul>
+
+    <!-- ============================================================ HTTP -->
+    <h2 id="s-http">HTTP request and response anatomy</h2>
+    <p><strong>Definition.</strong> HTTP is a request/response protocol over a TCP connection (HTTP/1.1, HTTP/2; HTTP/3 uses QUIC over UDP). A client sends a <strong>method + target + headers + optional body</strong>. The server returns a <strong>status code + headers + optional body</strong>. Semantics are defined in RFC 9110.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 340" role="img" aria-label="Annotated HTTP request and response for reliability-api /ready">
+        <text x="20" y="24" class="t-bold">Request (client → reliability-api)</text>
+        <rect class="box2" x="20" y="34" width="400" height="130" rx="8"/>
+        <text x="34" y="60" class="t-mono">GET /ready HTTP/1.1</text>
+        <text x="34" y="82" class="t-mono">Host: localhost:8000</text>
+        <text x="34" y="104" class="t-mono">User-Agent: curl/8.5.0</text>
+        <text x="34" y="126" class="t-mono">Accept: */*</text>
+        <text x="34" y="150" class="t-muted">(blank line, no body for GET)</text>
+        <text x="440" y="60" class="t-muted">← method · path (+ ?query) · version</text>
+        <text x="440" y="82" class="t-muted">← required in HTTP/1.1; virtual hosting, Ingress routing</text>
+        <text x="440" y="114" class="t-muted">← headers: metadata, one per line</text>
+        <text x="20" y="196" class="t-bold">Response (during READY_DELAY_SECONDS warm-up)</text>
+        <rect class="box3" x="20" y="206" width="400" height="124" rx="8"/>
+        <text x="34" y="230" class="t-mono">HTTP/1.1 503 Service Unavailable</text>
+        <text x="34" y="252" class="t-mono">content-type: application/json</text>
+        <text x="34" y="274" class="t-mono">content-length: 15</text>
+        <text x="34" y="306" class="t-mono">{"ready":false}</text>
+        <text x="440" y="230" class="t-muted">← status line: the code is what probes and LBs read</text>
+        <text x="440" y="262" class="t-muted">← headers describe the body</text>
+        <text x="440" y="306" class="t-muted">← body: for humans/clients; probes ignore it</text>
+      </svg>
+      <figcaption>A Kubernetes HTTP probe treats any status from 200 up to (not including) 400 as success. <code>/ready</code> returning 503 is how reliability-api says "do not send me traffic yet" (Module 04).</figcaption>
+    </figure>
+    <h3>Status code classes (RFC 9110 §15)</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Class</th><th>RFC meaning</th><th>Codes you will meet</th><th>reliability-api example</th></tr>
+      <tr><td><strong>1xx</strong></td><td>Informational: request received, continuing</td><td>101 Switching Protocols</td><td>(not used)</td></tr>
+      <tr><td><strong>2xx</strong></td><td>Successful</td><td>200 OK, 201 Created, 204 No Content</td><td><code>/health</code>, <code>/work</code> → 200</td></tr>
+      <tr><td><strong>3xx</strong></td><td>Redirection: further action needed</td><td>301, 302, 307, 308</td><td>FastAPI may 307-redirect a trailing-slash mismatch</td></tr>
+      <tr><td><strong>4xx</strong></td><td>Client error</td><td>400, 401, 403, 404, 405, 422, 429</td><td><code>/work?ms=abc</code> → 422 (validation), <code>/nope</code> → 404</td></tr>
+      <tr><td><strong>5xx</strong></td><td>Server error</td><td>500, 502, 503, 504</td><td><code>/ready</code> → 503 during warm-up; 502/504 come from proxies in front of the app</td></tr>
+    </table></div>
+    <div class="callout note"><span class="label">Why the class matters for reliability</span>
+      <p>SLOs usually count <strong>5xx</strong> as server failures and treat <strong>4xx</strong> as the client's fault. A metric that lumps them together (or a <code>/ready</code> that returns 500 instead of 503) misleads dashboards and alerts (Module 07). <strong>502 Bad Gateway</strong> and <strong>504 Gateway Timeout</strong> mean a <em>proxy</em> could not get a good answer from the app. The app itself may never have seen the request.</p>
+    </div>
+
+    <!-- ============================================================ DIAGNOSTICS -->
+    <h2 id="s-diag">Diagnostic command toolkit</h2>
+    <p>Each command answers one question. Learn the question first, then the flags. All outputs below are <strong>example outputs (yours will differ in names/IDs/timings)</strong>.</p>
+
+    <h3><code>ps</code> and <code>top</code>: is it running, and what is it using?</h3>
+<pre><code>$ ps aux --sort=-%cpu | head -5            <span class="c"># top CPU consumers right now</span>
+$ ps -eo pid,ppid,user,stat,%cpu,%mem,etime,args | grep [u]vicorn
+<span class="o"> 4321  2210 dev  Rl+  98.7  0.4    05:01 /home/dev/lab/.venv/bin/python3 …/uvicorn app.main:app --host 0.0.0.0 --port 8000</span>
+<span class="c"># the [u] trick stops grep from matching its own command line</span>
+
+$ top -p 4321                              <span class="c"># live view of one PID; press q to quit, 1 for per-CPU</span>
+<span class="o">  PID USER   PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+ 4321 dev    20   0  245612  46212  14580 R  99.3   0.3   1:12.40 uvicorn</span></code></pre>
+    <p><strong>Read it:</strong> <code>%CPU ≈ 100</code> means one core is saturated. That is expected while <code>/work</code> busy-loops, because one Uvicorn worker runs Python code on one core at a time. <code>RES</code> is resident memory in KiB. That number is what memory limits and the OOM killer care about (Module 04).</p>
+
+    <h3><code>ss</code> and <code>lsof</code>: who is listening, and on which address?</h3>
+<pre><code>$ ss -ltnp                   <span class="c"># -l listening, -t TCP, -n numeric (no DNS), -p show process</span>
+<span class="o">State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+LISTEN 0      4096   127.0.0.53%lo:53        0.0.0.0:*
+LISTEN 0      2048         0.0.0.0:8000      0.0.0.0:*     users:(("uvicorn",pid=4321,fd=6))</span>
+$ ss -tn state established '( sport = :8000 )'   <span class="c"># current client connections to the app</span>
+$ lsof -nP -iTCP:8000 -sTCP:LISTEN                <span class="c"># same question; also works on macOS</span>
+<span class="o">COMMAND  PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+uvicorn 4321  dev    6u  IPv4  81234      0t0  TCP *:8000 (LISTEN)</span></code></pre>
+    <p>Flag meanings come from <code>ss(8)</code>: <code>-t</code> <em>"Display TCP sockets"</em>, <code>-l</code> listening sockets only, <code>-n</code> do not resolve service names, <code>-p</code> <em>"Show processes using sockets"</em> (other users' processes need root). Not from <code>ss(8)</code>, but standard Linux behaviour: for a listening socket, <code>Send-Q</code> shows the configured backlog and <code>Recv-Q</code> the number of connections waiting to be accepted. A growing <code>Recv-Q</code> means the app is not accepting fast enough.</p>
+
+    <h3><code>curl -v</code>: the whole conversation, layer by layer</h3>
+<pre><code>$ curl -v http://localhost:8000/health
+<span class="o">*   Trying 127.0.0.1:8000...                         <span class="c">← DNS done (localhost from /etc/hosts), TCP SYN sent</span>
+* Connected to localhost (127.0.0.1) port 8000      <span class="c">← TCP handshake succeeded</span>
+&gt; GET /health HTTP/1.1                              <span class="c">← request line (&gt; = sent)</span>
+&gt; Host: localhost:8000
+&gt; User-Agent: curl/8.5.0
+&gt; Accept: */*
+&gt;
+&lt; HTTP/1.1 200 OK                                   <span class="c">← status line (&lt; = received)</span>
+&lt; date: Wed, 29 Oct 2026 10:15:02 GMT
+&lt; server: uvicorn
+&lt; content-length: 15
+&lt; content-type: application/json
+&lt;
+{"status":"ok"}</span>
+$ curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' http://localhost:8000/ready
+<span class="o">503 0.004213s</span>          <span class="c">← script-friendly: just status and timing</span>
+$ curl -v http://localhost:8001/health      <span class="c"># wrong port</span>
+<span class="o">*   Trying 127.0.0.1:8001...
+* connect to 127.0.0.1 port 8001 failed: Connection refused
+curl: (7) Failed to connect to localhost port 8001 after 0 ms: Couldn't connect to server</span>
+$ curl -sS --max-time 3 http://10.255.255.1:8000/   <span class="c"># unroutable IP</span>
+<span class="o">curl: (28) Connection timed out after 3001 milliseconds</span></code></pre>
+    <p>The exact wording of curl errors varies by version. The numeric codes are stable: <strong>(6)</strong> could not resolve host (DNS), <strong>(7)</strong> failed to connect (refused/unreachable), <strong>(28)</strong> operation timed out, <strong>(52)</strong> empty reply from server, <strong>(56)</strong> failure receiving data (e.g. connection reset). Each one points at a layer.</p>
+
+    <h3><code>df</code>, <code>du</code>, <code>free</code>: disk and memory</h3>
+<pre><code>$ df -h /                     <span class="c"># free space per filesystem</span>
+<span class="o">Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1        98G   41G   53G  44% /</span>
+$ du -sh .venv ~/.cache/pip    <span class="c"># what is using the space</span>
+<span class="o">52M     .venv
+310M    /home/dev/.cache/pip</span>
+$ free -h
+<span class="o">               total        used        free      shared  buff/cache   available
+Mem:            15Gi       4.1Gi       6.2Gi       312Mi       5.3Gi        10Gi
+Swap:          2.0Gi          0B       2.0Gi</span></code></pre>
+    <p>Look at <code>available</code>, not <code>free</code>. Linux uses spare RAM as page cache (<code>buff/cache</code>) and gives it back on demand. Low <code>free</code> with high <code>available</code> is healthy. A full disk (<code>Use% 100%</code>) causes strange failures: writes fail, logs stop, Docker builds fail with "no space left on device".</p>
+
+    <h3><code>journalctl</code>: logs of systemd-managed services</h3>
+<pre><code>$ journalctl -u reliability-api -f            <span class="c"># follow one unit's logs (if you run it as a systemd service)</span>
+$ journalctl -u reliability-api --since "10 min ago" -p warning
+$ journalctl -k | grep -i 'out of memory'     <span class="c"># kernel messages: OOM kills show up here</span>
+$ journalctl -u docker --since today          <span class="c"># the Docker daemon's own logs</span></code></pre>
+    <p>On a Linux host, systemd captures the stdout/stderr of the services it runs. <code>journalctl</code> is to systemd what <code>docker logs</code> is to Docker and <code>kubectl logs</code> is to Kubernetes. Kubernetes nodes also run the kubelet as a systemd unit, so <code>journalctl -u kubelet</code> is a standard node-debugging step.</p>
+    <details>
+      <summary>Optional: run reliability-api as a systemd service (to practise journalctl)</summary>
+<pre data-title="/etc/systemd/system/reliability-api.service"><code>[Unit]
+Description=reliability-api (lab)
+After=network.target
+
+[Service]
+User=dev
+WorkingDirectory=/home/dev/lab
+Environment=LOG_LEVEL=info
+ExecStart=/home/dev/lab/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+<pre><code>$ sudo systemctl daemon-reload &amp;&amp; sudo systemctl start reliability-api
+$ systemctl status reliability-api        <span class="c"># shows Main PID, state, last log lines</span>
+$ sudo systemctl stop reliability-api     <span class="c"># systemd sends SIGTERM, then SIGKILL after its timeout</span></code></pre>
+      <p>Notice that the shape is already there: a supervisor, an env, a restart policy, and log capture. Docker and Kubernetes formalise the same ideas.</p>
+    </details>
+
+    <h3>A first troubleshooting flow: "the API does not respond"</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 400" role="img" aria-label="Decision flow for diagnosing an API that does not respond">
+        <defs><marker id="m1i" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="300" y="12" width="260" height="40" rx="8"/><text x="430" y="37" text-anchor="middle" class="t-bold">curl -v fails. Which error?</text>
+        <path class="line" d="M360 52 L130 92" marker-end="url(#m1i)"/>
+        <path class="line" d="M430 52 L430 92" marker-end="url(#m1i)"/>
+        <path class="line" d="M500 52 L730 92" marker-end="url(#m1i)"/>
+        <rect class="box" x="20" y="94" width="220" height="56" rx="8"/><text x="130" y="116" text-anchor="middle" class="t-bold">(6) cannot resolve</text><text x="130" y="136" text-anchor="middle" class="t-muted">DNS layer</text>
+        <rect class="box" x="320" y="94" width="220" height="56" rx="8"/><text x="430" y="116" text-anchor="middle" class="t-bold">(7) refused</text><text x="430" y="136" text-anchor="middle" class="t-muted">reached host, no listener</text>
+        <rect class="box" x="620" y="94" width="220" height="56" rx="8"/><text x="730" y="116" text-anchor="middle" class="t-bold">(28) timeout</text><text x="730" y="136" text-anchor="middle" class="t-muted">packets dropped / app hung</text>
+        <rect class="box3" x="20" y="180" width="220" height="100" rx="8"/>
+        <text x="34" y="204" class="t-mono">getent hosts NAME</text>
+        <text x="34" y="226" class="t-mono">cat /etc/resolv.conf</text>
+        <text x="34" y="248" class="t-mono">dig NAME</text>
+        <text x="34" y="270" class="t-muted">typo? wrong namespace?</text>
+        <rect class="box3" x="320" y="180" width="220" height="100" rx="8"/>
+        <text x="334" y="204" class="t-mono">pgrep -af uvicorn</text>
+        <text x="334" y="226" class="t-mono">ss -ltnp</text>
+        <text x="334" y="248" class="t-muted">running? right port?</text>
+        <text x="334" y="270" class="t-muted">bound to 127.0.0.1?</text>
+        <rect class="box3" x="620" y="180" width="220" height="100" rx="8"/>
+        <text x="634" y="204" class="t-muted">firewall / sec. group?</text>
+        <text x="634" y="226" class="t-muted">right IP? route?</text>
+        <text x="634" y="248" class="t-mono">ss -ltn (Recv-Q full?)</text>
+        <text x="634" y="270" class="t-mono">top (100% CPU?)</text>
+        <path class="line" d="M130 150 L130 178" marker-end="url(#m1i)"/>
+        <path class="line" d="M430 150 L430 178" marker-end="url(#m1i)"/>
+        <path class="line" d="M730 150 L730 178" marker-end="url(#m1i)"/>
+        <rect class="box4" x="200" y="310" width="460" height="74" rx="8"/>
+        <text x="430" y="334" text-anchor="middle" class="t-bold">Connected but bad status?</text>
+        <text x="430" y="354" text-anchor="middle" class="t-muted">4xx → check URL/params · 5xx → read app logs (stderr)</text>
+        <text x="430" y="372" text-anchor="middle" class="t-muted">process gone → check exit code (128+N = killed by signal N)</text>
+      </svg>
+      <figcaption>Start from the curl error code. It tells you which layer to investigate. The same flow works for containers and Pods, with <code>docker exec</code> or <code>kubectl exec</code> prepended.</figcaption>
+    </figure>
+
+    <!-- ============================================================ NAMESPACES & CGROUPS -->
+    <h2 id="s-ns">Namespaces and cgroups: the bridge to containers</h2>
+    <p>Here is the key insight for Module 02. <strong>A container is an ordinary Linux process</strong> started with two extra kernel features applied:</p>
+    <ul>
+      <li><strong>Namespaces</strong> change what the process can <em>see</em>. From <code>namespaces(7)</code>: <em>"A namespace wraps a global system resource in an abstraction that makes it appear to the processes within the namespace that they have their own isolated instance of the global resource."</em></li>
+      <li><strong>cgroups</strong> (control groups) change what the process can <em>use</em>. From <code>cgroups(7)</code>: <em>"A cgroup is a collection of processes that are bound to a set of limits or parameters"</em>. The kernel's subsystems make it possible to limit CPU time and memory, among other resources.</li>
+    </ul>
+    <div class="table-wrap"><table>
+      <tr><th>Namespace (namespaces(7))</th><th>Isolates</th><th>What reliability-api experiences in a container</th></tr>
+      <tr><td>PID</td><td>Process IDs</td><td>Uvicorn sees itself as <strong>PID 1</strong>, so the signal rules from this module apply</td></tr>
+      <tr><td>Network</td><td>Network devices, stacks, ports</td><td>Its own <code>lo</code> and <code>eth0</code>, its own port 8000. That is why <code>127.0.0.1</code> inside ≠ host's</td></tr>
+      <tr><td>Mount</td><td>Mount points</td><td>Sees the image's filesystem as <code>/</code>, not the host's</td></tr>
+      <tr><td>UTS</td><td>Hostname and NIS domain name</td><td><code>hostname</code> returns the container ID or Pod name</td></tr>
+      <tr><td>IPC</td><td>System V IPC, POSIX message queues</td><td>Shared-memory isolation</td></tr>
+      <tr><td>User</td><td>User and group IDs</td><td>(Optional) UID 0 inside can map to an unprivileged UID outside</td></tr>
+      <tr><td>Cgroup</td><td>Cgroup root directory</td><td>Sees only its own cgroup tree</td></tr>
+      <tr><td>Time</td><td>Boot and monotonic clocks</td><td>Rarely used by container runtimes</td></tr>
+    </table></div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 340" role="img" aria-label="Same uvicorn process seen from host and from inside its namespaces, with cgroup limits">
+        <rect class="zone" x="20" y="20" width="820" height="300" rx="12"/>
+        <text x="36" y="42" class="t-bold">Host kernel (one kernel for everything)</text>
+        <rect class="box" x="40" y="60" width="240" height="150" rx="8"/>
+        <text x="160" y="84" text-anchor="middle" class="t-bold">Host view</text>
+        <text x="56" y="110" class="t-mono">PID 1     systemd</text>
+        <text x="56" y="130" class="t-mono">PID 2210  bash</text>
+        <text x="56" y="150" class="t-mono">PID 5120  containerd-shim</text>
+        <text x="56" y="170" class="t-mono">PID 5139  uvicorn  ◀</text>
+        <text x="56" y="196" class="t-muted">host eth0 192.168.1.20</text>
+        <rect class="box2" x="320" y="60" width="260" height="150" rx="8"/>
+        <text x="450" y="84" text-anchor="middle" class="t-bold">Inside the namespaces</text>
+        <text x="336" y="110" class="t-mono">PID 1  uvicorn  ◀ same process</text>
+        <text x="336" y="134" class="t-mono">lo 127.0.0.1, eth0 172.17.0.2</text>
+        <text x="336" y="158" class="t-mono">hostname 3f2c9a1b7e04</text>
+        <text x="336" y="182" class="t-mono">/ = image filesystem</text>
+        <rect class="box4" x="620" y="60" width="200" height="150" rx="8"/>
+        <text x="720" y="84" text-anchor="middle" class="t-bold">cgroup limits</text>
+        <text x="636" y="112" class="t-mono">memory.max  256Mi</text>
+        <text x="636" y="136" class="t-mono">cpu.max  1 CPU</text>
+        <text x="636" y="166" class="t-muted">exceed memory →</text>
+        <text x="636" y="184" class="t-muted">OOM kill → exit 137</text>
+        <text x="636" y="200" class="t-muted">exceed CPU → throttled</text>
+        <rect class="box3" x="40" y="236" width="780" height="66" rx="8"/>
+        <text x="430" y="262" text-anchor="middle" class="t-bold">namespaces = what it can see · cgroups = what it can use</text>
+        <text x="430" y="284" text-anchor="middle" class="t-muted">plus an image filesystem (Module 02). No separate kernel and no VM: that is why containers start in milliseconds.</text>
+      </svg>
+      <figcaption>One process, two PIDs: 5139 from the host's PID namespace, 1 from its own. PIDs and names are illustrative.</figcaption>
+    </figure>
+<pre data-title="See namespaces and cgroups for any process"><code>$ ls -l /proc/$$/ns            <span class="c"># namespaces of your current shell</span>
+<span class="o">lrwxrwxrwx 1 dev dev 0 Oct 29 10:20 mnt -&gt; 'mnt:[4026531841]'
+lrwxrwxrwx 1 dev dev 0 Oct 29 10:20 net -&gt; 'net:[4026531840]'
+lrwxrwxrwx 1 dev dev 0 Oct 29 10:20 pid -&gt; 'pid:[4026531836]'
+…</span>
+<span class="c"># Two processes are in the same namespace if these inode numbers match.</span>
+$ cat /proc/$$/cgroup          <span class="c"># which cgroup (v2: a single line "0::/path")</span>
+<span class="o">0::/user.slice/user-1000.slice/session-3.scope</span>
+$ sudo unshare --pid --fork --mount-proc bash   <span class="c"># try it: a new PID namespace by hand</span>
+# ps -e
+<span class="o">    PID TTY          TIME CMD
+      1 pts/1    00:00:00 bash
+      8 pts/1    00:00:00 ps</span>
+<span class="c"># Your bash is PID 1 here. You just made the "PID" part of a container yourself. Type exit to leave.
+# Example output (yours will differ in names/IDs/timings)</span></code></pre>
+    <details class="q"><summary>Self-check: a container has a 256 MiB memory limit and the app slowly leaks memory. What do you observe, in Linux terms?</summary><div class="a">When the cgroup's memory usage reaches its limit and the kernel cannot reclaim enough, the kernel OOM killer kills a process in that cgroup with <strong>SIGKILL</strong>. If that is the main process, the container exits with <strong>137</strong> (128 + 9). Docker reports <code>OOMKilled: true</code>, Kubernetes reports <code>Reason: OOMKilled</code>, and the restart policy decides what happens next. No SIGTERM is sent and no handler runs.</div></details>
+
+    <!-- ============================================================ LABS -->
+    <h2 id="s-labs">Hands-on labs</h2>
+    <p>Use a Linux shell (VM, cloud VM, or WSL2). Commands assume a directory <code>~/lab</code> containing <code>app/main.py</code> and <code>requirements.txt</code> from the top of this page. Record what <em>you</em> observe, with date and environment, in your own notes. The outputs below are examples.</p>
+
+    <section class="lab"><header>Lab 1 — Run reliability-api natively and inspect the process</header><div class="body">
+      <p><strong>Goal:</strong> connect the process, environment, socket, and HTTP views of one running app.</p>
+      <ol class="steps">
+        <li>Create a virtual environment and install dependencies:
+<pre><code>$ cd ~/lab
+$ python3.12 -m venv .venv &amp;&amp; . .venv/bin/activate
+$ pip install -r requirements.txt</code></pre></li>
+        <li>Start the app with explicit config (terminal A):
+<pre><code>$ LOG_LEVEL=info READY_DELAY_SECONDS=20 uvicorn app.main:app --host 0.0.0.0 --port 8000</code></pre>
+<pre><code><span class="o">INFO:     Started server process [4321]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)</span>
+<span class="c"># Example output (yours will differ in names/IDs/timings)</span></code></pre></li>
+        <li>In terminal B, find the process, its parent, user, and environment:
+<pre><code>$ PID=$(pgrep -f 'uvicorn app.main:app'); echo $PID
+$ ps -o pid,ppid,user,stat,etime,args -p $PID
+$ tr '\0' '\n' &lt; /proc/$PID/environ | grep -E 'LOG_LEVEL|READY_DELAY'
+<span class="o">LOG_LEVEL=info
+READY_DELAY_SECONDS=20</span></code></pre></li>
+        <li>Confirm the listening socket and its bind address:
+<pre><code>$ ss -ltnp 'sport = :8000'</code></pre>
+          Expected: one <code>LISTEN</code> line with local address <code>0.0.0.0:8000</code> and process <code>uvicorn</code>.</li>
+        <li>Call each endpoint. Run <code>/ready</code> within 20 s of startup, then again after:
+<pre><code>$ curl -s -w '  -&gt; %{http_code}\n' localhost:8000/health
+<span class="o">{"status":"ok"}  -&gt; 200</span>
+$ curl -s -w '  -&gt; %{http_code}\n' localhost:8000/ready
+<span class="o">{"ready":false}  -&gt; 503</span>          <span class="c"># during the 20 s warm-up</span>
+$ sleep 20; curl -s -w '  -&gt; %{http_code}\n' localhost:8000/ready
+<span class="o">{"ready":true}  -&gt; 200</span>
+$ curl -s 'localhost:8000/work?ms=50'
+<span class="o">{"worked_ms":50.0}</span>
+$ curl -s localhost:8000/metrics | grep http_requests_total
+<span class="o"># HELP http_requests_total Total HTTP requests
+# TYPE http_requests_total counter
+http_requests_total{path="/work",status="200"} 1.0</span></code></pre></li>
+        <li>Watch CPU while <code>/work</code> busy-loops: in terminal C run <code>top -p $PID</code>, and in B run <code>curl 'localhost:8000/work?ms=10000'</code>. <code>%CPU</code> should approach 100 and <code>S</code> should show <code>R</code> for about 10 s.</li>
+        <li>Try a request while the busy-loop runs: <code>curl -m 2 localhost:8000/health</code>. Write down what happens and explain it. (Hint: <code>/work</code> is a plain <code>def</code> endpoint, which FastAPI runs in a thread pool. Python's GIL means CPU-bound threads compete for one core. Does <code>/health</code> stay fast?)</li>
+      </ol>
+      <p><strong>Done when:</strong> you can name the PID, PPID, user, bind address, and effective env vars of the app, and explain each HTTP status you saw.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 2 — Binding (127.0.0.1 vs 0.0.0.0) and the wrong port</header><div class="body">
+      <p><strong>Goal:</strong> reproduce "works locally, refused from outside" on a single machine, then the wrong-port error.</p>
+      <ol class="steps">
+        <li>Find your machine's non-loopback IP: <code>hostname -I | awk '{print $1}'</code> (e.g. <code>192.168.1.20</code>; on macOS: <code>ipconfig getifaddr en0</code>). Store it: <code>IP=192.168.1.20</code>.</li>
+        <li>Start the app with the <strong>default</strong> host (no <code>--host</code>): <code>uvicorn app.main:app --port 8000</code>. Confirm with <code>ss -ltn 'sport = :8000'</code>. You should see <code>127.0.0.1:8000</code>.</li>
+        <li>Test both paths from the same machine:
+<pre><code>$ curl -sS localhost:8000/health
+<span class="o">{"status":"ok"}</span>
+$ curl -sS http://$IP:8000/health
+<span class="o">curl: (7) Failed to connect to 192.168.1.20 port 8000 after 0 ms: Couldn't connect to server</span></code></pre>
+          The second call uses the same machine, but the packet is addressed to the <code>eth0</code>/<code>wlan0</code> address, and nothing is bound there.</li>
+        <li>Restart with <code>--host 0.0.0.0</code>. Repeat both curls. Both should succeed, and <code>ss</code> now shows <code>0.0.0.0:8000</code>.</li>
+        <li>Wrong port: <code>curl -v localhost:8001/health</code>. Note "Connection refused" and how fast it fails.</li>
+        <li>Port collision: with the app still running, start a second copy on the same port in another terminal: <code>uvicorn app.main:app --port 8000</code>. Note the error (<code>[Errno 98] Address already in use</code> on Linux), then <code>echo $?</code>. It should print <code>1</code>. Find the owner with <code>ss -ltnp 'sport = :8000'</code>.</li>
+        <li>Timeout vs refused: <code>curl -sS --max-time 3 http://10.255.255.1:8000/</code>. Compare the error code (28) with step 5 (7).</li>
+      </ol>
+      <p><strong>Done when:</strong> you can predict, before running curl, whether a given (bind address, destination address) pair connects.</p>
+    </div></section>
+
+    <section class="lab"><header>Lab 3 — Signals, exit codes, and the PID 1 rule</header><div class="body">
+      <p><strong>Goal:</strong> see graceful shutdown, 143 and 137, and prove that PID 1 ignores signals it has no handler for.</p>
+      <ol class="steps">
+        <li><strong>Graceful SIGTERM with an in-flight request.</strong> Start the app (terminal A). In B, start a slow request: <code>curl 'localhost:8000/work?ms=5000'</code>. Within 5 s, in C: <code>kill -TERM $(pgrep -f 'uvicorn app.main:app')</code>. Observe in A:
+<pre><code><span class="o">INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [4321]</span></code></pre>
+          Does the curl in B still get <code>{"worked_ms":5000.0}</code>? Then run <code>echo $?</code> in A. Depending on your Uvicorn version you will see <code>0</code> or <code>143</code>, because newer versions re-raise the signal after cleanup. Either way the shutdown was graceful. Record which you got.</li>
+        <li><strong>A process without a handler.</strong>
+<pre><code>$ python3 -c 'import time; time.sleep(600)' &amp;
+$ kill -TERM $!; wait $!; echo "exit=$?"
+<span class="o">exit=143</span>
+$ python3 -c 'import time; time.sleep(600)' &amp;
+$ kill -KILL $!; wait $!; echo "exit=$?"
+<span class="o">exit=137</span></code></pre></li>
+        <li><strong>The PID 1 rule (the container problem, without a container).</strong> Terminal A:
+<pre><code>$ sudo unshare --pid --fork --mount-proc python3 -c 'import time; print("I am PID 1"); time.sleep(600)'</code></pre>
+          Terminal B:
+<pre><code>$ P=$(pgrep -f '^python3 -c import time'); echo $P   <span class="c"># host PID of that python</span>
+$ sudo kill -TERM $P            <span class="c"># nothing happens: PID 1 of its namespace has no SIGTERM handler</span>
+$ sleep 3; ps -p $P -o pid,stat,args   <span class="c"># still alive</span>
+$ sudo kill -KILL $P            <span class="c"># SIGKILL is always delivered from an ancestor namespace</span></code></pre>
+          Terminal A returns. Check <code>echo $?</code> there (expect a 128+9 style status). This is exactly why <code>docker stop</code> on a badly written image takes 10 s and ends in 137.</li>
+        <li><strong>Bad configuration → exit code 1.</strong> <code>READY_DELAY_SECONDS=ten uvicorn app.main:app; echo $?</code>. Find the <code>ValueError</code> in the traceback and the exit code <code>1</code>. Paste both into your notes as a "failure fingerprint".</li>
+        <li>Use the <a href="#exitw">exit-code decoder</a> to check each code you recorded.</li>
+      </ol>
+      <p><strong>Done when:</strong> you can explain, using the <code>pid_namespaces(7)</code> rule, why SIGTERM was ignored in step 3 but not in step 2.</p>
+    </div></section>
+
+    <!-- ============================================================ TROUBLESHOOTING -->
+    <h2>Troubleshooting quick reference</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Layer</th><th>Likely cause</th><th>Evidence to collect</th></tr>
+      <tr><td><code>curl: (6) Could not resolve host</code></td><td>DNS</td><td>Typo, missing search domain, resolver down</td><td><code>getent hosts NAME</code>, <code>dig NAME</code>, <code>/etc/resolv.conf</code></td></tr>
+      <tr><td><code>curl: (7)</code> refused</td><td>Transport</td><td>App not running, wrong port, bound to 127.0.0.1</td><td><code>pgrep -af uvicorn</code>, <code>ss -ltnp</code></td></tr>
+      <tr><td><code>curl: (28)</code> timeout</td><td>Network / app</td><td>Firewall, wrong IP, app hung or saturated</td><td><code>ss -ltn</code> Recv-Q, <code>top</code>, firewall rules</td></tr>
+      <tr><td>HTTP 503 from <code>/ready</code></td><td>Application</td><td>Still warming up (by design)</td><td>Compare uptime with <code>READY_DELAY_SECONDS</code></td></tr>
+      <tr><td>Process exits immediately, code 1</td><td>Application</td><td>Exception at import, bad env var, port in use</td><td>stderr traceback, <code>echo $?</code></td></tr>
+      <tr><td>Exit 127</td><td>Shell / PATH</td><td><code>uvicorn</code> not installed or venv not active</td><td><code>which uvicorn</code>, <code>echo $PATH</code></td></tr>
+      <tr><td>Exit 137</td><td>Kernel</td><td>OOM kill or SIGKILL after ignored SIGTERM</td><td><code>journalctl -k</code>, shutdown duration, memory limit</td></tr>
+      <tr><td><code>PermissionError [Errno 13]</code></td><td>Filesystem</td><td>Wrong owner/mode for the running UID</td><td><code>id</code>, <code>ls -ln</code>, <code>namei -l PATH</code></td></tr>
+      <tr><td>"No space left on device"</td><td>Disk</td><td>Full filesystem or inodes</td><td><code>df -h</code>, <code>df -i</code>, <code>du -sh</code></td></tr>
+    </table></div>
+
+    <!-- ============================================================ CHEAT SHEET -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Question</th><th>Command</th></tr>
+      <tr><td>Is it running? PID/PPID/user?</td><td><code>pgrep -af uvicorn</code> · <code>ps -o pid,ppid,user,stat,etime,args -p PID</code></td></tr>
+      <tr><td>What is it using?</td><td><code>top -p PID</code> · <code>cat /proc/PID/status</code></td></tr>
+      <tr><td>What env did it get?</td><td><code>tr '\0' '\n' &lt; /proc/PID/environ</code></td></tr>
+      <tr><td>Who listens on which address/port?</td><td><code>ss -ltnp</code> · <code>lsof -nP -iTCP -sTCP:LISTEN</code></td></tr>
+      <tr><td>Full HTTP conversation</td><td><code>curl -v URL</code> · status only: <code>curl -s -o /dev/null -w '%{http_code}\n' URL</code></td></tr>
+      <tr><td>Name resolution</td><td><code>getent hosts NAME</code> · <code>dig +short NAME</code> · <code>nslookup NAME</code></td></tr>
+      <tr><td>Disk / memory</td><td><code>df -h</code> · <code>du -sh DIR</code> · <code>free -h</code></td></tr>
+      <tr><td>Service and kernel logs</td><td><code>journalctl -u UNIT -f</code> · <code>journalctl -k</code></td></tr>
+      <tr><td>Stop politely / force</td><td><code>kill PID</code> (SIGTERM) · <code>kill -KILL PID</code></td></tr>
+      <tr><td>Last exit code</td><td><code>echo $?</code> (128+N ⇒ killed by signal N)</td></tr>
+      <tr><td>Permissions</td><td><code>id</code> · <code>ls -l</code> · <code>chmod 640 F</code> · <code>chown user:group F</code></td></tr>
+      <tr><td>Namespaces / cgroup of a process</td><td><code>ls -l /proc/PID/ns</code> · <code>cat /proc/PID/cgroup</code></td></tr>
+    </table></div>
+
+    <!-- ============================================================ GLOSSARY -->
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>Process / PID</dt><dd>A running program instance; the numeric ID the kernel assigns it.</dd>
+      <dt>PPID</dt><dd>Parent's PID. The parent collects the child's exit status.</dd>
+      <dt>PID 1 / init</dt><dd>First process of a PID namespace. It adopts orphans and only receives signals it has handlers for (except SIGKILL/SIGSTOP from an ancestor namespace).</dd>
+      <dt>Zombie</dt><dd>A process that exited but whose status was not yet collected by its parent.</dd>
+      <dt>Signal</dt><dd>Asynchronous notification to a process (SIGTERM = please stop, SIGKILL = stop now, uncatchable).</dd>
+      <dt>Grace period</dt><dd>Time between SIGTERM and SIGKILL (docker stop 10 s, Kubernetes default 30 s).</dd>
+      <dt>Exit code</dt><dd>0–255 status of a finished process; 128+N means terminated by signal N.</dd>
+      <dt>UID / GID</dt><dd>Numeric user / group identity of a process or file owner. UID 0 = root.</dd>
+      <dt>Mode bits</dt><dd>rwx for user, group, and others; written in octal (e.g. 755, 644).</dd>
+      <dt>Environment variable</dt><dd>NAME=value pair passed at exec time and inherited by children.</dd>
+      <dt>File descriptor</dt><dd>Integer handle to an open file or socket. 0/1/2 = stdin/stdout/stderr.</dd>
+      <dt>Port</dt><dd>16-bit number selecting a service on an IP address. Below 1024 is privileged.</dd>
+      <dt>Socket</dt><dd>Kernel endpoint for network I/O. Listening sockets accept, connected sockets carry data.</dd>
+      <dt>Bind address</dt><dd>Local IP a listening socket accepts on. 127.0.0.1 = loopback only, 0.0.0.0 = all interfaces.</dd>
+      <dt>Loopback (lo)</dt><dd>Virtual interface for traffic that never leaves the network stack (127.0.0.0/8).</dd>
+      <dt>DNS / TTL</dt><dd>Name → record lookup system; TTL is how long an answer may be cached.</dd>
+      <dt>Resolver</dt><dd>Stub resolver (in libc, reads resolv.conf) vs recursive resolver (does the lookup and caches).</dd>
+      <dt>HTTP status class</dt><dd>1xx info, 2xx success, 3xx redirect, 4xx client error, 5xx server error.</dd>
+      <dt>Namespace</dt><dd>Kernel feature giving a process its own view of a global resource (PIDs, network, mounts, …).</dd>
+      <dt>cgroup</dt><dd>Kernel feature grouping processes to limit and account for CPU, memory, and more.</dd>
+      <dt>OOM killer</dt><dd>Kernel mechanism that SIGKILLs a process when memory (global or a cgroup's limit) runs out.</dd>
+    </dl>
+
+    <!-- ============================================================ SELF-CHECK -->
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. What is the difference between SIGTERM and SIGKILL, and which one does a well-behaved orchestrator send first?</summary><div class="a">SIGTERM (15) can be caught. The app can finish in-flight work and clean up. SIGKILL (9) cannot be caught, blocked, or ignored, and the kernel ends the process immediately. Orchestrators send SIGTERM first, wait a grace period, then SIGKILL.</div></details>
+    <details class="q"><summary>2. A container shows exit code 143. What happened?</summary><div class="a">143 = 128 + 15: the main process was terminated by SIGTERM (it had a handler that re-raised the signal after cleanup, or it was not PID 1 and took the default action). Usually this is a normal stop (<code>docker stop</code>, rolling update), not a crash.</div></details>
+    <details class="q"><summary>3. Why does Uvicorn's default <code>--host 127.0.0.1</code> break the app in a container even though it works on your laptop?</summary><div class="a">In a container, 127.0.0.1 is the container's own loopback. Traffic forwarded by Docker (<code>-p</code>) or Kubernetes arrives on the container's <code>eth0</code> IP, where nothing is listening, so the connection is refused or reset. Bind to <code>0.0.0.0</code>.</div></details>
+    <details class="q"><summary>4. "Connection refused" vs "Connection timed out": which layer does each point to?</summary><div class="a">Refused: the host was reached and replied with a TCP RST because nothing listens on that address:port (app down, wrong port, wrong bind). Timeout: no reply at all. Packets were dropped (firewall, wrong IP, no route) or the server is too overloaded to complete the handshake.</div></details>
+    <details class="q"><summary>5. <code>dig api.internal</code> returns an IP but the app gets "Name or service not known". Name two reasons.</summary><div class="a">(a) The app resolves through nsswitch and <code>/etc/resolv.conf</code> with different nameservers or search domains than the server you queried with dig. (b) The app runs in a different network namespace (a container) with its own resolv.conf. Compare with <code>getent hosts</code> run in the same environment as the app.</div></details>
+    <details class="q"><summary>6. Your app is OOM-killed. Does its SIGTERM handler run? Does it log anything?</summary><div class="a">No. The OOM killer sends SIGKILL, so no handler runs and buffered logs may be lost. Evidence comes from outside: exit code 137, <code>OOMKilled</code> status, kernel log.</div></details>
+    <details class="q"><summary>7. Why is it better to log to stdout/stderr than to <code>/var/log/app.log</code> in a container?</summary><div class="a">The runtime captures stdout and stderr (<code>docker logs</code>, <code>kubectl logs</code>, log shippers). Files inside the container are invisible to those tools, fill the writable layer, and vanish when the container is replaced.</div></details>
+    <details class="q"><summary>8. What permission does a directory need for a process to open a file inside it?</summary><div class="a">Execute (<code>x</code>, "search/traverse") on that directory and every parent directory, for the class (user/group/other) that applies to the process.</div></details>
+    <details class="q"><summary>9. Why does <code>/ready</code> return 503 and not 500 during warm-up?</summary><div class="a">503 Service Unavailable means a temporary condition: try later or elsewhere. Probes and load balancers treat any status outside 200–399 as failure, so both would remove the Pod from rotation, but 503 keeps dashboards and SLOs honest: it is "not ready", not "broken".</div></details>
+    <details class="q"><summary>10. In one sentence each: what do namespaces and cgroups contribute to a container?</summary><div class="a">Namespaces control what the process can see (its own PIDs, network stack, hostname, mounts). Cgroups control what it can use (CPU time, memory), and exceeding the memory limit leads to an OOM kill.</div></details>
+    <details class="q"><summary>11. You set <code>export LOG_LEVEL=debug</code> in terminal B, but the app started in terminal A still logs at INFO. Why?</summary><div class="a">Environment variables are copied into a process at exec time from <em>its</em> parent. Terminal B's shell is not the app's parent, and even a parent's later changes do not reach an already-running child. Restart the app with the variable set.</div></details>
+
+    <!-- ============================================================ SOURCES -->
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://man7.org/linux/man-pages/man7/signal.7.html">signal(7) — signal numbers, default actions, SIGKILL/SIGSTOP cannot be caught — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man7/pid_namespaces.7.html">pid_namespaces(7) — the namespace init process and its signal rules — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man7/namespaces.7.html">namespaces(7) — namespace types table — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man7/cgroups.7.html">cgroups(7) — terminology — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man1/bash.1.html">bash(1) — EXIT STATUS (128+N, 126, 127) — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man1/ps.1.html">ps(1) — PROCESS STATE CODES — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man7/environ.7.html">environ(7) — environment inheritance — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man7/credentials.7.html">credentials(7) — process user and group identifiers — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man7/ip.7.html">ip(7) — INADDR_ANY, privileged ports — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man8/ss.8.html">ss(8) — socket statistics options — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man5/resolv.conf.5.html">resolv.conf(5) — nameserver and search options — man7.org</a></li>
+      <li><a href="https://man7.org/linux/man-pages/man1/curl.1.html">curl(1) — exit codes 6, 7, 28, 52, 56 — man7.org</a></li>
+      <li><a href="https://www.rfc-editor.org/rfc/rfc9110.html">RFC 9110 — HTTP Semantics, §15 status codes — rfc-editor.org</a></li>
+      <li><a href="https://www.rfc-editor.org/rfc/rfc1034.html">RFC 1034 — Domain Names: Concepts and Facilities — rfc-editor.org</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/">Pod Lifecycle — termination flow, default 30 s grace period, TERM to process 1 — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/">Liveness, Readiness, and Startup Probes — HTTP probe success is 200–399 — kubernetes.io</a></li>
+      <li><a href="https://docs.docker.com/reference/cli/docker/container/stop/">docker container stop — SIGTERM then SIGKILL after 10 s — docs.docker.com</a></li>
+      <li><a href="https://docs.docker.com/engine/containers/run/">Running containers — exit status 125/126/127 — docs.docker.com</a></li>
+      <li><a href="https://uvicorn.dev/settings/">Uvicorn settings — --host default 127.0.0.1, --port 8000, --timeout-graceful-shutdown — uvicorn.dev (official Uvicorn docs)</a></li>
+      <li><a href="https://github.com/encode/uvicorn/blob/master/uvicorn/server.py">Uvicorn source, server.py — handled signals SIGINT/SIGTERM and re-raise after shutdown — github.com/encode/uvicorn</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="index.html"><small>◀ Previous</small>Syllabus &amp; roadmap</a>
+      <a class="next" href="02-docker.html"><small>Next ▶</small>Module 02 · Docker &amp; Containers</a>
+    </nav>
+  </article></main>
+</div>
+
+<script>
+(function () {
+  /* ---------- Exit-code decoder ---------- */
+  var SIG = {1:"SIGHUP (hang-up / terminal closed)",2:"SIGINT (Ctrl+C)",3:"SIGQUIT (Ctrl+\\)",4:"SIGILL (illegal instruction)",6:"SIGABRT (abort(), e.g. failed assertion in C code)",7:"SIGBUS (bus error)",8:"SIGFPE (arithmetic error)",9:"SIGKILL (uncatchable kill)",11:"SIGSEGV (segmentation fault: invalid memory access)",13:"SIGPIPE (wrote to a closed pipe/socket)",14:"SIGALRM (timer)",15:"SIGTERM (polite termination request)"};
+  function decode(code, ctx) {
+    var lines = [];
+    if (isNaN(code)) return "Enter a number.";
+    if (code < 0) {
+      lines.push(code + " is negative. Python's subprocess reports 'killed by signal N' as returncode -N.");
+      var n0 = -code;
+      lines.push("Signal " + n0 + ": " + (SIG[n0] || "see `kill -l`") + ". A shell would show " + (128 + n0) + ".");
+      return lines.join("\n");
+    }
+    if (code > 255) {
+      lines.push(code + " cannot be an exit status: only the low 8 bits survive, so it shows as " + (code % 256) + ".");
+      code = code % 256;
+    }
+    if (code === 0) lines.push("0 = success. For a server, this usually means a clean, requested shutdown (it handled SIGTERM/SIGINT and exited).");
+    else if (code === 1) lines.push("1 = generic failure chosen by the program. For reliability-api: unhandled exception (bad env value such as READY_DELAY_SECONDS=ten, import error, port already in use). Read stderr / logs.");
+    else if (code === 2) lines.push("2 = conventional 'misuse / bad arguments' (e.g. an unknown Uvicorn CLI option).");
+    else if (code === 125) lines.push(ctx === "docker" ? "125 (docker run) = the error is with the Docker daemon itself: bad flag, port already allocated, invalid image reference. Your app never started." : "125 has no standard meaning in a shell; in Docker it means the daemon failed before starting the container.");
+    else if (code === 126) lines.push("126 = command found but cannot be invoked: missing execute permission, or not an executable (check chmod +x and the shebang).");
+    else if (code === 127) lines.push("127 = command not found: wrong path, venv not on PATH, binary not copied into the image, or a typo in CMD/ENTRYPOINT.");
+    else if (code > 128 && code <= 128 + 64) {
+      var n = code - 128;
+      lines.push(code + " = 128 + " + n + " → terminated by signal " + n + ": " + (SIG[n] || "see `kill -l` on your system") + ".");
+      if (n === 9) {
+        lines.push("SIGKILL cannot be caught, so no cleanup ran. Two common causes:");
+        lines.push("  • Out-of-memory kill (memory limit hit). Evidence: docker inspect → State.OOMKilled=true; Kubernetes → Reason: OOMKilled; kernel log 'Out of memory'.");
+        lines.push("  • SIGTERM was ignored until the grace period ended (docker stop 10 s, K8s 30 s). Evidence: stop took exactly the grace period; PID 1 was a shell or had no handler.");
+      }
+      if (n === 15) lines.push("SIGTERM: a normal stop request (docker stop, rolling update, kill). If the app handled it and re-raised, this can still be a graceful shutdown.");
+      if (n === 2) lines.push("SIGINT: someone pressed Ctrl+C.");
+      if (n === 11) lines.push("Segfault: a crash in native code (C extension, interpreter bug, corrupted memory).");
+    } else lines.push(code + " is an application-defined code. Check the program's documentation and its last log lines.");
+    if (ctx === "k8s") lines.push("\nKubernetes: see `kubectl describe pod` → Last State: Terminated, Reason (Error / OOMKilled / Completed) and Exit Code. Repeated non-zero exits lead to CrashLoopBackOff (Module 04).");
+    if (ctx === "docker" && code !== 125) lines.push("\nDocker: `docker ps -a` shows Exited (" + code + "); `docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}}' NAME` gives the code and OOM flag.");
+    return lines.join("\n");
+  }
+  var ein = document.getElementById("exit-in"), ectx = document.getElementById("exit-ctx"), eout = document.getElementById("exit-out");
+  function runExit() { eout.textContent = decode(parseInt(ein.value, 10), ectx.value); }
+  document.getElementById("exit-go").addEventListener("click", runExit);
+  ectx.addEventListener("change", runExit);
+  ein.addEventListener("keydown", function (e) { if (e.key === "Enter") runExit(); });
+  document.querySelectorAll("#exitw [data-code]").forEach(function (b) {
+    b.addEventListener("click", function () { ein.value = b.getAttribute("data-code"); runExit(); });
+  });
+  runExit();
+
+  /* ---------- Binding explorer ---------- */
+  var bw = document.getElementById("b-where"), bb = document.getElementById("b-bind"), bc = document.getElementById("b-client"), bo = document.getElementById("b-out");
+  function bind() {
+    var where = bw.value, b = bb.value, c = bc.value, ok, why;
+    var insideOpt = bc.querySelector('option[value="inside"]');
+    insideOpt.disabled = (where !== "ctr");
+    if (where !== "ctr" && c === "inside") { bc.value = c = "same-lo"; }
+    if (where === "host") {
+      if (b === "127.0.0.1") {
+        ok = (c === "same-lo");
+        why = ok ? "The packet goes to 127.0.0.1 over the loopback interface, which matches the bind address."
+                 : "The packet is addressed to " + (c === "same-lan" ? "192.168.1.20 (even though it comes from the same machine)" : "the host's LAN IP from another machine") + ". Nothing is bound to that address, so the kernel replies with RST: connection refused (curl exit 7).";
+      } else if (b === "0.0.0.0") {
+        ok = true;
+        why = "0.0.0.0 (INADDR_ANY) accepts on all local interfaces: loopback and LAN. (A host firewall could still drop LAN traffic, which would show as a timeout, not a refusal.)";
+      } else {
+        ok = (c !== "same-lo");
+        why = ok ? "The destination 192.168.1.20 matches the bind address exactly."
+                 : "Bound only to 192.168.1.20, so a connection to 127.0.0.1 has no listener on loopback: refused.";
+      }
+    } else {
+      if (c === "inside") {
+        ok = (b !== "lan");
+        why = ok ? "docker exec runs curl inside the container's network namespace; localhost there is the container's loopback, which " + (b === "0.0.0.0" ? "0.0.0.0 includes." : "matches 127.0.0.1.")
+                 : "The container does not own 192.168.1.20; Uvicorn would fail to start with 'Cannot assign requested address' (exit 1).";
+      } else if (b === "lan") {
+        ok = false;
+        why = "192.168.1.20 is the HOST's address. Inside the container's network namespace that IP does not exist, so bind() fails ('Cannot assign requested address') and the container exits with code 1.";
+      } else if (b === "127.0.0.1") {
+        ok = false;
+        why = "Docker forwards host port 8000 to the container's eth0 address (e.g. 172.17.0.2:8000). Uvicorn listens only on the container's own 127.0.0.1, so the forwarded connection finds no listener. curl usually reports 'connection reset' or 'empty reply' (exit 56/52) instead of a clean refusal. Fix: --host 0.0.0.0. This is the #1 'works inside, not outside' bug.";
+      } else {
+        ok = true;
+        why = "Docker publishes host port 8000 (on all host addresses by default, so both 127.0.0.1 and the LAN IP work) and forwards to the container's eth0:8000, where 0.0.0.0 accepts. To restrict to your laptop only, publish with -p 127.0.0.1:8000:8000.";
+      }
+    }
+    bo.textContent = (ok ? "✔ CONNECTS (HTTP 200 from /health)\n\n" : "✘ FAILS\n\n") + why;
+  }
+  [bw, bb, bc].forEach(function (el) { el.addEventListener("change", bind); });
+  bind();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<!--
+  AUTHORING TEMPLATE — copy this structure for every module page.
+
+  RULES
+  1. Link ONLY assets/style.css and assets/notes.js. No external CDNs, no fonts, no frameworks. Pages must work offline from file://.
+  2. Diagrams = inline <svg> inside <figure class="diagram">. Use ONLY the helper classes (box, box2, box3, box4, zone, line, line dash,
+     line accent, line ok, line bad, t-muted, t-bold, t-mono, dot-ok, dot-bad, dot-warn, dot-accent) — never hard-coded colours —
+     so diagrams work in light and dark theme. Give every svg a viewBox and role="img" + aria-label. Arrowheads: define a <marker>
+     with fill="currentColor" style="color:var(--d-stroke)" or use class on a path.
+  3. Interactive widgets: <div class="widget">…</div> with small inline <script> at the end of the page. Plain JS, no libraries.
+     Step-through diagrams: <div class="widget stepper" data-steps='[{"title":"…","html":"…"}]'> containing an <svg> whose elements carry
+     data-step="0,1,2" (indexes of steps where they are highlighted), a <div class="stage"></div>, and
+     <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>.
+     notes.js wires it automatically.
+  4. Callouts: <div class="callout note|tip|warn|danger|example"><span class="label">…</span>…</div>
+  5. Labs: <section class="lab"><header>Lab N — title</header><div class="body"> … <ol class="steps">…</ol> … expected output … </div></section>
+  6. Self-check: <details class="q"><summary>Question</summary><div class="a">Answer</div></details>
+  7. Every factual section ends with (or the page has a final) "Sources" list linking the exact OFFICIAL doc page used.
+     Official = kubernetes.io, docs.docker.com, kind.sigs.k8s.io, helm.sh, prometheus.io, grafana.com/docs, docs.github.com,
+     developer.hashicorp.com, cloud.google.com / docs.cloud.google.com, kserve.github.io, k6/grafana docs, locust.io docs,
+     man7.org (Linux man pages), RFCs (rfc-editor.org), fastapi.tiangolo.com, prometheus client_python docs, opentelemetry.io, sre.google.
+  8. Keep the running example consistent (see RUNNING EXAMPLE below). Every concept is shown applied to reliability-api.
+  9. Never present an expected output as an observed one. Label sample outputs "Example output (yours will differ in names/IDs/timings)".
+ 10. Topbar crumb = "Module NN · Title". Pager links to previous/next module files (names in SYLLABUS).
+
+  SYLLABUS (file names)
+  index.html                              Syllabus, roadmap, progress tracker
+  01-linux-networking.html                Linux processes, signals, users/perms, env, exit codes, TCP/IP, ports, DNS, HTTP, binding, diagnostic commands
+  02-docker.html                          Images, containers, layers, Dockerfile, multi-stage, non-root, .dockerignore, ports, volumes, networks, tags/digests, registries, signals/PID1, healthcheck, compose (brief)
+  03-kubernetes-architecture.html         Why orchestration, control plane/nodes components, API & objects, declarative model & reconciliation, kubectl, namespaces, labels/selectors, Pods, ReplicaSet, Deployment
+  04-kubernetes-workloads.html            Probes (liveness/readiness/startup), requests/limits, QoS classes, OOMKill/throttling, scheduling basics (taints/tolerations/affinity brief), rolling updates, rollout/rollback, PodDisruptionBudget, graceful termination, Jobs/CronJobs, DaemonSet/StatefulSet overview
+  05-kubernetes-networking-config.html    Pod networking model, Services (ClusterIP/NodePort/LoadBalancer/headless), EndpointSlices, DNS, port-forward, Ingress & Gateway API, NetworkPolicy, ConfigMap, Secret, volumes/PV/PVC/StorageClass, ServiceAccount, RBAC
+  06-kind-helm.html                       kind (install, cluster config, multi-node, loading images, port mappings, limits) and Helm (charts, templates, values, releases, install/upgrade/rollback, lint/template, chart structure)
+  07-observability.html                   Monitoring vs observability, metrics/logs/traces, Prometheus architecture, data model, metric types, scraping, PromQL, instrumenting FastAPI, kube-prometheus-stack/ServiceMonitor, Grafana dashboards, alerting & Alertmanager, SLI/SLO/SLA, error budgets, RED/USE/golden signals
+  08-scaling-load-failure.html            metrics-server & resource metrics API, HPA algorithm & behavior, VPA, cluster autoscaler, load testing concepts (closed/open model, percentiles), k6/Locust, failure testing, measuring recovery, chaos tools overview
+  09-cicd-github-actions.html             CI/CD concepts, workflow syntax (events/jobs/steps/runners), actions, secrets & GITHUB_TOKEN permissions, caching, matrix, building/pushing images to GHCR, image scanning, kind in CI, environments/gates
+  10-terraform.html                       IaC, HCL, providers, resources, data sources, variables/outputs/locals, state & backends & locking, plan/apply/destroy, modules, workflow & safety
+  11-gke-cloud.html                       GCP basics (projects, IAM, VPC, regions/zones), GKE architecture, Autopilot vs Standard, node pools, Artifact Registry, Workload Identity Federation, load balancing, cost controls & cleanup, Terraform for GKE
+  12-ai-inference.html                    Model-serving concepts, inference metrics (TTFT, ITL, tokens/s, throughput, queueing), batching, CPU vs GPU scheduling on K8s (device plugins), KServe, vLLM, benchmarking (AIPerf), scaling inference
+  13-troubleshooting-capstone.html        Troubleshooting method & playbook, capstone project plan (milestones, evidence, checklist), interview prep
+
+  RUNNING EXAMPLE (use these exact names everywhere)
+  - App: "reliability-api", Python 3.12 + FastAPI + Uvicorn, listens on 0.0.0.0:8000
+  - Endpoints: GET /health (liveness: process alive), GET /ready (readiness: can serve traffic), GET /work?ms=50 (CPU-bound busy loop for ~ms, used for load), GET /metrics (Prometheus)
+  - Env vars: APP_MODE (default "normal"), LOG_LEVEL (default "info"), READY_DELAY_SECONDS (simulated warm-up)
+  - Image: reliability-api:0.1.0 (local), ghcr.io/<you>/reliability-api:<git-sha> (CI)
+  - kind cluster: reliability-lab ; namespace: reliability-lab
+  - K8s objects: Deployment/reliability-api (2 replicas, label app.kubernetes.io/name: reliability-api), Service/reliability-api (ClusterIP, port 80 -> targetPort 8000),
+    ConfigMap/reliability-api-config, HPA/reliability-api (min 2, max 6, CPU 60%)
+  - Resources per container: requests cpu 100m / memory 128Mi ; limits memory 256Mi (cpu limit discussed as a trade-off)
+  - Helm chart: charts/reliability-api ; release name: reliability-api
+  - Monitoring: kube-prometheus-stack release "monitoring" in namespace "monitoring"
+  - Repo: kubernetes-reliability-lab/ (layout from the study guide)
+
+  Canonical app code (app/main.py) — reuse verbatim when showing the app:
+  ----------------------------------------------------------------------
+  import os, time, logging
+  from fastapi import FastAPI, Response
+  from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+  LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
+  READY_DELAY = float(os.getenv("READY_DELAY_SECONDS", "0"))
+  logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+  log = logging.getLogger("reliability-api")
+
+  REQUESTS = Counter("http_requests_total", "Total HTTP requests", ["path", "status"])
+  LATENCY = Histogram("http_request_duration_seconds", "Request latency", ["path"])
+
+  app = FastAPI()
+  STARTED = time.monotonic()
+
+  @app.get("/health")
+  def health():
+      return {"status": "ok"}
+
+  @app.get("/ready")
+  def ready(response: Response):
+      if time.monotonic() - STARTED < READY_DELAY:
+          response.status_code = 503
+          return {"ready": False}
+      return {"ready": True}
+
+  @app.get("/work")
+  def work(ms: int = 50):
+      start = time.perf_counter()
+      while (time.perf_counter() - start) * 1000 < ms:
+          pass                                   # burn CPU deliberately
+      elapsed = time.perf_counter() - start
+      LATENCY.labels("/work").observe(elapsed)
+      REQUESTS.labels("/work", "200").inc()
+      return {"worked_ms": round(elapsed * 1000, 1)}
+
+  @app.get("/metrics")
+  def metrics():
+      return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+  ----------------------------------------------------------------------
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module NN · Title — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/anim.css">
+<script src="assets/notes.js"></script>
+<script src="assets/anim.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module NN · Title</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="NN"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module NN · Title</h1>
+    <p class="lede">One-paragraph summary of what this module teaches and why it matters for reliability-api.</p>
+    <div class="meta"><span class="pill accent">Prereq: Module NN-1</span><span class="pill">≈ X h study + Y h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+
+    <h2>Learning objectives</h2>
+    <ul><li>…</li></ul>
+
+    <!-- concept sections: h2 per concept, h3 for sub-concepts.
+         Each concept: definition → problem it solves → diagram → how it works → reliability-api example → failure cases → trade-offs → self-check -->
+
+    <h2>Cheat sheet</h2>
+    <h2>Self-check</h2>
+    <h2>Sources</h2>
+    <ul class="sources"><li><a href="https://…">Title — site</a></li></ul>
+
+    <nav class="pager">
+      <a class="prev" href="NN-1.html"><small>◀ Previous</small>Module NN-1 · …</a>
+      <a class="next" href="NN+1.html"><small>Next ▶</small>Module NN+1 · …</a>
+    </nav>
+  </article></main>
+</div>
+</body>
+</html>

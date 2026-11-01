@@ -1,0 +1,1323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 11 · Google Cloud &amp; GKE — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/anim.css">
+<script src="assets/notes.js"></script>
+<script src="assets/anim.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 11 · Google Cloud &amp; GKE</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="11"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 11 · Google Cloud &amp; GKE</h1>
+    <p class="lede">Until now reliability-api has lived in a kind cluster on your laptop, where mistakes cost nothing. This module moves the same image, Helm chart and observability workflow onto Google Kubernetes Engine (GKE). You will learn the Google Cloud building blocks the cluster depends on (projects, billing, IAM, regions, VPC), how GKE splits work between Google and you (Autopilot vs Standard), how images and identities flow without long-lived keys (Artifact Registry, Workload Identity Federation), how traffic reaches the app, and — most importantly — how to keep a learning cluster from turning into a surprise bill.</p>
+    <div class="meta"><span class="pill accent">Prereq: Module 10 · Terraform</span><span class="pill">≈ 5 h study + 4 h lab</span><span class="verified">✓ Checked against official docs, 29 Oct 2026</span></div>
+    <section class="explainer" id="explainer-video"><header>🎬 Animated explainer <span class="pill accent">GKE & keyless identity</span></header><video controls preload="metadata" playsinline poster="videos/m11.jpg" src="videos/m11.mp4"></video><div class="ex-foot"><strong>Watch first, then read.</strong> Managed control plane, Autopilot vs Standard, Workload Identity Federation and what still costs money. Rendered with Manim Community (MIT); source: <code>video-src/</code>. Facts match this page's verified sections.</div></section>
+
+
+    <div class="callout danger"><span class="label">This module costs real money</span>
+      <p>Everything before this module ran locally for free. GKE, load balancers, disks, logs and registries are billed. Read the <a href="#s-cost">cost controls</a> section <em>before</em> the labs, create a budget alert first, and finish every lab with the cleanup and verification steps. Prices in this page were read from the official pricing page on <strong>29 October 2026</strong>; they change, so re-check the current pricing page before you run anything.</p>
+    </div>
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Explain the Google Cloud resource hierarchy (organization → folders → projects → resources), how billing accounts attach to projects, and why APIs must be enabled per project.</li>
+      <li>Read and write IAM bindings: principals, roles (basic, predefined, custom), allow policies, inheritance, service accounts and least privilege.</li>
+      <li>Choose regions/zones and explain zonal vs regional GKE clusters and release channels.</li>
+      <li>Describe a VPC-native cluster: subnet primary range for nodes, secondary ranges for Pods and Services, firewall rules.</li>
+      <li>Draw GKE's architecture (Google-managed control plane, nodes, node pools) and compare Autopilot with Standard, including the billing model.</li>
+      <li>Push <code>reliability-api</code> to Artifact Registry and deploy the Helm chart to an Autopilot cluster with <code>gcloud</code>.</li>
+      <li>Explain Workload Identity Federation for GKE (Pods → Google APIs) and for GitHub Actions (OIDC → no JSON keys).</li>
+      <li>Choose between a <code>LoadBalancer</code> Service and Gateway/Ingress, and know what each costs.</li>
+      <li>Use Cloud Logging/Monitoring and Managed Service for Prometheus at a basic level.</li>
+      <li>Apply cost controls: budgets and alerts, labels, a cost-risk checklist, and a cleanup procedure you verify.</li>
+      <li>Provision an Autopilot cluster with Terraform (<code>google_container_cluster</code>, <code>enable_autopilot</code>) and destroy it safely.</li>
+    </ul>
+
+    <h2>Where this module fits: kind → GKE mapping</h2>
+    <p>A good mental model is that <strong>almost nothing about your application changes</strong>. The same container image, the same Deployment, Service, probes, requests and HPA work on GKE because GKE is conformant Kubernetes. What changes is everything <em>around</em> the cluster: who runs the control plane, where nodes come from, how images are stored, how identities are proven, how traffic enters, and who pays.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Concern</th><th>Local (Modules 06–10)</th><th>Google Cloud (this module)</th></tr></thead>
+      <tbody>
+        <tr><td>Cluster</td><td>kind cluster <code>reliability-lab</code> (Docker containers as nodes)</td><td>GKE Autopilot cluster <code>reliability-lab</code> (Google-managed control plane + nodes)</td></tr>
+        <tr><td>Image storage</td><td><code>kind load docker-image</code>, or GHCR from CI</td><td>Artifact Registry: <code>REGION-docker.pkg.dev/PROJECT/reliability/reliability-api:&lt;git-sha&gt;</code></td></tr>
+        <tr><td>Identity</td><td>your local kubeconfig, no cloud identity</td><td>Google Account / service accounts, IAM roles, Workload Identity Federation</td></tr>
+        <tr><td>Traffic in</td><td><code>kubectl port-forward</code> or kind port mappings</td><td>port-forward (free), <code>LoadBalancer</code> Service or Gateway (billed load balancer)</td></tr>
+        <tr><td>Metrics</td><td>kube-prometheus-stack release <code>monitoring</code></td><td>Cloud Monitoring + Managed Service for Prometheus (or your own stack)</td></tr>
+        <tr><td>Infrastructure as code</td><td>Terraform basics (Module 10)</td><td>Terraform <code>google</code> provider, <code>google_container_cluster</code></td></tr>
+        <tr><td>Cost</td><td>your laptop's electricity</td><td>cluster fee, Pod resources, disks, load balancers, logs, egress, storage</td></tr>
+      </tbody>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2 id="s-hierarchy">Google Cloud resource hierarchy, billing and APIs</h2>
+    <p><strong>Definition.</strong> Every Google Cloud resource (a GKE cluster, a disk, a bucket, an Artifact Registry repository) belongs to exactly one <strong>project</strong>. Projects can be grouped under <strong>folders</strong>, and folders sit under an <strong>organization</strong> node (which exists if you use Google Workspace or Cloud Identity; a personal account usually has projects with no organization). The official docs describe four tiers: organization, folders, projects, and service resources.</p>
+    <p><strong>Problem it solves.</strong> Without a hierarchy you could not answer three basic operational questions: <em>who may touch this?</em> (IAM is attached to nodes of the tree and inherited downward), <em>who pays for this?</em> (a project is linked to one billing account), and <em>how do I delete everything from this experiment?</em> (shutting down a project removes the resources inside it).</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 360" role="img" aria-label="Resource hierarchy: organization, folders, projects, resources, with a billing account linked to projects">
+        <defs><marker id="m11a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="250" y="16" width="220" height="44" rx="8"/>
+        <text x="360" y="36" text-anchor="middle" class="t-bold">Organization</text>
+        <text x="360" y="52" text-anchor="middle" class="t-muted">example.com (optional)</text>
+        <rect class="box" x="90" y="100" width="200" height="44" rx="8"/>
+        <text x="190" y="120" text-anchor="middle" class="t-bold">Folder: learning</text>
+        <text x="190" y="136" text-anchor="middle" class="t-muted">IAM set here is inherited</text>
+        <rect class="box" x="430" y="100" width="200" height="44" rx="8"/>
+        <text x="530" y="120" text-anchor="middle" class="t-bold">Folder: production</text>
+        <text x="530" y="136" text-anchor="middle" class="t-muted">stricter policies</text>
+        <line class="line" x1="330" y1="60" x2="200" y2="100" marker-end="url(#m11a)"/>
+        <line class="line" x1="390" y1="60" x2="520" y2="100" marker-end="url(#m11a)"/>
+        <rect class="box4" x="40" y="186" width="300" height="56" rx="8"/>
+        <text x="190" y="208" text-anchor="middle" class="t-bold">Project: reliability-lab-1234</text>
+        <text x="190" y="228" text-anchor="middle" class="t-muted">ID immutable · number auto · name editable</text>
+        <rect class="box" x="430" y="186" width="200" height="56" rx="8"/>
+        <text x="530" y="210" text-anchor="middle" class="t-bold">Project: prod-api</text>
+        <text x="530" y="228" text-anchor="middle" class="t-muted">not used in this course</text>
+        <line class="line" x1="190" y1="144" x2="190" y2="186" marker-end="url(#m11a)"/>
+        <line class="line" x1="530" y1="144" x2="530" y2="186" marker-end="url(#m11a)"/>
+        <rect class="box3" x="20" y="286" width="110" height="50" rx="6"/>
+        <text x="75" y="308" text-anchor="middle">GKE cluster</text>
+        <text x="75" y="324" text-anchor="middle" class="t-muted">reliability-lab</text>
+        <rect class="box3" x="140" y="286" width="110" height="50" rx="6"/>
+        <text x="195" y="308" text-anchor="middle">AR repo</text>
+        <text x="195" y="324" text-anchor="middle" class="t-muted">reliability</text>
+        <rect class="box3" x="260" y="286" width="110" height="50" rx="6"/>
+        <text x="315" y="308" text-anchor="middle">GCS bucket</text>
+        <text x="315" y="324" text-anchor="middle" class="t-muted">tf state</text>
+        <line class="line" x1="120" y1="242" x2="75" y2="286" marker-end="url(#m11a)"/>
+        <line class="line" x1="190" y1="242" x2="195" y2="286" marker-end="url(#m11a)"/>
+        <line class="line" x1="260" y1="242" x2="315" y2="286" marker-end="url(#m11a)"/>
+        <rect class="box2" x="660" y="186" width="145" height="56" rx="8"/>
+        <text x="732" y="208" text-anchor="middle" class="t-bold">Billing account</text>
+        <text x="732" y="228" text-anchor="middle" class="t-muted">pays for projects</text>
+        <line class="line dash accent" x1="660" y1="214" x2="630" y2="214"/>
+        <path class="line dash accent" d="M732,242 L732,270 L190,270 L190,242"/>
+        <text x="460" y="286" text-anchor="middle" class="t-muted">billing link (one billing account per project)</text>
+        <text x="580" y="316" class="t-muted">IAM allow policies flow DOWN:</text>
+        <text x="580" y="334" class="t-muted">effective = own + ancestors</text>
+      </svg>
+      <figcaption>Figure 11.1 — The resource hierarchy. Solid arrows are parent/child (policy inheritance). The dashed link is billing: a project is linked to one billing account, which can pay for many projects.</figcaption>
+    </figure>
+
+    <h3>How it works, step by step</h3>
+    <ol>
+      <li><strong>Create a project.</strong> You pick a globally unique <em>project ID</em> (e.g. <code>reliability-lab-1234</code>), which can never be changed. Google assigns a numeric <em>project number</em>. The display <em>name</em> is just a label you can edit. Most <code>gcloud</code> commands take the ID; some identity strings (Workload Identity principals) use the number.</li>
+      <li><strong>Link a billing account.</strong> Until a project is linked to an active billing account, billable APIs such as GKE cannot be used. The billing account is a separate resource with its own IAM (Billing Account Administrator/User).</li>
+      <li><strong>Enable APIs.</strong> Each Google Cloud service is an API that must be <em>enabled per project</em> before use: for this module, <code>container.googleapis.com</code> (GKE), <code>artifactregistry.googleapis.com</code>, and later <code>iam.googleapis.com</code>, <code>iamcredentials.googleapis.com</code>, <code>sts.googleapis.com</code> for federation. Enabling an API is free; using it may not be.</li>
+      <li><strong>Create resources inside the project.</strong> They inherit IAM from the project, folder and organization.</li>
+      <li><strong>Delete.</strong> Deleting individual resources stops their charges. Shutting down the whole project is the strongest cleanup (it schedules everything inside for deletion), which is why we use a <em>dedicated project per lab</em>.</li>
+    </ol>
+
+    <div class="callout example"><span class="label">Applied to reliability-api</span>
+      <p>Create one project just for this course, e.g. <code>reliability-lab-&lt;random4&gt;</code>. Put the GKE cluster, the Artifact Registry repository <code>reliability</code>, and (in the Terraform lab) the state bucket inside it. Label everything <code>app=reliability-api</code>, <code>env=lab</code>, <code>owner=&lt;you&gt;</code>. When the course ends, deleting this single project is your final safety net.</p>
+    </div>
+
+    <h3>Failure cases and how to diagnose them</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Symptom</th><th>Likely cause</th><th>Check / fix</th></tr></thead>
+      <tbody>
+        <tr><td>Error mentions <code>SERVICE_DISABLED</code> or "API has not been used in project … or it is disabled"</td><td>API not enabled in this project</td><td><code>gcloud services list --enabled</code>; <code>gcloud services enable container.googleapis.com</code></td></tr>
+        <tr><td>"Billing account for project … is not found" / billing disabled</td><td>project not linked to an active billing account</td><td><code>gcloud billing projects describe PROJECT_ID</code>; link in console (Billing → Account management)</td></tr>
+        <tr><td>Commands act on the wrong project</td><td>gcloud default project points elsewhere</td><td><code>gcloud config list</code>; <code>gcloud config set project PROJECT_ID</code>; or pass <code>--project</code> explicitly in scripts</td></tr>
+        <tr><td>Project ID "already exists"</td><td>IDs are globally unique, and deleted IDs are not immediately reusable</td><td>add a random suffix</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Trade-offs.</strong> One project per environment/experiment gives clean isolation and trivial cleanup, at the cost of re-enabling APIs and re-granting IAM each time (which Terraform makes cheap). One shared project is convenient but makes "what is this disk and who created it?" hard to answer.</p>
+
+    <details class="q"><summary>Self-check: why do Workload Identity principal strings use the project <em>number</em> while gcloud mostly uses the project <em>ID</em>?</summary><div class="a">The ID is a human-chosen name; the number is the stable, system-assigned identifier. IAM principal identifiers for federation pools are defined in terms of <code>projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/…</code>, so you must look up the number (<code>gcloud projects describe PROJECT_ID --format='value(projectNumber)'</code>).</div></details>
+
+    <!-- ============================================================ -->
+    <h2 id="s-iam">IAM: principals, roles, service accounts, least privilege</h2>
+    <p><strong>Definition.</strong> Identity and Access Management answers "<em>who</em> can do <em>what</em> on <em>which resource</em>". The <em>who</em> is a <strong>principal</strong>: a human (Google Account, Google group, federated workforce identity) or a workload (a <strong>service account</strong>, or a workload identity pool identity). The <em>what</em> is a <strong>role</strong>, a named bundle of permissions such as <code>roles/artifactregistry.writer</code>. The binding of principals to a role on a resource is stored in that resource's <strong>allow policy</strong>.</p>
+    <p><strong>Problem it solves.</strong> A Kubernetes cluster you can reach is also a cluster an attacker can reach with your credentials. IAM lets you give the CI pipeline only "push images", give the running Pod only "read this bucket", and keep "delete the cluster" for yourself.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 300" role="img" aria-label="IAM role binding: principal plus role on a resource">
+        <defs><marker id="m11b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="20" y="26" class="t-bold">Allow policy on resource = list of role bindings</text>
+        <rect class="box2" x="20" y="50" width="220" height="60" rx="8"/>
+        <text x="130" y="74" text-anchor="middle" class="t-bold">Principal (who)</text>
+        <text x="130" y="94" text-anchor="middle" class="t-mono">user:you@example.com</text>
+        <rect class="box3" x="300" y="50" width="220" height="60" rx="8"/>
+        <text x="410" y="74" text-anchor="middle" class="t-bold">Role (what)</text>
+        <text x="410" y="94" text-anchor="middle" class="t-mono">roles/container.admin</text>
+        <rect class="box4" x="580" y="50" width="220" height="60" rx="8"/>
+        <text x="690" y="74" text-anchor="middle" class="t-bold">Resource (where)</text>
+        <text x="690" y="94" text-anchor="middle" class="t-mono">project reliability-lab</text>
+        <line class="line" x1="240" y1="80" x2="300" y2="80" marker-end="url(#m11b)"/>
+        <line class="line" x1="520" y1="80" x2="580" y2="80" marker-end="url(#m11b)"/>
+        <rect class="box2" x="20" y="150" width="220" height="60" rx="8"/>
+        <text x="130" y="174" text-anchor="middle" class="t-bold">CI identity</text>
+        <text x="130" y="194" text-anchor="middle" class="t-mono">principalSet://…/repo</text>
+        <rect class="box3" x="300" y="150" width="220" height="60" rx="8"/>
+        <text x="410" y="174" text-anchor="middle" class="t-bold">Role</text>
+        <text x="410" y="194" text-anchor="middle" class="t-mono">artifactregistry.writer</text>
+        <rect class="box4" x="580" y="150" width="220" height="60" rx="8"/>
+        <text x="690" y="174" text-anchor="middle" class="t-bold">Resource</text>
+        <text x="690" y="194" text-anchor="middle" class="t-mono">AR repo: reliability</text>
+        <line class="line ok" x1="240" y1="180" x2="300" y2="180" marker-end="url(#m11b)"/>
+        <line class="line ok" x1="520" y1="180" x2="580" y2="180" marker-end="url(#m11b)"/>
+        <text x="20" y="248" class="t-muted">Top: broad (fine for your own learning project). Bottom: least privilege — narrow role on a single resource.</text>
+        <text x="20" y="270" class="t-muted">Avoid basic roles (Owner/Editor/Viewer) for workloads: they grant permissions across almost every service.</text>
+      </svg>
+      <figcaption>Figure 11.2 — A role binding is a triple. Least privilege means the narrowest role on the smallest resource that still lets the job succeed.</figcaption>
+    </figure>
+
+    <h3>Role types</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Type</th><th>Examples</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td>Basic</td><td><code>roles/owner</code>, <code>roles/editor</code>, <code>roles/viewer</code></td><td>Highly permissive, across services. OK for <em>you</em> in a throwaway lab project; avoid for service accounts and production.</td></tr>
+        <tr><td>Predefined</td><td><code>roles/container.developer</code>, <code>roles/artifactregistry.reader</code>, <code>roles/artifactregistry.writer</code>, <code>roles/storage.objectViewer</code></td><td>Maintained by Google per service. Your default choice.</td></tr>
+        <tr><td>Custom</td><td>your own list of permissions</td><td>When no predefined role is narrow enough. Higher maintenance.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Service accounts</h3>
+    <p>A <strong>service account</strong> is an identity for software, with an email like <code>gke-nodes@PROJECT_ID.iam.gserviceaccount.com</code>. Two facts matter for GKE:</p>
+    <ul>
+      <li><strong>Node service account.</strong> GKE nodes run as a service account (by default the Compute Engine default service account, unless you pass <code>--service-account</code> at creation, which the docs recommend and which cannot be changed later). Nodes use it to pull images from Artifact Registry and write logs/metrics. If image pulls fail with 403, this account usually lacks <code>roles/artifactregistry.reader</code> on the repository.</li>
+      <li><strong>Workload identity.</strong> Your <em>Pods</em> should not borrow the node's identity. They get their own via Workload Identity Federation for GKE (covered below).</li>
+    </ul>
+    <div class="callout danger"><span class="label">Never download service account keys for this course</span>
+      <p>A JSON key file is a long-lived password. It ends up in a repo, a Docker layer, or a CI secret and stays valid until someone revokes it. Everything in this module (Pods → Google APIs, GitHub Actions → Google Cloud) is done with <em>federation</em> instead: short-lived tokens, no key files.</p>
+    </div>
+
+    <h3>Least-privilege role plan for this course</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Principal</th><th>Needs to</th><th>Role on resource</th></tr></thead>
+      <tbody>
+        <tr><td>You (human)</td><td>create/delete everything in the lab project</td><td><code>roles/owner</code> on the lab project (acceptable for a personal sandbox only)</td></tr>
+        <tr><td>GKE node SA <code>gke-nodes@…</code></td><td>pull images, write logs/metrics</td><td><code>roles/artifactregistry.reader</code> on repo; <code>roles/container.defaultNodeServiceAccount</code> on project (check the GKE hardening doc for the current recommended role)</td></tr>
+        <tr><td>GitHub Actions (federated)</td><td>push <code>reliability-api:&lt;git-sha&gt;</code></td><td><code>roles/artifactregistry.writer</code> on repo <code>reliability</code> only</td></tr>
+        <tr><td>Pod KSA <code>reliability-lab/reliability-api</code></td><td>(example) read experiment configs from a bucket</td><td><code>roles/storage.objectViewer</code> on that bucket only</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Failure cases</h3>
+    <ul>
+      <li><code>PERMISSION_DENIED</code> / HTTP 403: the message names the missing permission (e.g. <code>artifactregistry.repositories.uploadArtifacts</code>). Find which role contains it, grant it at the narrowest scope. Inspect current bindings with <code>gcloud projects get-iam-policy PROJECT_ID</code> or <code>gcloud artifacts repositories get-iam-policy reliability --location=REGION</code>.</li>
+      <li>"It works for me but not in CI": you are Owner, CI is not. Always test with the CI identity's roles.</li>
+      <li>IAM changes are eventually consistent; a grant can take a short while to take effect. Retry before re-granting.</li>
+    </ul>
+
+    <details class="q"><summary>Self-check: a colleague suggests giving the CI service account <code>roles/editor</code> "to stop permission errors". What do you answer?</summary><div class="a">Editor is a basic role that grants write access to almost every service in the project, so a compromised workflow could delete clusters or read data. CI only needs to push images: grant <code>roles/artifactregistry.writer</code> on the single repository, and use Workload Identity Federation so no key exists to steal.</div></details>
+
+    <!-- ============================================================ -->
+    <h2 id="s-regions">Regions, zones and cluster location</h2>
+    <p><strong>Definition.</strong> A <strong>region</strong> is a geographic location (e.g. <code>us-central1</code>, <code>europe-west1</code>, <code>asia-south1</code>). Each region contains several <strong>zones</strong> (<code>us-central1-a</code>, <code>-b</code>, <code>-c</code>, …), which are isolated failure domains. Resources are <em>zonal</em> (a VM, a zonal persistent disk), <em>regional</em> (an Artifact Registry repo, a regional cluster's control plane), or <em>global</em>.</p>
+    <p><strong>Problem it solves.</strong> A single zone can fail. Spreading control plane replicas and nodes across zones lets the service survive a zone outage — at the cost of more resources and cross-zone traffic.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="Zonal cluster versus regional cluster">
+        <text x="200" y="22" text-anchor="middle" class="t-bold">Zonal cluster (Standard only)</text>
+        <rect class="zone" x="20" y="36" width="380" height="270" rx="10"/>
+        <text x="32" y="56" class="t-muted">region us-central1</text>
+        <rect class="box" x="40" y="70" width="110" height="160" rx="8"/>
+        <text x="95" y="90" text-anchor="middle" class="t-bold">zone a</text>
+        <rect class="box2" x="52" y="104" width="86" height="40" rx="6"/>
+        <text x="95" y="120" text-anchor="middle">control</text>
+        <text x="95" y="137" text-anchor="middle">plane</text>
+        <rect class="box4" x="52" y="156" width="86" height="28" rx="6"/><text x="95" y="175" text-anchor="middle">node</text>
+        <rect class="box4" x="52" y="192" width="86" height="28" rx="6"/><text x="95" y="211" text-anchor="middle">node</text>
+        <rect class="box" x="165" y="70" width="110" height="160" rx="8"/>
+        <text x="220" y="90" text-anchor="middle" class="t-bold">zone b</text>
+        <text x="220" y="160" text-anchor="middle" class="t-muted">(unused)</text>
+        <rect class="box" x="290" y="70" width="100" height="160" rx="8"/>
+        <text x="340" y="90" text-anchor="middle" class="t-bold">zone c</text>
+        <text x="340" y="160" text-anchor="middle" class="t-muted">(unused)</text>
+        <text x="210" y="260" text-anchor="middle" class="t-muted">zone a down = API + app down</text>
+        <text x="640" y="22" text-anchor="middle" class="t-bold">Regional cluster (Autopilot is always regional)</text>
+        <rect class="zone" x="440" y="36" width="400" height="270" rx="10"/>
+        <text x="452" y="56" class="t-muted">region us-central1</text>
+        <rect class="box" x="455" y="70" width="120" height="160" rx="8"/>
+        <text x="515" y="90" text-anchor="middle" class="t-bold">zone a</text>
+        <rect class="box2" x="467" y="104" width="96" height="40" rx="6"/><text x="515" y="128" text-anchor="middle">CP replica</text>
+        <rect class="box4" x="467" y="156" width="96" height="28" rx="6"/><text x="515" y="175" text-anchor="middle">node</text>
+        <rect class="box" x="585" y="70" width="120" height="160" rx="8"/>
+        <text x="645" y="90" text-anchor="middle" class="t-bold">zone b</text>
+        <rect class="box2" x="597" y="104" width="96" height="40" rx="6"/><text x="645" y="128" text-anchor="middle">CP replica</text>
+        <rect class="box4" x="597" y="156" width="96" height="28" rx="6"/><text x="645" y="175" text-anchor="middle">node</text>
+        <rect class="box" x="715" y="70" width="115" height="160" rx="8"/>
+        <text x="772" y="90" text-anchor="middle" class="t-bold">zone c</text>
+        <rect class="box2" x="726" y="104" width="94" height="40" rx="6"/><text x="773" y="128" text-anchor="middle">CP replica</text>
+        <rect class="box4" x="726" y="156" width="94" height="28" rx="6"/><text x="773" y="175" text-anchor="middle">node</text>
+        <text x="640" y="254" text-anchor="middle" class="t-muted">API reachable during upgrades and a</text>
+        <text x="640" y="272" text-anchor="middle" class="t-muted">single-zone outage; Standard node</text>
+        <text x="640" y="290" text-anchor="middle" class="t-muted">counts multiply per zone</text>
+      </svg>
+      <figcaption>Figure 11.3 — Zonal vs regional. Regional clusters replicate the control plane across zones; GKE Autopilot clusters are always regional. In Standard, "3 nodes" in a regional cluster means 3 <em>per zone</em> (the documented default is nine nodes across three zones).</figcaption>
+    </figure>
+
+    <h3>How to choose for reliability-api</h3>
+    <ul>
+      <li><strong>Region:</strong> pick one close to you, with the services you need, and check its prices (Autopilot prices are per region). Use the same region for the cluster and the Artifact Registry repository, so image pulls stay in-region.</li>
+      <li><strong>Autopilot:</strong> always regional, so you do not choose zonal vs regional. Spread the 2 replicas of <code>reliability-api</code> across zones with <code>topologySpreadConstraints</code> (Module 04) if you want to test zone-level resilience.</li>
+      <li><strong>Standard:</strong> a zonal cluster is cheapest for learning; regional is what the docs recommend for production. Remember cross-zone node-to-node traffic is billed.</li>
+    </ul>
+    <p><strong>SLA context</strong> (from the GKE pricing page, read 29 Oct 2026): 99.95% for the control plane of Autopilot clusters and regional Standard clusters; 99.5% for the control plane of zonal Standard clusters; 99.9% for Autopilot Pods in multiple zones. An SLA is a commercial promise about the platform — your app's SLO (Module 07) still depends on your probes, replicas and rollout settings.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="s-vpc">VPC basics for GKE</h2>
+    <p><strong>Definition.</strong> A <strong>VPC network</strong> is a global, private software-defined network in your project. It contains regional <strong>subnets</strong>, each with a <em>primary</em> IPv4 range and optional <em>secondary</em> ranges. <strong>Firewall rules</strong> (or policies) allow/deny traffic to VM interfaces by direction, protocol/port, source/destination range, tags or service accounts.</p>
+    <p><strong>Problem it solves.</strong> Pods need routable IPs that do not collide with anything else in your network, and you need a place to control what can reach the nodes.</p>
+    <p><strong>VPC-native clusters.</strong> "VPC-native is the default network mode for all new clusters". They use <em>alias IP ranges</em>:</p>
+    <ul>
+      <li><strong>Subnet primary range → nodes.</strong> Each node VM gets its IP from here.</li>
+      <li><strong>Secondary range → Pods.</strong> Each node receives a slice (alias range) of the Pod range; Pod IPs are therefore real VPC addresses, routable from the VPC and peered networks, and reserved <em>before</em> Pods are created.</li>
+      <li><strong>Services → ClusterIPs.</strong> Either a GKE-managed range (<code>34.118.224.0/20</code> per the docs) or a secondary range you supply.</li>
+    </ul>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 340" role="img" aria-label="VPC-native cluster address ranges">
+        <defs><marker id="m11c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="10" y="10" width="840" height="320" rx="12"/>
+        <text x="24" y="32" class="t-bold">VPC network: reliability-vpc (global)</text>
+        <rect class="box" x="30" y="48" width="540" height="262" rx="10"/>
+        <text x="44" y="70" class="t-bold">Subnet: gke-subnet (region us-central1)</text>
+        <rect class="box2" x="46" y="84" width="160" height="48" rx="6"/>
+        <text x="126" y="104" text-anchor="middle" class="t-bold">primary</text>
+        <text x="126" y="122" text-anchor="middle" class="t-mono">10.10.0.0/20</text>
+        <rect class="box3" x="222" y="84" width="160" height="48" rx="6"/>
+        <text x="302" y="104" text-anchor="middle" class="t-bold">secondary: pods</text>
+        <text x="302" y="122" text-anchor="middle" class="t-mono">10.20.0.0/16</text>
+        <rect class="box4" x="398" y="84" width="160" height="48" rx="6"/>
+        <text x="478" y="104" text-anchor="middle" class="t-bold">secondary: services</text>
+        <text x="478" y="122" text-anchor="middle" class="t-mono">10.30.0.0/20</text>
+        <rect class="box2" x="46" y="160" width="240" height="134" rx="8"/>
+        <text x="166" y="180" text-anchor="middle" class="t-bold">node 10.10.0.5</text>
+        <text x="166" y="196" text-anchor="middle" class="t-muted">alias range 10.20.1.0/24</text>
+        <rect class="box3" x="60" y="208" width="100" height="36" rx="6"/>
+        <text x="110" y="231" text-anchor="middle" class="t-mono">10.20.1.7</text>
+        <rect class="box3" x="172" y="208" width="100" height="36" rx="6"/>
+        <text x="222" y="231" text-anchor="middle" class="t-mono">10.20.1.8</text>
+        <text x="166" y="270" text-anchor="middle" class="t-muted">reliability-api Pods</text>
+        <rect class="box4" x="320" y="190" width="236" height="64" rx="8"/>
+        <text x="438" y="212" text-anchor="middle" class="t-bold">Service reliability-api</text>
+        <text x="438" y="232" text-anchor="middle" class="t-mono">ClusterIP 10.30.0.42:80</text>
+        <line class="line" x1="320" y1="222" x2="274" y2="226" marker-end="url(#m11c)"/>
+        <rect class="box" x="600" y="48" width="230" height="120" rx="10"/>
+        <text x="715" y="70" text-anchor="middle" class="t-bold">Firewall rules</text>
+        <text x="614" y="94" class="t-muted">GKE creates rules it needs</text>
+        <text x="614" y="112" class="t-muted">(node↔control plane, LB health</text>
+        <text x="614" y="130" class="t-muted">checks); you add only narrow</text>
+        <text x="614" y="148" class="t-muted">allow rules, never 0.0.0.0/0 SSH</text>
+        <rect class="box" x="600" y="190" width="230" height="120" rx="10"/>
+        <text x="715" y="212" text-anchor="middle" class="t-bold">Sizing rule of thumb</text>
+        <text x="614" y="236" class="t-muted">Pod range limits max Pods/nodes</text>
+        <text x="614" y="254" class="t-muted">primary range cannot shrink;</text>
+        <text x="614" y="272" class="t-muted">plan ranges that do not overlap</text>
+        <text x="614" y="290" class="t-muted">on-prem or peered VPCs</text>
+      </svg>
+      <figcaption>Figure 11.4 — In a VPC-native cluster, node IPs come from the subnet primary range, Pod IPs from a secondary range (each node gets an alias slice), and ClusterIPs from a Services range. Example CIDRs are illustrative.</figcaption>
+    </figure>
+
+    <h3>Applied to reliability-api</h3>
+    <p>For the labs you can let Autopilot use the <code>default</code> VPC and auto-created ranges. In the Terraform section we create a dedicated <code>reliability-vpc</code> and subnet with named secondary ranges <code>pods</code> and <code>services</code>, so the address plan is explicit and reviewable in a plan.</p>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>Pods stuck Pending with IP exhaustion events:</strong> the Pod secondary range is too small for the node count × per-node alias range. Fix by adding ranges or planning bigger ones; you cannot shrink a primary range after creation.</li>
+      <li><strong>Overlapping CIDRs</strong> with a peered network or VPN: traffic silently goes to the wrong place. Plan ranges before creating the cluster.</li>
+      <li><strong>LoadBalancer Service has an IP but connections hang:</strong> check firewall rules and that the Pods are Ready (Module 05 EndpointSlices).</li>
+    </ul>
+    <details class="q"><summary>Self-check: why is "Pod IPs are real VPC addresses" useful, and what is the price?</summary><div class="a">Other VPC resources (and Google load balancers using container-native NEGs) can reach Pods directly without node-level NAT hops, and IPs are reserved before Pods start, avoiding conflicts. The price is IP planning: Pod ranges consume VPC address space and must be sized up front.</div></details>
+
+    <!-- ============================================================ -->
+    <h2 id="s-gke-arch">GKE architecture</h2>
+    <p><strong>Definition.</strong> GKE is Google's managed Kubernetes. Per the GKE overview: "In GKE, Google Cloud manages the control plane and system components for you", and in Autopilot "Google Cloud also manages your worker nodes". Nodes are Compute Engine VMs; your workloads are ordinary Pods.</p>
+    <p><strong>Problem it solves.</strong> Running etcd, the API server, upgrades and security patches yourself is a full-time job. GKE turns the control plane into a service with an SLA so you can concentrate on workloads.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 400" role="img" aria-label="GKE architecture: Google-managed control plane and nodes in your project">
+        <defs><marker id="m11d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="10" y="10" width="300" height="370" rx="12"/>
+        <text x="24" y="32" class="t-bold">Google-managed (Google's project)</text>
+        <rect class="box2" x="30" y="50" width="260" height="210" rx="10"/>
+        <text x="160" y="72" text-anchor="middle" class="t-bold">Control plane</text>
+        <rect class="box" x="46" y="86" width="228" height="30" rx="6"/><text x="160" y="106" text-anchor="middle">kube-apiserver (endpoint)</text>
+        <rect class="box" x="46" y="124" width="228" height="30" rx="6"/><text x="160" y="144" text-anchor="middle">etcd / cluster state</text>
+        <rect class="box" x="46" y="162" width="228" height="30" rx="6"/><text x="160" y="182" text-anchor="middle">scheduler</text>
+        <rect class="box" x="46" y="200" width="228" height="30" rx="6"/><text x="160" y="220" text-anchor="middle">controller managers</text>
+        <text x="160" y="250" text-anchor="middle" class="t-muted">upgrades via release channel</text>
+        <rect class="box3" x="30" y="280" width="260" height="80" rx="10"/>
+        <text x="160" y="302" text-anchor="middle" class="t-bold">You interact via</text>
+        <text x="160" y="322" text-anchor="middle" class="t-mono">kubectl → API endpoint</text>
+        <text x="160" y="342" text-anchor="middle" class="t-mono">gcloud → GKE API</text>
+        <rect class="zone" x="340" y="10" width="530" height="370" rx="12"/>
+        <text x="354" y="32" class="t-bold">Your project: reliability-lab-1234 (VPC, nodes)</text>
+        <rect class="box" x="360" y="50" width="240" height="200" rx="10"/>
+        <text x="480" y="72" text-anchor="middle" class="t-bold">Node pool "default" (Standard)</text>
+        <rect class="box4" x="374" y="86" width="100" height="150" rx="8"/>
+        <text x="424" y="104" text-anchor="middle" class="t-bold">node VM</text>
+        <text x="424" y="122" text-anchor="middle" class="t-muted">kubelet</text>
+        <text x="424" y="138" text-anchor="middle" class="t-muted">containerd</text>
+        <rect class="box3" x="384" y="150" width="80" height="34" rx="6"/><text x="424" y="172" text-anchor="middle">api Pod</text>
+        <rect class="box3" x="384" y="192" width="80" height="34" rx="6"/><text x="424" y="214" text-anchor="middle">system</text>
+        <rect class="box4" x="486" y="86" width="100" height="150" rx="8"/>
+        <text x="536" y="104" text-anchor="middle" class="t-bold">node VM</text>
+        <text x="536" y="122" text-anchor="middle" class="t-muted">same machine</text>
+        <text x="536" y="138" text-anchor="middle" class="t-muted">type in a pool</text>
+        <rect class="box3" x="496" y="150" width="80" height="34" rx="6"/><text x="536" y="172" text-anchor="middle">api Pod</text>
+        <rect class="box" x="620" y="50" width="230" height="200" rx="10"/>
+        <text x="735" y="72" text-anchor="middle" class="t-bold">Node pool "gpu" (optional)</text>
+        <rect class="box4" x="660" y="90" width="150" height="110" rx="8"/>
+        <text x="735" y="112" text-anchor="middle" class="t-bold">GPU node</text>
+        <text x="735" y="132" text-anchor="middle" class="t-muted">different machine type</text>
+        <text x="735" y="150" text-anchor="middle" class="t-muted">taints + labels</text>
+        <text x="735" y="168" text-anchor="middle" class="t-muted">autoscaling 0..N</text>
+        <text x="735" y="230" text-anchor="middle" class="t-muted">see Module 12</text>
+        <rect class="box2" x="360" y="272" width="490" height="90" rx="10"/>
+        <text x="605" y="294" text-anchor="middle" class="t-bold">Autopilot: you never see or size node pools</text>
+        <text x="605" y="316" text-anchor="middle" class="t-muted">GKE provisions nodes from your Pod requests; you pay per Pod request</text>
+        <text x="605" y="336" text-anchor="middle" class="t-muted">(general-purpose) — node size/count does not matter for billing</text>
+        <line class="line" x1="290" y1="101" x2="374" y2="120" marker-end="url(#m11d)"/>
+        <line class="line dash" x1="290" y1="177" x2="660" y2="140" />
+        <text x="318" y="96" class="t-muted">kubelet ⇄ API</text>
+      </svg>
+      <figcaption>Figure 11.5 — GKE splits responsibility. The control plane runs in Google-managed infrastructure; nodes are Compute Engine VMs in your project, grouped into node pools (a pool = nodes with the same configuration). In Autopilot, node pools are managed for you.</figcaption>
+    </figure>
+
+    <h3>Node pools</h3>
+    <p>A <strong>node pool</strong> is a group of nodes with identical configuration (machine type, disk, image, labels, taints, autoscaling bounds). In Standard mode you create pools explicitly: e.g. a small general-purpose pool for <code>reliability-api</code> and a separate GPU pool, tainted so only inference Pods land there (Module 12). Pools let you upgrade, resize or replace one class of nodes without touching another. In Autopilot you express needs in the Pod spec instead (resource requests, compute classes, accelerators), and GKE creates appropriate nodes.</p>
+
+    <h3>Failure cases specific to managed clusters</h3>
+    <ul>
+      <li><strong>Automatic upgrades</strong> drain nodes. If <code>reliability-api</code> lacks a PodDisruptionBudget, readiness probe or graceful shutdown (Module 04), users see errors during routine maintenance. Configure maintenance windows and PDBs.</li>
+      <li><strong>Deprecated APIs</strong> removed in a new minor version break old manifests. Run <code>helm template</code> output through your tests against the target version before the channel upgrades you.</li>
+      <li><strong>Autopilot rejects or mutates Pods</strong> that violate its rules (privileged containers, host access, resource ratios). Read the admission error in <code>kubectl describe</code> / the apply output.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="s-modes">Autopilot vs Standard</h2>
+    <p>Both modes run the same Kubernetes API; the difference is <em>who owns the nodes</em> and therefore <em>how you are billed</em>. The GKE overview calls Autopilot the recommended mode ("a workload-focused, cost-optimized, production-ready experience") and Standard the mode for teams that need manual control over node pools.</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Aspect</th><th>Autopilot</th><th>Standard</th></tr></thead>
+      <tbody>
+        <tr><td>Control plane</td><td>Google-managed</td><td>Google-managed</td></tr>
+        <tr><td>Nodes</td><td>Google provisions, scales, patches and upgrades nodes; you do not manage node pools</td><td>You create/size node pools, choose machine types, configure autoscaling, upgrades and surge settings</td></tr>
+        <tr><td>Location</td><td>Always regional</td><td>Zonal, multi-zonal or regional</td></tr>
+        <tr><td>Release channel</td><td>Must be enrolled (Rapid / Regular / Stable)</td><td>Channel recommended; Extended channel available</td></tr>
+        <tr><td>Billing (compute)</td><td><strong>General-purpose Pods:</strong> charged for the CPU, memory and ephemeral storage your Pods <em>request</em>, in one-second increments, no minimum duration. <strong>Pods selecting specific hardware</strong> (GPUs, machine series): node-based billing = Compute Engine price + Autopilot management premium.</td><td>Charged for the node VMs (Compute Engine pricing, per-second with a one-minute minimum) until nodes are deleted, whether or not Pods use them</td></tr>
+        <tr><td>Cluster management fee</td><td colspan="2">Flat <strong>$0.10 per cluster per hour</strong> (charged in 1-second increments) for all modes and topologies; extra fee for clusters in Extended support. Free tier: <strong>$74.40/month credit per billing account</strong> (≈ one Autopilot or zonal Standard cluster), not applicable to regional Standard clusters' fee or compute. <em>Source: GKE pricing page, read 29 Oct 2026.</em></td></tr>
+        <tr><td>Default requests</td><td>If you omit requests, defaults are applied (general-purpose class: 0.5 vCPU, 2 GiB memory, 1 GiB ephemeral storage); values below minimums or outside CPU:memory ratio (1:1 to 1:6.5) are raised</td><td>No defaults beyond what you or a LimitRange set</td></tr>
+        <tr><td>Security defaults</td><td>Hardened: no privileged Pods by default, Workload Identity Federation always enabled, Dataplane V2</td><td>You enable/tune features</td></tr>
+        <tr><td>What you learn</td><td>Workload-level Kubernetes, right-sizing requests (requests = money)</td><td>Node pools, machine types, cluster autoscaler, node upgrades</td></tr>
+      </tbody>
+    </table></div>
+
+    <div class="callout note"><span class="label">Billing gotcha worth memorising</span>
+      <p>Autopilot bills Pods "that have been scheduled to a node and have resources allocated to them. This includes Pods in the Running phase, as well as Pods in error or retry loops (such as ImagePullBackOff or CrashLoopBackOff)." Pending (unscheduled) and successfully terminated Pods are not billed, nor are unmodified system DaemonSets. A crash-looping <code>reliability-api</code> is therefore <em>still costing money</em>.</p>
+    </div>
+
+    <h3>Requests are now money: an estimator</h3>
+    <p>On Autopilot, the numbers you set in <code>resources.requests</code> (Module 04) become the bill. reliability-api requests <code>cpu: 100m</code> and <code>memory: 128Mi</code>. Depending on the cluster's bursting support, Autopilot's general-purpose minimums are 50m CPU / 52 MiB (with bursting) or 250m / 512 MiB (without), and CPU is rounded to 0.25 vCPU steps when bursting is not supported — so always check what Autopilot actually set on the Pod (<code>kubectl get pod … -o yaml</code>, look at <code>resources</code> and annotations).</p>
+
+    <div class="widget" id="w-estimator">
+      <div class="w-title">Autopilot cost estimator (general-purpose Pods)</div>
+      <div class="w-sub">Default unit prices are what the GKE pricing page showed for us-central1 on 29 Oct 2026 (vCPU $0.0445/h, memory $0.0049225/GiB-h, ephemeral $0.0001389/GiB-h). Replace them with the current prices for your region. This ignores load balancers, logs, disks and egress.</div>
+      <div class="row">
+        <label style="flex:1">Replicas <input type="number" id="e-rep" value="2" min="0" max="100" style="width:80px"></label>
+        <label style="flex:1">CPU request (vCPU) <input type="number" id="e-cpu" value="0.1" step="0.05" min="0" style="width:90px"></label>
+        <label style="flex:1">Memory (GiB) <input type="number" id="e-mem" value="0.125" step="0.125" min="0" style="width:90px"></label>
+        <label style="flex:1">Ephemeral (GiB) <input type="number" id="e-eph" value="1" step="0.5" min="0" style="width:90px"></label>
+      </div>
+      <div class="row">
+        <label style="flex:1">$/vCPU-hour <input type="number" id="e-pcpu" value="0.0445" step="0.0001" style="width:100px"></label>
+        <label style="flex:1">$/GiB-hour <input type="number" id="e-pmem" value="0.0049225" step="0.0000001" style="width:110px"></label>
+        <label style="flex:1">$/eph GiB-hour <input type="number" id="e-peph" value="0.0001389" step="0.0000001" style="width:110px"></label>
+        <label style="flex:1">Hours running <input type="number" id="e-hours" value="4" min="0" style="width:80px"></label>
+      </div>
+      <label><input type="checkbox" id="e-free" checked> First cluster on this billing account (cluster fee covered by free-tier credit up to $74.40/month)</label>
+      <div class="out" id="e-out"></div>
+    </div>
+
+    <h3>Which mode for this course?</h3>
+    <p>Use <strong>Autopilot</strong> for the labs: no node pools to forget, per-Pod billing means two tiny reliability-api Pods cost very little, and the cluster fee for one cluster is covered by the free-tier credit (verify on the current pricing page). Use <strong>Standard</strong> only if you specifically want to practise node-pool and cluster-autoscaler operations — and then use a small zonal cluster and delete it the same day.</p>
+    <details class="q"><summary>Self-check: reliability-api enters CrashLoopBackOff on Autopilot overnight. Are you billed for it? On Standard?</summary><div class="a">On Autopilot yes — Pods in error/retry loops that are scheduled and have resources allocated are billed per request. On Standard you pay for the node VMs regardless of what Pods do; the crash loop does not change the node bill, but the nodes would be billed even if every Pod were healthy or deleted.</div></details>
+
+    <!-- ============================================================ -->
+    <h2 id="s-channels">Release channels and versions</h2>
+    <p><strong>Definition.</strong> A release channel is a subscription that decides which GKE versions your cluster gets and how fast automatic upgrades arrive.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Channel</th><th>Intent (from the docs)</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td>Rapid</td><td>Latest Kubernetes release as early as possible</td><td>trying new features on non-critical clusters</td></tr>
+        <tr><td>Regular (default)</td><td>Features soon after GA, qualified for longer; "what we recommend for most users"</td><td>this course</td></tr>
+        <tr><td>Stable</td><td>Stability over features; versions roll out here last</td><td>conservative production</td></tr>
+        <tr><td>Extended</td><td>Stay on a minor version up to ~24 months; extra cost during extended support; not for Autopilot</td><td>organisations that upgrade manually once or twice a year</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Why it matters for reliability.</strong> Auto-upgrades are routine disruptions: nodes are drained and Pods rescheduled. Your Module 04 work (readiness probes, PDB <code>minAvailable: 1</code>, graceful SIGTERM handling, 2+ replicas) is exactly what keeps reliability-api available through them. Use maintenance windows/exclusions to control <em>when</em> they happen.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="s-ar">Artifact Registry: storing reliability-api images</h2>
+    <p><strong>Definition.</strong> Artifact Registry is Google Cloud's package and container registry. A <strong>repository</strong> has a format (<code>docker</code>), a location (region or multi-region) and its own IAM policy.</p>
+    <p><strong>Problem it solves.</strong> GKE nodes must pull your image from somewhere reachable, authenticated, and ideally close by. Pulling from a same-region repository is fast and keeps traffic inside Google Cloud; IAM on the repo controls who can push and pull.</p>
+    <h3>Image path anatomy</h3>
+<pre data-title="Artifact Registry image path"><code>LOCATION-docker.pkg.dev/PROJECT-ID/REPOSITORY/IMAGE:TAG
+us-central1-docker.pkg.dev/reliability-lab-1234/reliability/reliability-api:3f9c2ab
+└── host per location ─────┘ └── project ────────┘ └ repo ───┘ └ image ───────┘ └ git sha</code></pre>
+    <h3>How a push works</h3>
+    <ol>
+      <li><code>gcloud services enable artifactregistry.googleapis.com</code></li>
+      <li><code>gcloud artifacts repositories create reliability --repository-format=docker --location=us-central1</code></li>
+      <li><code>gcloud auth configure-docker us-central1-docker.pkg.dev</code> — adds a credential helper entry to <code>~/.docker/config.json</code> so <code>docker push</code> obtains short-lived tokens from your gcloud login.</li>
+      <li><code>docker tag</code> the local image with the full path, then <code>docker push</code>.</li>
+      <li>Pullers need <code>roles/artifactregistry.reader</code>; pushers need <code>roles/artifactregistry.writer</code> (on the repo is narrowest).</li>
+    </ol>
+    <div class="callout warn"><span class="label">Architecture mismatch</span>
+      <p>If you build on an Apple Silicon Mac, a plain <code>docker build</code> produces an <code>arm64</code> image. GKE nodes are usually <code>amd64</code>, so the Pod fails with <code>exec format error</code>. Build with <code>docker buildx build --platform linux/amd64 …</code> (or multi-arch) — or let CI on an amd64 runner build it.</p>
+    </div>
+    <h3>Failure cases</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Symptom</th><th>Cause</th><th>Diagnose</th></tr></thead>
+      <tbody>
+        <tr><td><code>denied: Permission "artifactregistry.repositories.uploadArtifacts" denied</code> on push</td><td>no writer role, or Docker not configured for that host</td><td><code>cat ~/.docker/config.json</code> (look for the host under credHelpers); check IAM on the repo</td></tr>
+        <tr><td>Pod <code>ImagePullBackOff</code>, event says 403/Forbidden</td><td>node service account lacks reader role</td><td><code>kubectl describe pod</code> events; grant <code>roles/artifactregistry.reader</code> to the node SA</td></tr>
+        <tr><td><code>ImagePullBackOff</code>, "not found"</td><td>typo in path/tag, wrong region host, image never pushed</td><td><code>gcloud artifacts docker images list us-central1-docker.pkg.dev/PROJECT/reliability</code></td></tr>
+        <tr><td><code>exec format error</code> in container logs</td><td>arm64 image on amd64 node</td><td><code>docker image inspect … --format '{{.Architecture}}'</code></td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Cost note.</strong> Artifact Registry charges for stored data beyond any free allowance and for some egress; every CI push of <code>reliability-api:&lt;git-sha&gt;</code> adds layers. Configure cleanup policies or delete the repository at the end (check the Artifact Registry pricing page for current numbers).</p>
+
+    <!-- ============================================================ -->
+    <h2 id="s-gcloud">gcloud essentials</h2>
+    <p><code>gcloud</code> is the CLI for Google Cloud. It has <em>two</em> separate credential stores, which confuses almost everyone once:</p>
+    <ul>
+      <li><code>gcloud auth login</code> — credentials used by <code>gcloud</code> itself (and by <code>kubectl</code> through the GKE auth plugin, and by Docker via the credential helper).</li>
+      <li><code>gcloud auth application-default login</code> — "Application Default Credentials" (ADC) used by <em>client libraries and tools such as Terraform</em> running on your machine.</li>
+    </ul>
+<pre data-title="Session setup (run once per machine/project)"><code><span class="c"># 1. Log in (opens a browser)</span>
+gcloud auth login
+gcloud auth application-default login      <span class="c"># for Terraform / client libraries</span>
+
+<span class="c"># 2. Defaults so you do not repeat flags</span>
+export PROJECT_ID=reliability-lab-1234
+export REGION=us-central1
+gcloud config set project "$PROJECT_ID"
+gcloud config set compute/region "$REGION"
+gcloud config list
+
+<span class="c"># 3. Enable the APIs this module uses</span>
+gcloud services enable container.googleapis.com artifactregistry.googleapis.com
+
+<span class="c"># 4. kubectl needs the GKE auth plugin to talk to GKE</span>
+gcloud components install gke-gcloud-auth-plugin   <span class="c"># or install via your OS package manager</span>
+
+<span class="c"># 5. Create an Autopilot cluster and fetch credentials</span>
+gcloud container clusters create-auto reliability-lab \
+    --location="$REGION" --project="$PROJECT_ID" \
+    --release-channel=regular \
+    --labels=app=reliability-api,env=lab
+gcloud container clusters get-credentials reliability-lab \
+    --location="$REGION" --project="$PROJECT_ID"
+kubectl config current-context    <span class="c"># gke_reliability-lab-1234_us-central1_reliability-lab</span></code></pre>
+    <div class="callout warn"><span class="label">Two clusters, one kubectl</span>
+      <p><code>get-credentials</code> adds a context and <em>switches</em> to it. Your kind context <code>kind-reliability-lab</code> is still there. Before any destructive command, run <code>kubectl config current-context</code>. Many engineers put the context in their shell prompt for exactly this reason.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <section class="lab"><header>Lab 1 — Project guard-rails, Artifact Registry and first push</header><div class="body">
+      <div class="callout danger"><span class="label">Cost warning</span><p>This lab creates an Artifact Registry repository (storage is billed beyond any free allowance) and a budget (free). Expected cost: very small, but not guaranteed to be zero. Do the cleanup at the end if you will not continue to Lab 2 today.</p></div>
+      <p><strong>Goal:</strong> a dedicated project with a budget alert, enabled APIs, and <code>reliability-api</code> pushed to Artifact Registry tagged with the git SHA.</p>
+      <ol class="steps">
+        <li><strong>Create the project and link billing</strong> (console is simplest for billing). Then:
+<pre><code>export PROJECT_ID=reliability-lab-$RANDOM
+gcloud projects create "$PROJECT_ID" --name="reliability-lab"
+<span class="c"># link billing: Console → Billing → My projects → Change billing  (or gcloud billing projects link)</span>
+gcloud config set project "$PROJECT_ID"
+gcloud billing projects describe "$PROJECT_ID"</code></pre>
+          <p>Example output (yours will differ in names/IDs):</p>
+<pre><code><span class="o">billingAccountName: billingAccounts/0X0X0X-0X0X0X-0X0X0X
+billingEnabled: true
+name: projects/reliability-lab-12345/billingInfo
+projectId: reliability-lab-12345</span></code></pre></li>
+        <li><strong>Create a budget</strong> before anything else: Console → Billing → Budgets &amp; alerts → Create budget. Scope it to this project, amount e.g. 10 (in your billing currency), keep the default thresholds (50%, 90%, 100% of actual spend) and add a forecasted threshold. Remember: an alerts-only budget <em>does not stop spending</em>.</li>
+        <li><strong>Enable APIs:</strong>
+<pre><code>gcloud services enable container.googleapis.com artifactregistry.googleapis.com
+gcloud services list --enabled --filter="name:(container.googleapis.com artifactregistry.googleapis.com)"</code></pre></li>
+        <li><strong>Create the repository with labels:</strong>
+<pre><code>export REGION=us-central1
+gcloud artifacts repositories create reliability \
+    --repository-format=docker --location="$REGION" \
+    --description="reliability-api images" \
+    --labels=app=reliability-api,env=lab
+gcloud artifacts repositories list</code></pre></li>
+        <li><strong>Build for amd64, tag and push:</strong>
+<pre><code>cd kubernetes-reliability-lab
+export SHA=$(git rev-parse --short HEAD)
+export IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/reliability/reliability-api:$SHA"
+gcloud auth configure-docker "$REGION-docker.pkg.dev"
+docker buildx build --platform linux/amd64 -t "$IMAGE" --push .
+gcloud artifacts docker images list "$REGION-docker.pkg.dev/$PROJECT_ID/reliability" --include-tags</code></pre>
+          <p>Example output (yours will differ in names/IDs/timings):</p>
+<pre><code><span class="o">IMAGE                                                                       DIGEST         TAGS     CREATE_TIME
+us-central1-docker.pkg.dev/reliability-lab-12345/reliability/reliability-api sha256:9b1c…  3f9c2ab  2026-10-29T10:12:03</span></code></pre></li>
+      </ol>
+      <p><strong>Checkpoint:</strong> You can explain why the push succeeded (you have Owner; gcloud credential helper supplied a token) and what a CI identity would need instead (writer on this repo only).</p>
+      <p><strong>Cleanup (if stopping here):</strong></p>
+<pre><code>gcloud artifacts repositories delete reliability --location="$REGION" --quiet
+gcloud artifacts repositories list          <span class="c"># verify: Listed 0 items.</span></code></pre>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2 id="s-wi-gke">Workload Identity Federation for GKE (Pods → Google APIs)</h2>
+    <p><strong>Definition.</strong> A mechanism that lets a Kubernetes ServiceAccount (KSA) act as an IAM principal, so code in a Pod can call Google APIs (Cloud Storage, Pub/Sub, …) with short-lived tokens and <em>no key file</em>. The cluster's workload identity pool is <code>PROJECT_ID.svc.id.goog</code>. In Autopilot, "Workload Identity Federation for GKE is always enabled".</p>
+    <p><strong>Problem it solves.</strong> Before it existed, Pods either used the node's service account (every Pod on the node got the same, usually broad, permissions) or mounted a JSON key from a Secret (long-lived, leak-prone). Workload Identity gives each workload its own identity, scoped by namespace and KSA name.</p>
+    <p><strong>Principal identifier for one KSA</strong> (verbatim format from the docs):</p>
+<pre><code>principal://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/PROJECT_ID.svc.id.goog/subject/ns/NAMESPACE/sa/SERVICEACCOUNT</code></pre>
+
+    <div class="widget stepper" data-steps='[
+      {"title":"Pod starts with a KSA","html":"The reliability-api Pod runs as Kubernetes ServiceAccount <code>reliability-api</code> in namespace <code>reliability-lab</code>. No key file is mounted. The Google client library in the app looks for credentials and, finding none in env/files, calls the metadata endpoint."},
+      {"title":"Request to metadata.google.internal","html":"The library asks <code>http://metadata.google.internal</code> for an access token. On GKE, the <strong>GKE metadata server</strong> (a DaemonSet on every Linux node) intercepts this request. Traffic stays on the node."},
+      {"title":"Metadata server identifies the Pod","html":"The metadata server knows which Pod made the call and therefore its namespace and KSA. It obtains a Kubernetes-signed token for that KSA."},
+      {"title":"Token exchange","html":"It exchanges the KSA token with Google Security Token Service for a <strong>federated access token</strong> for principal <code>…/subject/ns/reliability-lab/sa/reliability-api</code>. (Alternative: if the KSA is annotated with an IAM service account, GKE then exchanges again for that service account token.)"},
+      {"title":"Call the Google API","html":"The app calls e.g. Cloud Storage with the short-lived token. IAM checks the allow policy on the bucket: is this principal bound to <code>roles/storage.objectViewer</code>? Yes → 200. No → 403 naming the missing permission."}
+    ]'>
+      <div class="w-title">Step through: how a Pod gets a Google token</div>
+      <svg viewBox="0 0 860 230" role="img" aria-label="Workload Identity Federation for GKE token flow">
+        <defs><marker id="m11e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="10" y="10" width="400" height="210" rx="10"/>
+        <text x="22" y="30" class="t-muted">GKE node</text>
+        <g data-step="0,1,2"><rect class="box3" x="30" y="50" width="160" height="70" rx="8"/><text x="110" y="76" text-anchor="middle" class="t-bold">reliability-api Pod</text><text x="110" y="96" text-anchor="middle" class="t-mono">KSA reliability-api</text></g>
+        <g data-step="1,2,3"><rect class="box2" x="230" y="50" width="160" height="70" rx="8"/><text x="310" y="76" text-anchor="middle" class="t-bold">GKE metadata</text><text x="310" y="96" text-anchor="middle" class="t-bold">server</text></g>
+        <g data-step="1"><line class="line accent" x1="190" y1="85" x2="230" y2="85" marker-end="url(#m11e)"/></g>
+        <g data-step="2"><text x="310" y="150" text-anchor="middle" class="t-muted">knows Pod → ns/KSA</text></g>
+        <g data-step="3"><rect class="box4" x="470" y="40" width="170" height="60" rx="8"/><text x="555" y="66" text-anchor="middle" class="t-bold">Security Token</text><text x="555" y="84" text-anchor="middle" class="t-bold">Service (STS)</text>
+          <line class="line accent" x1="390" y1="75" x2="470" y2="70" marker-end="url(#m11e)"/>
+          <text x="430" y="62" text-anchor="middle" class="t-muted">exchange</text></g>
+        <g data-step="4"><rect class="box4" x="680" y="120" width="160" height="70" rx="8"/><text x="760" y="146" text-anchor="middle" class="t-bold">Cloud Storage</text><text x="760" y="166" text-anchor="middle" class="t-muted">IAM check</text>
+          <path class="line ok" d="M190,110 C 330,200 560,200 680,160" marker-end="url(#m11e)"/>
+          <text x="430" y="210" text-anchor="middle" class="t-muted">API call with short-lived token</text></g>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+    <h3>Two ways to grant access</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>Direct (recommended where supported)</th><th>Link KSA to an IAM service account</th></tr></thead>
+      <tbody>
+        <tr><td>Grant</td><td>Bind a role directly to the <code>principal://…/ns/NS/sa/KSA</code> identifier on the resource</td><td>Annotate the KSA with <code>iam.gke.io/gcp-service-account: GSA_EMAIL</code> and grant the KSA principal <code>roles/iam.workloadIdentityUser</code> on that GSA; grant roles to the GSA</td></tr>
+        <tr><td>Pros</td><td>No extra service account; fewer moving parts</td><td>Works with APIs that do not accept federated principals; reuse existing GSA permissions</td></tr>
+        <tr><td>Cons</td><td>Some APIs/features have limitations (see docs)</td><td>Extra object and an extra exchange step</td></tr>
+      </tbody>
+    </table></div>
+<pre data-title="Direct grant example: reliability-api may read one bucket"><code>PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+kubectl create serviceaccount reliability-api -n reliability-lab
+gcloud storage buckets add-iam-policy-binding gs://$PROJECT_ID-experiments \
+  --role=roles/storage.objectViewer \
+  --member="principal://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$PROJECT_ID.svc.id.goog/subject/ns/reliability-lab/sa/reliability-api"
+<span class="c"># then set spec.template.spec.serviceAccountName: reliability-api in the Deployment (Helm value)</span></code></pre>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>403 from the API:</strong> principal string typo (project ID vs number, namespace or KSA name), Pod not actually using the KSA (<code>kubectl get pod -o jsonpath='{.spec.serviceAccountName}'</code>), or IAM propagation delay.</li>
+      <li><strong>App uses a key file instead</strong>: an env var such as <code>GOOGLE_APPLICATION_CREDENTIALS</code> left from local development overrides metadata-based credentials. Remove it in the cluster.</li>
+      <li><strong>Standard cluster without Workload Identity enabled</strong> on cluster or node pool: Pods get the node identity. Enable with <code>--workload-pool=PROJECT_ID.svc.id.goog</code>.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="s-wi-gh">Workload Identity Federation for GitHub Actions (no long-lived keys)</h2>
+    <p><strong>Definition.</strong> GitHub Actions can mint an OIDC <em>ID token</em> for each workflow run, signed by GitHub and describing the repo, ref, actor, etc. A Google Cloud <strong>workload identity pool provider</strong> trusts that issuer (<code>https://token.actions.githubusercontent.com</code>), maps token claims to attributes, and enforces an <strong>attribute condition</strong>. The workflow exchanges the GitHub token for a short-lived Google token.</p>
+    <p><strong>Problem it solves.</strong> Module 09 pushed to GHCR using <code>GITHUB_TOKEN</code>. To push to Artifact Registry you need a Google credential. The old way was a service account JSON key in a GitHub secret — exactly the long-lived key we refuse to create. Federation means nothing secret is stored in GitHub at all.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 300" role="img" aria-label="GitHub Actions OIDC federation with Google Cloud">
+        <defs><marker id="m11f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="10" y="10" width="260" height="280" rx="10"/>
+        <text x="22" y="30" class="t-muted">GitHub</text>
+        <rect class="box2" x="30" y="44" width="220" height="70" rx="8"/>
+        <text x="140" y="70" text-anchor="middle" class="t-bold">Workflow run</text>
+        <text x="140" y="90" text-anchor="middle" class="t-mono">permissions: id-token: write</text>
+        <rect class="box" x="30" y="150" width="220" height="70" rx="8"/>
+        <text x="140" y="176" text-anchor="middle" class="t-bold">GitHub OIDC issuer</text>
+        <text x="140" y="196" text-anchor="middle" class="t-muted">signs ID token (≈5 min)</text>
+        <line class="line" x1="110" y1="114" x2="110" y2="150" marker-end="url(#m11f)"/>
+        <line class="line" x1="170" y1="150" x2="170" y2="114" marker-end="url(#m11f)"/>
+        <text x="20" y="250" class="t-muted">claims: repository, repository_owner,</text>
+        <text x="20" y="266" class="t-muted">ref, sub, actor, *_id …</text>
+        <rect class="zone" x="300" y="10" width="570" height="280" rx="10"/>
+        <text x="312" y="30" class="t-muted">Google Cloud (project reliability-lab)</text>
+        <rect class="box4" x="320" y="44" width="250" height="90" rx="8"/>
+        <text x="445" y="66" text-anchor="middle" class="t-bold">Workload identity pool "github"</text>
+        <text x="445" y="86" text-anchor="middle" class="t-muted">provider: issuer + attribute mapping</text>
+        <text x="445" y="104" text-anchor="middle" class="t-mono">condition: owner == '&lt;you&gt;'</text>
+        <text x="445" y="122" text-anchor="middle" class="t-muted">rejects tokens from other orgs</text>
+        <rect class="box2" x="610" y="44" width="240" height="90" rx="8"/>
+        <text x="730" y="70" text-anchor="middle" class="t-bold">Security Token Service</text>
+        <text x="730" y="92" text-anchor="middle" class="t-muted">returns short-lived</text>
+        <text x="730" y="110" text-anchor="middle" class="t-muted">federated token</text>
+        <rect class="box3" x="440" y="190" width="300" height="80" rx="8"/>
+        <text x="590" y="214" text-anchor="middle" class="t-bold">Artifact Registry repo "reliability"</text>
+        <text x="590" y="236" text-anchor="middle" class="t-mono">principalSet://…/attribute.repository/</text>
+        <text x="590" y="254" text-anchor="middle" class="t-mono">&lt;you&gt;/kubernetes-reliability-lab → writer</text>
+        <path class="line accent" d="M250,79 L320,79" marker-end="url(#m11f)"/>
+        <text x="285" y="72" text-anchor="middle" class="t-muted">1</text>
+        <path class="line accent" d="M570,89 L610,89" marker-end="url(#m11f)"/>
+        <text x="590" y="82" text-anchor="middle" class="t-muted">2</text>
+        <path class="line ok" d="M250,100 C 330,170 380,230 440,230" marker-end="url(#m11f)"/>
+        <text x="330" y="196" class="t-muted">3 docker push</text>
+      </svg>
+      <figcaption>Figure 11.6 — (1) The workflow presents GitHub's ID token to the pool provider, which checks the issuer, maps claims and applies the attribute condition; (2) STS returns a short-lived Google token; (3) the workflow pushes, and IAM on the repository authorises the mapped principal set.</figcaption>
+    </figure>
+
+    <h3>Setup (one time, from the official auth action README)</h3>
+<pre data-title="Create pool + OIDC provider + grant (replace placeholders)"><code>export GITHUB_ORG=&lt;your-github-user-or-org&gt;
+export REPO="$GITHUB_ORG/kubernetes-reliability-lab"
+gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com
+
+gcloud iam workload-identity-pools create "github" \
+  --project="${PROJECT_ID}" --location="global" \
+  --display-name="GitHub Actions Pool"
+
+gcloud iam workload-identity-pools providers create-oidc "reliability-repo" \
+  --project="${PROJECT_ID}" --location="global" \
+  --workload-identity-pool="github" \
+  --display-name="reliability-lab repo" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository,attribute.repository_owner=assertion.repository_owner" \
+  --attribute-condition="assertion.repository_owner == '${GITHUB_ORG}'" \
+  --issuer-uri="https://token.actions.githubusercontent.com"
+
+export POOL_ID=$(gcloud iam workload-identity-pools describe github \
+  --project="$PROJECT_ID" --location=global --format='value(name)')
+gcloud artifacts repositories add-iam-policy-binding reliability \
+  --location="$REGION" --role=roles/artifactregistry.writer \
+  --member="principalSet://iam.googleapis.com/${POOL_ID}/attribute.repository/${REPO}"</code></pre>
+    <div class="callout tip"><span class="label">Harden the condition</span>
+      <p>Google's deployment-pipeline guide warns that name-based claims (<code>repository</code>, <code>repository_owner</code>) are exposed to cybersquatting/typosquatting and recommends mapping the numeric <code>*_id</code> claims; you can also restrict to a branch, e.g. <code>assertion.repository_owner=='ORG' &amp;&amp; assertion.ref=='refs/heads/main'</code>.</p>
+    </div>
+<pre data-title=".github/workflows/push-ar.yml (excerpt)"><code>permissions:
+  contents: 'read'
+  id-token: 'write'          <span class="c"># allow the job to request the OIDC token</span>
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: 'actions/checkout@v7'
+      - uses: 'google-github-actions/auth@v3'
+        with:
+          project_id: 'reliability-lab-12345'
+          workload_identity_provider: 'projects/123456789/locations/global/workloadIdentityPools/github/providers/reliability-repo'
+      - uses: 'google-github-actions/setup-gcloud@v3'
+      - run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+      - run: |
+          IMAGE=us-central1-docker.pkg.dev/reliability-lab-12345/reliability/reliability-api:${GITHUB_SHA::7}
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"</code></pre>
+    <p>Action versions above match the READMEs as of 29 Oct 2026; pin to the current major (or a commit SHA) when you copy them. If a Google API you call does not accept direct federated principals, pass <code>service_account:</code> to the auth action to impersonate a service account instead, and grant the principal set <code>roles/iam.workloadIdentityUser</code> on it.</p>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><code>Unable to get ACTIONS_ID_TOKEN_REQUEST_URL</code> / no token: missing <code>id-token: write</code> permission (or a fork PR where it is not granted).</li>
+      <li><code>The given credential is rejected by the attribute condition</code>: the condition does not match the token (wrong owner name, branch restriction).</li>
+      <li><code>Permission … denied</code> on push: the principalSet string or role binding is wrong (pool full name uses the project <em>number</em>).</li>
+      <li>Long jobs fail late: derived credentials share the short OIDC token lifetime noted in the auth README; authenticate close to where you need it.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2 id="s-expose">Exposing reliability-api: LoadBalancer Service vs Gateway/Ingress</h2>
+    <p>In kind you reached the app with <code>kubectl port-forward</code>. On GKE you have three options, with very different cost and capability:</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 330" role="img" aria-label="Three ways to reach reliability-api on GKE">
+        <defs><marker id="m11g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="140" y="24" text-anchor="middle" class="t-bold">A. port-forward (free)</text>
+        <rect class="box" x="40" y="40" width="200" height="40" rx="6"/><text x="140" y="65" text-anchor="middle">your laptop</text>
+        <rect class="box2" x="40" y="130" width="200" height="40" rx="6"/><text x="140" y="155" text-anchor="middle">API server tunnel</text>
+        <rect class="box3" x="40" y="220" width="200" height="40" rx="6"/><text x="140" y="245" text-anchor="middle">Service / Pod :8000</text>
+        <line class="line" x1="140" y1="80" x2="140" y2="130" marker-end="url(#m11g)"/>
+        <line class="line" x1="140" y1="170" x2="140" y2="220" marker-end="url(#m11g)"/>
+        <text x="140" y="290" text-anchor="middle" class="t-muted">only you; no public IP</text>
+        <text x="440" y="24" text-anchor="middle" class="t-bold">B. Service type LoadBalancer (L4)</text>
+        <rect class="box" x="340" y="40" width="200" height="40" rx="6"/><text x="440" y="65" text-anchor="middle">internet client</text>
+        <rect class="box2" x="340" y="130" width="200" height="40" rx="6"/><text x="440" y="150" text-anchor="middle">passthrough Network LB</text><text x="440" y="164" text-anchor="middle" class="t-muted">regional, TCP/UDP</text>
+        <rect class="box3" x="340" y="220" width="200" height="40" rx="6"/><text x="440" y="245" text-anchor="middle">nodes → Pods :8000</text>
+        <line class="line" x1="440" y1="80" x2="440" y2="130" marker-end="url(#m11g)"/>
+        <line class="line" x1="440" y1="170" x2="440" y2="220" marker-end="url(#m11g)"/>
+        <text x="440" y="290" text-anchor="middle" class="t-muted">one LB + IP per Service; billed</text>
+        <text x="740" y="24" text-anchor="middle" class="t-bold">C. Gateway API / Ingress (L7)</text>
+        <rect class="box" x="640" y="40" width="200" height="40" rx="6"/><text x="740" y="65" text-anchor="middle">HTTPS client</text>
+        <rect class="box2" x="640" y="130" width="200" height="40" rx="6"/><text x="740" y="150" text-anchor="middle">Application LB</text><text x="740" y="164" text-anchor="middle" class="t-muted">host/path routing, TLS</text>
+        <rect class="box3" x="640" y="220" width="200" height="40" rx="6"/><text x="740" y="245" text-anchor="middle">HTTPRoute → Service</text>
+        <line class="line" x1="740" y1="80" x2="740" y2="130" marker-end="url(#m11g)"/>
+        <line class="line" x1="740" y1="170" x2="740" y2="220" marker-end="url(#m11g)"/>
+        <text x="740" y="290" text-anchor="middle" class="t-muted">many Services behind one LB; billed</text>
+      </svg>
+      <figcaption>Figure 11.7 — Port-forward for labs; an L4 passthrough Network Load Balancer per <code>LoadBalancer</code> Service; or an L7 Application Load Balancer provisioned by the GKE Gateway controller (or Ingress) that routes HTTP to many Services.</figcaption>
+    </figure>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>LoadBalancer Service</th><th>Gateway (recommended L7) / Ingress</th></tr></thead>
+      <tbody>
+        <tr><td>Layer</td><td>L4 (TCP/UDP), passthrough — the client connection reaches your Pod</td><td>L7 (HTTP/HTTPS), proxied — TLS termination, host/path routing, header matching</td></tr>
+        <tr><td>GKE implementation</td><td>External passthrough Network LB (on GKE 1.37+ the backend-service-based variant with <code>GCE_VM_IP</code> NEGs); internal via annotation <code>networking.gke.io/load-balancer-type: "Internal"</code></td><td>GKE Gateway controller ("enabled by default in GKE") creates Cloud Load Balancing resources from <code>Gateway</code> + <code>HTTPRoute</code>; GatewayClasses such as <code>gke-l7-global-external-managed</code>, <code>gke-l7-regional-external-managed</code>, <code>gke-l7-rilb</code> (internal)</td></tr>
+        <tr><td>Cost shape</td><td>One forwarding rule/IP per Service, plus data processed</td><td>One LB shared by many routes, plus rules and data processed</td></tr>
+        <tr><td>Good for reliability-api?</td><td>Quick demo of a public endpoint</td><td>Anything with HTTPS, several services, or canary routing</td></tr>
+      </tbody>
+    </table></div>
+    <p>Load balancer prices (forwarding rules, data processing) are on the Cloud Load Balancing pricing page; check it — and remember the LB is billed for as long as the Service/Gateway exists, even with zero traffic.</p>
+<pre data-title="gateway.yaml — reliability-api behind a regional external Application LB"><code>apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reliability-gw
+  namespace: reliability-lab
+spec:
+  gatewayClassName: gke-l7-regional-external-managed
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+spec:
+  parentRefs:
+  - name: reliability-gw
+  rules:
+  - matches:
+    - path: { type: PathPrefix, value: / }
+    backendRefs:
+    - name: reliability-api        <span class="c"># the existing ClusterIP Service, port 80</span>
+      port: 80</code></pre>
+    <div class="callout note"><span class="label">Prerequisites and health checks</span>
+      <p>Regional external managed load balancers need a <em>proxy-only subnet</em> in the region; the GKE Gateway docs explain how to create it. Google load balancers health-check your Pods; GKE can derive the check from the readiness probe or you can set a <code>HealthCheckPolicy</code>. If the LB marks backends unhealthy, compare its health-check path/port with <code>/ready</code> on 8000.</p>
+    </div>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><code>EXTERNAL-IP</code> stays <code>&lt;pending&gt;</code>: quota, missing permissions, or invalid annotations — <code>kubectl describe svc</code> events.</li>
+      <li>Gateway has no address: <code>kubectl describe gateway reliability-gw</code> conditions (<code>Accepted</code>, <code>Programmed</code>), missing proxy-only subnet, wrong class name.</li>
+      <li>502 from the LB: backends unhealthy (readiness failing, health check on wrong port) — see Module 05/13 playbooks.</li>
+    </ul>
+    <details class="q"><summary>Self-check: you need to demo reliability-api to a teammate for 10 minutes. Which option and why?</summary><div class="a">Port-forward (or a short-lived LoadBalancer Service that you delete immediately). Port-forward costs nothing and exposes nothing publicly; a Gateway is overkill for a demo and keeps billing until deleted.</div></details>
+
+    <!-- ============================================================ -->
+    <h2 id="s-obs">Cloud Logging, Cloud Monitoring and Managed Service for Prometheus</h2>
+    <p>GKE ships container stdout/stderr to <strong>Cloud Logging</strong> and system metrics to <strong>Cloud Monitoring</strong> by default. reliability-api already logs to stdout (Module 02/07), so its log lines appear without code changes; query them in Logs Explorer with a filter like <code>resource.type="k8s_container" resource.labels.namespace_name="reliability-lab"</code>.</p>
+    <p><strong>Google Cloud Managed Service for Prometheus (GMP)</strong> is a managed, Prometheus-compatible backend. With <em>managed collection</em> (enabled by default on Autopilot clusters running GKE 1.25+ and Standard 1.27+, per the setup docs) you describe scrape targets with a <code>PodMonitoring</code> resource, and query with PromQL from Cloud Monitoring or Grafana. Billing is based on samples ingested (check the Cloud Monitoring pricing page).</p>
+<pre data-title="podmonitoring.yaml — scrape reliability-api /metrics every 30s"><code>apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reliability-api
+  endpoints:
+  - port: http          <span class="c"># the NAMED container port (8000) in the Deployment</span>
+    path: /metrics
+    interval: 30s</code></pre>
+    <p>Then the PromQL you wrote in Module 07 works unchanged, e.g. <code>histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{path="/work"}[5m])))</code>.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Choice</th><th>Pros</th><th>Cons</th></tr></thead>
+      <tbody>
+        <tr><td>GMP managed collection</td><td>Nothing to operate, long retention, integrates with Cloud Monitoring alerting</td><td>Per-sample cost; different CRDs (<code>PodMonitoring</code> instead of <code>ServiceMonitor</code>)</td></tr>
+        <tr><td>Your kube-prometheus-stack (Module 07)</td><td>Same as local; full control; portable</td><td>You run and size Prometheus; Autopilot restricts some host-level components (e.g. privileged exporters) — check compatibility</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Cost tip:</strong> logging is one of the most common hidden costs. Do not run reliability-api with <code>LOG_LEVEL=debug</code> under load on GKE, and avoid logging every request at info level during load tests.</p>
+
+    <!-- ============================================================ -->
+    <h2 id="s-helm-gke">Deploying the Helm chart to GKE: what changes</h2>
+    <p>The point of packaging reliability-api as a chart in Module 06 was that environments differ only in <em>values</em>. Keep <code>values.yaml</code> as the local default and add a small overlay for GKE:</p>
+<pre data-title="charts/reliability-api/values-gke.yaml"><code>image:
+  repository: us-central1-docker.pkg.dev/reliability-lab-12345/reliability/reliability-api
+  tag: "3f9c2ab"                 <span class="c"># CI passes --set image.tag=&lt;git-sha&gt;; never "latest"</span>
+  pullPolicy: IfNotPresent
+replicaCount: 2
+resources:
+  requests:
+    cpu: 100m                    <span class="c"># on Autopilot this IS the bill — check what admission sets</span>
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+serviceAccount:
+  create: true
+  name: reliability-api          <span class="c"># used by Workload Identity principal strings</span>
+config:
+  logLevel: info                 <span class="c"># debug logs at load-test volume = Cloud Logging cost</span>
+  readyDelaySeconds: "5"
+autoscaling:
+  enabled: true                  <span class="c"># chart default is false; turn the HPA on for GKE</span>
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 60</code></pre>
+    <p>Install with <code>helm upgrade --install reliability-api charts/reliability-api -f charts/reliability-api/values-gke.yaml -n reliability-lab</code>. Every key above exists in the Module 06 <code>values.yaml</code>. Helm silently ignores keys that no template reads, so a typo in an overlay fails quietly. Check with <code>helm template … -f values-gke.yaml | grep -A3 LOG_LEVEL</code>.</p>
+    <div class="callout example"><span class="label">Exercise: extend the chart for GKE</span>
+      <p>The Module 06 chart has no PodDisruptionBudget or topology-spread template. For a regional Autopilot cluster both are worth adding:</p>
+      <ul>
+        <li>a <code>templates/pdb.yaml</code> guarded by <code>{{- if .Values.podDisruptionBudget.enabled }}</code> with <code>minAvailable: 1</code>, which protects availability during node upgrades (Module 04);</li>
+        <li>a <code>topologySpreadConstraints</code> block in the Deployment template using <code>topologyKey: topology.kubernetes.io/zone</code>.</li>
+      </ul>
+      <p>Add the matching keys to <code>values.yaml</code> with safe defaults (disabled), enable them in <code>values-gke.yaml</code>, then run <code>helm lint</code> and <code>helm template</code> to check the output.</p></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Value</th><th>kind</th><th>GKE</th><th>Why it differs</th></tr></thead>
+      <tbody>
+        <tr><td>image.repository</td><td><code>reliability-api</code> (loaded with kind)</td><td>Artifact Registry path</td><td>nodes must pull over the network with IAM</td></tr>
+        <tr><td>image.tag</td><td><code>0.1.0</code></td><td>git SHA</td><td>traceability from Pod to commit</td></tr>
+        <tr><td>resources.requests</td><td>scheduling hint</td><td>scheduling hint <em>and</em> billing unit</td><td>Autopilot Pod-based billing</td></tr>
+        <tr><td>PDB / topology spread</td><td>optional</td><td>recommended</td><td>auto-upgrades and multi-zone nodes</td></tr>
+        <tr><td>Service type</td><td>ClusterIP</td><td>ClusterIP (+ Gateway when needed)</td><td>avoid a billed LB per Service</td></tr>
+      </tbody>
+    </table></div>
+
+    <section class="lab"><header>Lab 2 — Autopilot cluster, Helm deploy, observe, clean up</header><div class="body">
+      <div class="callout danger"><span class="label">Cost warning</span><p>This lab creates a GKE Autopilot cluster (cluster management fee $0.10/hour as of 29 Oct 2026, possibly offset by the free-tier credit for your first cluster), two small Pods (billed per request), logs and metrics, and optionally a load balancer. Budget about one to two hours and do the cleanup the same day. Do <strong>not</strong> leave the cluster running overnight.</p></div>
+      <p><strong>Goal:</strong> the same Helm chart from Module 06, running on GKE with the Artifact Registry image, probes passing, HPA present, metrics visible.</p>
+      <ol class="steps">
+        <li><strong>Create the cluster</strong> (takes several minutes):
+<pre><code>gcloud container clusters create-auto reliability-lab \
+    --location="$REGION" --release-channel=regular \
+    --labels=app=reliability-api,env=lab
+gcloud container clusters get-credentials reliability-lab --location="$REGION"
+kubectl config current-context
+kubectl get nodes</code></pre>
+          <p>Example output (yours will differ; Autopilot may show few or no nodes until Pods need them):</p>
+<pre><code><span class="o">gke_reliability-lab-12345_us-central1_reliability-lab
+NAME                                             STATUS   ROLES    AGE   VERSION
+gk3-reliability-lab-pool-2-1a2b3c4d-xyz1         Ready    &lt;none&gt;   3m    v1.3x.x-gke.xxxx</span></code></pre></li>
+        <li><strong>Deploy the chart with the Artifact Registry image.</strong> (The chart from Module 06 exposes <code>image.repository</code> and <code>image.tag</code>.)
+<pre><code>helm upgrade --install reliability-api charts/reliability-api \
+  --namespace reliability-lab --create-namespace \
+  --set image.repository="$REGION-docker.pkg.dev/$PROJECT_ID/reliability/reliability-api" \
+  --set image.tag="$SHA" \
+  --wait --timeout 10m
+kubectl -n reliability-lab get deploy,pods,svc,hpa</code></pre>
+          <p>Example output (yours will differ in names/timings):</p>
+<pre><code><span class="o">NAME                              READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/reliability-api   2/2     2            2           2m
+NAME                                   READY   STATUS    RESTARTS   AGE
+pod/reliability-api-6d9f7c8b5d-4kq2m   1/1     Running   0          2m
+pod/reliability-api-6d9f7c8b5d-p8wzs   1/1     Running   0          2m
+NAME                      TYPE        CLUSTER-IP       EXTERNAL-IP   PORT(S)   AGE
+service/reliability-api   ClusterIP   34.118.230.17    &lt;none&gt;        80/TCP    2m
+NAME                                                  REFERENCE                    TARGETS       MINPODS   MAXPODS   REPLICAS
+horizontalpodautoscaler.autoscaling/reliability-api   Deployment/reliability-api   cpu: 3%/60%   2         6         2</span></code></pre></li>
+        <li><strong>See what Autopilot did to your requests</strong> (you are billed on these):
+<pre><code>kubectl -n reliability-lab get pod -l app.kubernetes.io/name=reliability-api \
+  -o jsonpath='{.items[0].spec.containers[0].resources}{"\n"}'
+kubectl -n reliability-lab get pod -l app.kubernetes.io/name=reliability-api -o yaml | grep -i autopilot</code></pre>
+          <p>Compare with your chart values (100m / 128Mi). If Autopilot raised them, note the new values in your cost notes.</p></li>
+        <li><strong>Test through a port-forward (free):</strong>
+<pre><code>kubectl -n reliability-lab port-forward svc/reliability-api 8080:80 &amp;
+curl -s localhost:8080/ready; echo
+curl -s "localhost:8080/work?ms=50"; echo</code></pre>
+          <p>Example output:</p>
+<pre><code><span class="o">{"ready":true}
+{"worked_ms":50.0}</span></code></pre></li>
+        <li><strong>Metrics with GMP:</strong> make sure the Deployment's container port is named <code>http</code> (add it to the chart if not), apply <code>podmonitoring.yaml</code>, wait a few minutes, then in Cloud Console → Monitoring → Metrics Explorer → PromQL run <code>sum(rate(http_requests_total[5m]))</code> while generating a little load with your Module 08 k6 script against the port-forward.</li>
+        <li><strong>Logs:</strong> Logs Explorer filter <code>resource.type="k8s_container" resource.labels.namespace_name="reliability-lab"</code>.</li>
+        <li><strong>(Optional, billed) public endpoint:</strong> apply the Gateway above <em>or</em> <code>kubectl -n reliability-lab expose deploy reliability-api --name=reliability-api-lb --type=LoadBalancer --port=80 --target-port=8000</code>. Note the time you created it. Delete it as soon as you have tested it.</li>
+      </ol>
+      <p><strong>Cleanup (in this order) and verification:</strong></p>
+<pre><code><span class="c"># 1. delete anything that created Google Cloud resources outside the cluster FIRST</span>
+kubectl -n reliability-lab delete gateway,httproute --all --ignore-not-found
+kubectl -n reliability-lab delete svc reliability-api-lb --ignore-not-found
+kubectl get svc -A | grep LoadBalancer          <span class="c"># expect no output</span>
+kubectl get pvc -A                              <span class="c"># PVCs → persistent disks that would survive</span>
+<span class="c"># 2. uninstall the release and delete the cluster</span>
+helm -n reliability-lab uninstall reliability-api
+gcloud container clusters delete reliability-lab --location="$REGION" --quiet
+<span class="c"># 3. verify nothing billable is left behind</span>
+gcloud container clusters list
+gcloud compute forwarding-rules list
+gcloud compute addresses list
+gcloud compute disks list
+<span class="c"># 4. remove the stale kube context</span>
+kubectl config delete-context gke_${PROJECT_ID}_${REGION}_reliability-lab</code></pre>
+      <p>Expected after cleanup: each <code>list</code> command prints <code>Listed 0 items.</code> (or nothing). If disks or forwarding rules remain, see the explorer widget below.</p>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2 id="s-cost">Cost controls: budgets, labels, checklists, cleanup</h2>
+    <p><strong>Problem.</strong> Cloud bills are driven by things that are easy to forget: a load balancer left from a demo, a disk orphaned by a deleted cluster, debug logs at load-test volume, a regional Standard cluster with nine nodes. Cost control is an <em>engineering habit</em>, not a finance task.</p>
+    <h3>Budgets and alerts</h3>
+    <ul>
+      <li>A budget tracks actual (and forecasted) spend against an amount for a scope: billing account, projects, services, <em>labels</em>, folders.</li>
+      <li>Default thresholds notify at <strong>50%, 90%, 100%</strong> of actual spend; add forecasted thresholds to be warned earlier.</li>
+      <li>Alerts go to Billing Account Administrators/Users (and Project Owners for single-project budgets), or to Cloud Monitoring notification channels.</li>
+      <li><strong>Critical:</strong> "Setting an alerts-only budget doesn't automatically cap … usage or spending." Alerts are smoke detectors, not sprinklers. Your cleanup procedure is the sprinkler.</li>
+    </ul>
+    <h3>Labels</h3>
+    <p>Labels are key/value pairs on Google Cloud resources (clusters, disks, repos, buckets) that appear in billing exports and can scope budgets. Use the same three everywhere: <code>app=reliability-api</code>, <code>env=lab</code>, <code>owner=&lt;you&gt;</code>. They are not the same thing as Kubernetes labels on Pods, though GKE can propagate cluster labels to underlying resources and cost allocation can break costs down by namespace/K8s labels when enabled.</p>
+
+    <div class="widget" id="w-checklist">
+      <div class="w-title">Cost-risk checklist (saved in this browser)</div>
+      <div class="w-sub">Tick each item before and after a cloud lab. Progress is stored in localStorage on this device only.</div>
+      <div id="cl-items"></div>
+      <div class="row" style="margin-top:10px"><button class="btn" id="cl-reset" type="button">Reset checklist</button><span class="pill" id="cl-score"></span></div>
+    </div>
+
+    <h3>What still costs money after you delete the cluster?</h3>
+    <p>"Delete the cluster" removes the control plane, nodes, Pods, emptyDir/hostPath data, and the firewall rules and routes GKE created. It does <em>not</em> remove everything. The GKE docs warn that persistent disk volumes are retained, and recommend deleting <code>LoadBalancer</code> Services before the cluster because cleanup of load balancer resources can fail. Explore the list:</p>
+
+    <div class="widget" id="w-explorer">
+      <div class="w-title">Leftover-cost explorer</div>
+      <div class="w-sub">Click a resource to see whether it survives <code>gcloud container clusters delete</code>, how to find it and how to remove it.</div>
+      <div class="row" id="ex-buttons"></div>
+      <div class="out" id="ex-out">Select a resource above.</div>
+    </div>
+
+    <h3>Cleanup procedure (always in this order)</h3>
+    <ol>
+      <li><strong>Kubernetes objects that own cloud resources:</strong> <code>LoadBalancer</code> Services, Gateways/Ingresses, PVCs (decide: keep data or delete). Verify with <code>kubectl get svc,gateway,ingress,pvc -A</code>.</li>
+      <li><strong>Helm releases</strong> (optional once the cluster is going, but tidy).</li>
+      <li><strong>The cluster</strong>: <code>gcloud container clusters delete …</code> or <code>terraform destroy</code>.</li>
+      <li><strong>Project-level leftovers</strong>: disks, snapshots, static IPs, forwarding rules, NAT/routers, buckets (incl. Terraform state, last), Artifact Registry repos.</li>
+      <li><strong>Verify</strong> with list commands; next day, check the billing report filtered by label <code>app=reliability-api</code> shows costs dropping to zero.</li>
+      <li><strong>End of course</strong>: shut down the project (<code>gcloud projects delete PROJECT_ID</code>) as the final sweep.</li>
+    </ol>
+
+    <!-- ============================================================ -->
+    <h2 id="s-tf">Terraform for a GKE Autopilot cluster</h2>
+    <p>Module 10 taught providers, state, plan/apply/destroy. Here we apply them to GKE. Boundary reminder: <strong>Terraform</strong> owns the VPC, subnet, cluster, repository and IAM; <strong>Helm</strong> owns what runs inside the cluster. Do not manage the reliability-api Deployment with Terraform in this course.</p>
+    <p>Arguments below were checked against the <code>google_container_cluster</code> documentation for the hashicorp/google provider (latest version listed on the registry API on 29 Oct 2026: 8.9.0). Key points from that page:</p>
+    <ul>
+      <li><code>enable_autopilot</code> — "Enable Autopilot for this cluster. Defaults to <code>false</code>."</li>
+      <li><code>location</code> — a region gives a regional cluster (Autopilot must be regional).</li>
+      <li><code>deletion_protection</code> — "Deleting this cluster via <code>terraform destroy</code> or <code>terraform apply</code> will only succeed if this field is <code>false</code> in the Terraform state." Since provider 5.0.0 you must set it to <code>false</code> <em>and apply</em> before you can destroy.</li>
+      <li><code>ip_allocation_policy</code> with <code>cluster_secondary_range_name</code> / <code>services_secondary_range_name</code> — use named subnet ranges.</li>
+      <li><code>release_channel { channel = "REGULAR" }</code>; <code>resource_labels</code> for labels.</li>
+      <li>The page warns all arguments and attributes (including certificate outputs) are stored in state as plaintext — protect the state bucket.</li>
+    </ul>
+<pre data-title="infra/gke/main.tf — skeleton"><code>terraform {
+  required_version = "&gt;= 1.6"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~&gt; 8.0"          <span class="c"># check the registry for the current major</span>
+    }
+  }
+  <span class="c"># backend "gcs" { bucket = "reliability-lab-12345-tfstate"  prefix = "gke" }</span>
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+  default_labels = {
+    app   = "reliability-api"
+    env   = "lab"
+    owner = var.owner
+  }
+}
+
+variable "project_id" {
+  type = string
+}
+variable "region" {
+  type    = string
+  default = "us-central1"
+}
+variable "owner" {
+  type = string
+}
+
+resource "google_project_service" "apis" {
+  for_each = toset(["container.googleapis.com", "artifactregistry.googleapis.com"])
+  service  = each.value
+  disable_on_destroy = false
+}
+
+resource "google_compute_network" "vpc" {
+  name                    = "reliability-vpc"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "gke" {
+  name          = "gke-subnet"
+  region        = var.region
+  network       = google_compute_network.vpc.id
+  ip_cidr_range = "10.10.0.0/20"           <span class="c"># nodes</span>
+  secondary_ip_range {
+    range_name    = "pods"
+    ip_cidr_range = "10.20.0.0/16"
+  }
+  secondary_ip_range {
+    range_name    = "services"
+    ip_cidr_range = "10.30.0.0/20"
+  }
+}
+
+resource "google_artifact_registry_repository" "reliability" {
+  location      = var.region
+  repository_id = "reliability"
+  format        = "DOCKER"
+  description   = "reliability-api images"
+}
+
+resource "google_container_cluster" "lab" {
+  name     = "reliability-lab"
+  location = var.region                     <span class="c"># region =&gt; regional (required for Autopilot)</span>
+
+  enable_autopilot    = true
+  deletion_protection = false               <span class="c"># lab only: allows terraform destroy</span>
+
+  network    = google_compute_network.vpc.id
+  subnetwork = google_compute_subnetwork.gke.id
+  ip_allocation_policy {
+    cluster_secondary_range_name  = "pods"
+    services_secondary_range_name = "services"
+  }
+
+  release_channel {
+    channel = "REGULAR"
+  }
+
+  resource_labels = {
+    app = "reliability-api"
+    env = "lab"
+  }
+
+  depends_on = [google_project_service.apis]
+}
+
+output "cluster_name" { value = google_container_cluster.lab.name }
+output "get_credentials" {
+  value = "gcloud container clusters get-credentials ${google_container_cluster.lab.name} --location=${var.region} --project=${var.project_id}"
+}</code></pre>
+    <div class="callout warn"><span class="label">Verify before you apply</span>
+      <p>Provider majors change argument behaviour; run <code>terraform init -upgrade</code> and <code>terraform validate</code>, and read the plan. If <code>default_labels</code> or a nested block is rejected by your provider version, follow the error message and the registry page for that version — do not guess.</p>
+    </div>
+
+    <section class="lab"><header>Lab 3 — Plan, apply and destroy GKE with Terraform</header><div class="body">
+      <div class="callout danger"><span class="label">Cost warning</span><p>Same costs as Lab 2 (cluster fee, Pods, repository storage). If Lab 2's cluster still exists, delete it first so you do not run two clusters (the free-tier credit covers about one).</p></div>
+      <ol class="steps">
+        <li><code>cd infra/gke &amp;&amp; terraform init</code></li>
+        <li>Create <code>terraform.tfvars</code> (do not commit if it contains anything personal): <code>project_id = "reliability-lab-12345"</code>, <code>owner = "yourname"</code>. Make sure ADC is set: <code>gcloud auth application-default login</code>.</li>
+        <li><code>terraform fmt -check &amp;&amp; terraform validate</code></li>
+        <li><code>terraform plan -out=tfplan</code> — read it. Expect roughly: 2 API enablements, 1 network, 1 subnet, 1 repository, 1 cluster to add.
+<pre><code><span class="o">Plan: 6 to add, 0 to change, 0 to destroy.</span></code></pre>
+          <p>(Example output; the count depends on your file.) Write down what each resource will cost before you type apply.</p></li>
+        <li><code>terraform apply tfplan</code> (cluster creation takes several minutes), then run the <code>get_credentials</code> output and repeat Lab 2 steps 2–5 with the Helm chart.</li>
+        <li><strong>Destroy</strong> (after deleting any LoadBalancer Services/Gateways with kubectl):
+<pre><code>terraform plan -destroy        <span class="c"># read: everything listed will be deleted</span>
+terraform destroy
+gcloud container clusters list
+gcloud compute networks list   <span class="c"># reliability-vpc should be gone</span>
+gcloud compute disks list</code></pre></li>
+      </ol>
+      <p><strong>If destroy fails</strong> with a deletion-protection error: set <code>deletion_protection = false</code>, run <code>terraform apply</code> to record it in state, then destroy again. If the network cannot be deleted because "resource is in use", a leftover load balancer or firewall rule still references it — list forwarding rules and firewall rules and remove the leftovers created by Kubernetes.</p>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2 id="s-trouble">GKE troubleshooting quick map</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Symptom</th><th>First commands</th><th>Common GKE-specific cause</th></tr></thead>
+      <tbody>
+        <tr><td><code>kubectl</code>: "gke-gcloud-auth-plugin not found"</td><td><code>gcloud components list</code></td><td>auth plugin not installed / not on PATH</td></tr>
+        <tr><td>Pods Pending a long time on Autopilot</td><td><code>kubectl describe pod</code> events</td><td>node provisioning in progress (normal for a minute or two); request exceeds class maximum; quota</td></tr>
+        <tr><td>Pod rejected at admission</td><td>apply output / events</td><td>Autopilot policy: privileged, hostPath, unsupported resource ratio</td></tr>
+        <tr><td><code>ImagePullBackOff</code></td><td><code>kubectl describe pod</code></td><td>node SA lacks Artifact Registry reader; wrong region host; arm64 image</td></tr>
+        <tr><td>Errors during the night, then fine</td><td>Cluster operations/upgrade history in console; events</td><td>auto-upgrade drained nodes; missing PDB/readiness</td></tr>
+        <tr><td>403 from Google APIs inside Pod</td><td>check KSA name, IAM binding, env vars</td><td>Workload Identity principal mismatch</td></tr>
+        <tr><td>Bill higher than expected</td><td>Billing report grouped by SKU, filtered by label</td><td>LB left running, logs volume, Pods in crash loops, leftover disks</td></tr>
+      </tbody>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Task</th><th>Command</th></tr></thead>
+      <tbody>
+        <tr><td>Who/what am I using?</td><td><code>gcloud config list</code> · <code>gcloud auth list</code></td></tr>
+        <tr><td>Set project / region</td><td><code>gcloud config set project ID</code> · <code>gcloud config set compute/region us-central1</code></td></tr>
+        <tr><td>Enable APIs</td><td><code>gcloud services enable container.googleapis.com artifactregistry.googleapis.com</code></td></tr>
+        <tr><td>Create Autopilot cluster</td><td><code>gcloud container clusters create-auto NAME --location=REGION --release-channel=regular</code></td></tr>
+        <tr><td>kubeconfig for cluster</td><td><code>gcloud container clusters get-credentials NAME --location=REGION</code></td></tr>
+        <tr><td>Create Docker repo</td><td><code>gcloud artifacts repositories create reliability --repository-format=docker --location=REGION</code></td></tr>
+        <tr><td>Docker auth for AR</td><td><code>gcloud auth configure-docker REGION-docker.pkg.dev</code></td></tr>
+        <tr><td>List images</td><td><code>gcloud artifacts docker images list REGION-docker.pkg.dev/ID/reliability --include-tags</code></td></tr>
+        <tr><td>Project number</td><td><code>gcloud projects describe ID --format='value(projectNumber)'</code></td></tr>
+        <tr><td>IAM policy</td><td><code>gcloud projects get-iam-policy ID</code></td></tr>
+        <tr><td>Deploy chart</td><td><code>helm upgrade --install reliability-api charts/reliability-api -n reliability-lab --set image.repository=… --set image.tag=SHA</code></td></tr>
+        <tr><td>Delete cluster</td><td><code>gcloud container clusters delete NAME --location=REGION</code></td></tr>
+        <tr><td>Leftover check</td><td><code>gcloud compute disks list</code> · <code>forwarding-rules list</code> · <code>addresses list</code> · <code>gcloud artifacts repositories list</code> · <code>gcloud storage buckets list</code></td></tr>
+        <tr><td>Nuke everything</td><td><code>gcloud projects delete ID</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>Project</dt><dd>Container for resources, billing link, enabled APIs and IAM. Identified by immutable ID and numeric number.</dd>
+      <dt>Billing account</dt><dd>Pays for one or more projects; has its own IAM and budgets.</dd>
+      <dt>Principal</dt><dd>An identity IAM can grant roles to: user, group, service account, federated identity/principal set.</dd>
+      <dt>Role</dt><dd>Named set of permissions: basic, predefined or custom.</dd>
+      <dt>Allow policy</dt><dd>List of role bindings attached to a resource; inherited by descendants.</dd>
+      <dt>Service account</dt><dd>Identity for software (<code>…@PROJECT.iam.gserviceaccount.com</code>).</dd>
+      <dt>Region / zone</dt><dd>Geographic location / isolated failure domain within it.</dd>
+      <dt>VPC-native</dt><dd>Cluster networking mode using alias IP ranges; Pod IPs from a subnet secondary range.</dd>
+      <dt>Node pool</dt><dd>Group of nodes with identical configuration (Standard mode).</dd>
+      <dt>Autopilot</dt><dd>GKE mode where Google manages nodes; general-purpose Pods are billed by their requests.</dd>
+      <dt>Release channel</dt><dd>Rapid/Regular/Stable/Extended stream of GKE versions and auto-upgrades.</dd>
+      <dt>Artifact Registry</dt><dd>Google Cloud registry; Docker repos at <code>LOCATION-docker.pkg.dev</code>.</dd>
+      <dt>Workload Identity Federation for GKE</dt><dd>Lets a Kubernetes ServiceAccount act as an IAM principal via pool <code>PROJECT_ID.svc.id.goog</code>.</dd>
+      <dt>Workload identity pool / provider</dt><dd>Trust configuration for external identity tokens (e.g., GitHub OIDC), with attribute mapping and conditions.</dd>
+      <dt>STS</dt><dd>Security Token Service: exchanges external/federated tokens for Google access tokens.</dd>
+      <dt>GatewayClass</dt><dd>Type of load balancer a Gateway creates, e.g. <code>gke-l7-regional-external-managed</code>.</dd>
+      <dt>PodMonitoring</dt><dd>GMP custom resource declaring Prometheus scrape targets.</dd>
+      <dt>Budget</dt><dd>Spend-tracking object that sends alerts at thresholds; does not cap spending by itself.</dd>
+    </dl>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. List the three things a project gives you that make it the natural unit for a lab.</summary><div class="a">A billing link (who pays), an IAM boundary (who can act, inherited by resources), and a lifecycle boundary (deleting the project removes everything inside), plus per-project API enablement.</div></details>
+    <details class="q"><summary>2. Why can an alerts-only budget not protect you from a forgotten load balancer?</summary><div class="a">It only notifies at thresholds of actual/forecast spend; it does not stop or delete resources. The LB keeps billing until someone deletes it. Only a cleanup procedure (and verification) removes the cost.</div></details>
+    <details class="q"><summary>3. You deploy reliability-api to Autopilot without resource requests. What happens and why does it matter?</summary><div class="a">Autopilot applies default requests (general-purpose: 0.5 vCPU, 2 GiB, 1 GiB ephemeral). You are billed for those requests, so two Pods cost far more than with 100m/128Mi. Also the HPA's CPU utilisation percentage is calculated against the request, so scaling behaviour changes.</div></details>
+    <details class="q"><summary>4. What does a regional cluster protect against that a zonal one does not, and what does it cost in Standard mode?</summary><div class="a">Control-plane and node availability during a single-zone failure and during control-plane upgrades. In Standard mode node counts are per zone (3 zones × N), and cross-zone traffic is billed. Autopilot is always regional and bills per Pod, so the node multiplication does not apply.</div></details>
+    <details class="q"><summary>5. Explain the difference between <code>gcloud auth login</code> and <code>gcloud auth application-default login</code>.</summary><div class="a">The first stores credentials for the gcloud CLI (and tools that call it, like the kubectl auth plugin and Docker credential helper). The second creates Application Default Credentials used by client libraries and Terraform. Terraform failing with "could not find default credentials" while gcloud works means ADC is missing.</div></details>
+    <details class="q"><summary>6. Your Pod gets 403 calling Cloud Storage despite Workload Identity. Give three things to check.</summary><div class="a">(1) The Pod's <code>serviceAccountName</code> matches the KSA in the principal string; (2) the principal uses the project <em>number</em> and the right namespace/KSA and has the role on that bucket; (3) no <code>GOOGLE_APPLICATION_CREDENTIALS</code> or key file overrides metadata credentials; also allow time for IAM propagation.</div></details>
+    <details class="q"><summary>7. Why does the GitHub provider need an attribute condition?</summary><div class="a">Without it, any GitHub repository's OIDC token (same issuer) could be exchanged in your pool. The condition (e.g. <code>assertion.repository_owner == 'you'</code>, better with numeric IDs and branch) restricts which workflows are trusted.</div></details>
+    <details class="q"><summary>8. What survives <code>gcloud container clusters delete</code>? Name at least four.</summary><div class="a">Persistent disks from PVCs, possibly load balancer forwarding rules/IPs if Services/Gateways were not deleted first (cleanup can fail), reserved static IPs, Artifact Registry images, Cloud Storage buckets (incl. Terraform state), snapshots, retained logs, Cloud NAT/routers created separately, and the project itself.</div></details>
+    <details class="q"><summary>9. Why must you set <code>deletion_protection = false</code> <em>and apply</em> before <code>terraform destroy</code> works?</summary><div class="a">Destroy succeeds only if the field is false <em>in state</em>. Changing the file alone is not enough: an apply records the new value in state; then destroy is allowed.</div></details>
+    <details class="q"><summary>10. When would you choose a Gateway over a LoadBalancer Service for reliability-api?</summary><div class="a">When you need HTTP features: TLS termination, host/path routing to several Services, traffic splitting for canaries, or one shared LB for many apps. For a quick L4 demo a LoadBalancer Service is simpler; for a private lab, port-forward.</div></details>
+    <details class="q"><summary>11. Your M-series Mac pushes an image; Pods crash with <code>exec format error</code>. Fix?</summary><div class="a">The image is arm64 and nodes are amd64. Rebuild with <code>docker buildx build --platform linux/amd64</code> (or multi-arch) and push, or build in CI on amd64 runners.</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/kubernetes-engine-overview">GKE overview — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/autopilot-overview">Autopilot overview — docs.cloud.google.com</a></li>
+      <li><a href="https://cloud.google.com/kubernetes-engine/pricing">GKE pricing (cluster fee, free tier, Autopilot billing; read 29 Oct 2026) — cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/autopilot-resource-requests">Autopilot resource requests (defaults, minimums, ratios) — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/how-to/creating-an-autopilot-cluster">Create an Autopilot cluster — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/regional-clusters">Regional clusters — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/release-channels">Release channels — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/alias-ips">VPC-native clusters — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/resource-manager/docs/cloud-platform-resource-hierarchy">Resource hierarchy — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/iam/docs/overview">IAM overview — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/artifact-registry/docs/docker/store-docker-container-images">Artifact Registry Docker quickstart — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/artifact-registry/docs/docker/pushing-and-pulling">Push and pull images — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/workload-identity">About Workload Identity Federation for GKE — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-identity">Authenticate to Google Cloud APIs from GKE workloads — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/iam/docs/workload-identity-federation-with-deployment-pipelines">Workload Identity Federation with deployment pipelines — docs.cloud.google.com</a></li>
+      <li><a href="https://github.com/google-github-actions/auth">google-github-actions/auth README (Google-maintained) — github.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/service-load-balancer">LoadBalancer Services on GKE — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/concepts/gateway-api">Gateway API on GKE — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/stackdriver/docs/managed-prometheus">Managed Service for Prometheus overview — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/stackdriver/docs/managed-prometheus/setup-managed">GMP managed collection setup — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/billing/docs/how-to/budgets">Create, edit, or delete budgets and budget alerts — docs.cloud.google.com</a></li>
+      <li><a href="https://docs.cloud.google.com/kubernetes-engine/docs/how-to/deleting-a-cluster">Deleting a cluster — docs.cloud.google.com</a></li>
+      <li><a href="https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/container_cluster">google_container_cluster — registry.terraform.io</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="10-terraform.html"><small>◀ Previous</small>Module 10 · Terraform &amp; Infrastructure as Code</a>
+      <a class="next" href="12-ai-inference.html"><small>Next ▶</small>Module 12 · AI Inference on Kubernetes</a>
+    </nav>
+  </article></main>
+</div>
+
+<script>
+(function () {
+  function $(id) { return document.getElementById(id); }
+
+  /* ---------- Autopilot cost estimator ---------- */
+  var ids = ["e-rep", "e-cpu", "e-mem", "e-eph", "e-pcpu", "e-pmem", "e-peph", "e-hours", "e-free"];
+  function num(id) { var v = parseFloat($(id).value); return isFinite(v) ? v : 0; }
+  function estimate() {
+    var rep = num("e-rep"), cpu = num("e-cpu"), mem = num("e-mem"), eph = num("e-eph");
+    var hours = num("e-hours");
+    var perPodHour = cpu * num("e-pcpu") + mem * num("e-pmem") + eph * num("e-peph");
+    var podsHour = perPodHour * rep;
+    var fee = 0.10;
+    var feeLine = $("e-free").checked ? "cluster fee: $0.10/h, likely offset by free-tier credit (first cluster)" : "cluster fee: $0.10/h";
+    var ratio = mem > 0 && cpu > 0 ? (mem / cpu) : 0;
+    var warn = "";
+    if (cpu > 0 && (ratio < 1 || ratio > 6.5)) warn = "\n! CPU:memory ratio 1:" + ratio.toFixed(2) + " is outside 1:1..1:6.5 — Autopilot would raise a value.";
+    var total = podsHour * hours + ($("e-free").checked ? 0 : fee * hours);
+    $("e-out").textContent =
+      "per Pod:      $" + perPodHour.toFixed(5) + " / hour\n" +
+      "all replicas: $" + podsHour.toFixed(5) + " / hour  (≈ $" + (podsHour * 730).toFixed(2) + " per 730-h month)\n" +
+      feeLine + "\n" +
+      "estimate for " + hours + " h: $" + total.toFixed(4) + warn +
+      "\n(illustrative only — excludes LB, logs, disks, egress, taxes; check current prices)";
+  }
+  ids.forEach(function (i) { var el = $(i); if (el) { el.addEventListener("input", estimate); el.addEventListener("change", estimate); } });
+  estimate();
+
+  /* ---------- Cost-risk checklist with localStorage ---------- */
+  var KEY = "notes-m11-costchecklist";
+  var items = [
+    "Using a dedicated lab project (not a shared/production one)",
+    "Budget with 50/90/100% actual + forecasted alerts exists for the project",
+    "Billing alert emails reach an inbox I actually read",
+    "All resources labelled app=reliability-api, env=lab, owner=me",
+    "Using Autopilot (or a small zonal Standard cluster), not regional Standard",
+    "No GPU or large machine types requested",
+    "Requests set explicitly (no 0.5 vCPU / 2 GiB defaults) and checked after admission",
+    "No public LoadBalancer/Gateway unless needed; creation time noted",
+    "LOG_LEVEL is info (not debug) during load tests",
+    "Artifact Registry cleanup policy or deletion planned",
+    "LoadBalancer Services, Gateways and PVCs deleted BEFORE the cluster",
+    "Cluster deleted and gcloud container clusters list is empty",
+    "disks / forwarding-rules / addresses / snapshots lists are empty",
+    "Next-day billing report checked for label app=reliability-api"
+  ];
+  function load() { try { return JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (e) { return {}; } }
+  function save(s) { try { localStorage.setItem(KEY, JSON.stringify(s)); } catch (e) { /* storage unavailable */ } }
+  var state = load();
+  var box = $("cl-items");
+  function score() {
+    var n = 0; items.forEach(function (_, i) { if (state[i]) n++; });
+    $("cl-score").textContent = n + " / " + items.length + " done" + (n === items.length ? " — safe to walk away" : "");
+  }
+  items.forEach(function (txt, i) {
+    var lab = document.createElement("label");
+    var cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = !!state[i];
+    cb.addEventListener("change", function () { state[i] = cb.checked; save(state); score(); });
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(" " + txt));
+    box.appendChild(lab);
+  });
+  $("cl-reset").addEventListener("click", function () {
+    state = {}; save(state);
+    box.querySelectorAll("input").forEach(function (cb) { cb.checked = false; });
+    score();
+  });
+  score();
+
+  /* ---------- Leftover-cost explorer ---------- */
+  var leftovers = [
+    { name: "Cluster fee", survives: "NO", why: "The $0.10/cluster-hour fee stops when the cluster is deleted.", find: "gcloud container clusters list", fix: "gcloud container clusters delete NAME --location=REGION" },
+    { name: "Autopilot Pods / nodes", survives: "NO", why: "Pods and node VMs are deleted with the cluster.", find: "gcloud compute instances list", fix: "nothing — verify instances list is empty" },
+    { name: "Persistent disks (PVCs)", survives: "YES", why: "GKE retains persistent disk volumes during cluster deletion. Disks are billed by provisioned size until deleted.", find: "gcloud compute disks list --filter=\"name~pvc\"", fix: "gcloud compute disks delete DISK --zone=ZONE (or --region for regional PDs) — after confirming you do not need the data" },
+    { name: "Load balancers from Services", survives: "MAYBE", why: "GKE attempts to delete LB resources but can fail, especially with many Services. Delete LoadBalancer Services and Gateways BEFORE the cluster.", find: "gcloud compute forwarding-rules list ; gcloud compute backend-services list", fix: "kubectl delete svc/gateway before cluster delete; otherwise delete forwarding rules, target pools/backend services, health checks manually" },
+    { name: "Reserved static IPs", survives: "YES", why: "Addresses you reserved (e.g., for a Gateway) are separate resources; an unattached reserved IP is still billed (check the IP pricing page).", find: "gcloud compute addresses list", fix: "gcloud compute addresses delete NAME --region=REGION (or --global)" },
+    { name: "Artifact Registry images", survives: "YES", why: "The repository and its images are project resources, independent of the cluster. Storage is billed beyond any free allowance.", find: "gcloud artifacts repositories list", fix: "gcloud artifacts repositories delete reliability --location=REGION" },
+    { name: "Cloud Storage buckets", survives: "YES", why: "Buckets (experiment reports, Terraform state) are independent and billed for storage.", find: "gcloud storage buckets list", fix: "gcloud storage rm --recursive gs://BUCKET (state bucket LAST, after terraform destroy)" },
+    { name: "Snapshots / backups", survives: "YES", why: "Disk snapshots or Backup for GKE backups are separate billed resources.", find: "gcloud compute snapshots list", fix: "gcloud compute snapshots delete NAME" },
+    { name: "Logs & metrics", survives: "PARTLY", why: "Ingestion stops with the cluster, but already-ingested data is retained per bucket retention; long custom retention or exported sinks can cost.", find: "Console: Logging → Logs Storage; Monitoring → Metrics", fix: "keep default retention for labs; delete custom sinks/buckets you created" },
+    { name: "Cloud NAT / routers", survives: "YES", why: "If you created Cloud NAT for private nodes, it is a separate resource and billed while it exists.", find: "gcloud compute routers list", fix: "gcloud compute routers nats delete … ; gcloud compute routers delete …" },
+    { name: "VPC, subnets, firewall rules", survives: "YES (you created them)", why: "Networks you created (e.g., by Terraform) remain; they are generally not a direct cost, but they block deletion of the network if LBs remain and clutter the project.", find: "gcloud compute networks list ; gcloud compute firewall-rules list", fix: "terraform destroy, or delete firewall rules, subnets, then network" },
+    { name: "The project itself", survives: "YES", why: "The project holds everything above. Deleting (shutting down) the project is the final sweep at the end of the course.", find: "gcloud projects list", fix: "gcloud projects delete PROJECT_ID" }
+  ];
+  var bwrap = $("ex-buttons");
+  leftovers.forEach(function (r) {
+    var b = document.createElement("button");
+    b.className = "btn"; b.type = "button"; b.textContent = r.name;
+    b.addEventListener("click", function () {
+      bwrap.querySelectorAll("button").forEach(function (x) { x.classList.remove("primary"); });
+      b.classList.add("primary");
+      $("ex-out").textContent =
+        r.name + "\nSurvives cluster delete? " + r.survives + "\n\nWhy: " + r.why + "\n\nFind it:  " + r.find + "\nRemove:   " + r.fix;
+    });
+    bwrap.appendChild(b);
+  });
+})();
+</script>
+</body>
+</html>

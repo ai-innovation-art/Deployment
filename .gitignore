@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.env
+*.pem
+*.key
+
+# Editors
+.vscode/
+.idea/
+
+# Build artifacts (keep rendered videos and posters)
+video-src/__pycache__/
+
+# Local scratch
+labs/scratch/

@@ -1,0 +1,1358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 08 · Autoscaling, Load Testing &amp; Failure Testing — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/anim.css">
+<script src="assets/notes.js"></script>
+<script src="assets/anim.js"></script>
+<style>
+  /* page-local helpers for widgets (theme tokens only) */
+  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; margin-top: 12px; }
+  .kv div { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13.5px; }
+  .kv b { display: block; font-family: var(--mono); font-size: 16px; }
+  .kv .bad { color: var(--bad); } .kv .ok { color: var(--ok); } .kv .warn { color: var(--warn); }
+  .widget .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 2px 16px; }
+  .widget .grid2 input[type="number"] { width: 100%; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .legend i { display: inline-block; width: 18px; height: 3px; vertical-align: middle; margin-right: 5px; background: var(--d-stroke); }
+  .legend i.acc { background: var(--accent); } .legend i.ok { background: var(--ok); } .legend i.bad { background: var(--bad); }
+  .legend i.warn { background: var(--warn); opacity: .5; height: 10px; } .legend i.dash { background: repeating-linear-gradient(90deg, var(--d-muted) 0 5px, transparent 5px 9px); }
+  .sim-chart { width: 100%; height: auto; display: block; margin-top: 10px; background: var(--surface); }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 08 · Autoscaling, Load Testing &amp; Failure Testing</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="08"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 08 · Autoscaling, Load Testing &amp; Failure Testing</h1>
+    <p class="lede">Module 07 gave you trustworthy measurements. Now you use them to answer the questions the whole project exists for: <em>Does <code>reliability-api</code> keep its test SLOs when traffic rises? Does the HorizontalPodAutoscaler add replicas in time, and does adding them actually help? When a Pod dies or a bad release ships, how many requests fail and how long until the service is healthy again?</em> You will learn the HPA algorithm well enough to predict its decisions, the theory that separates a real load test from “I ran a benchmark”, and a safe, measured way to inject failures.</p>
+    <div class="meta"><span class="pill accent">Prereq: Module 07 (Observability)</span><span class="pill">≈ 6 h study + 6 h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+    <section class="explainer" id="explainer-video"><header>🎬 Animated explainer <span class="pill accent">The HPA control loop & recovery</span></header><video controls preload="metadata" playsinline poster="videos/m08.jpg" src="videos/m08.mp4"></video><div class="ex-foot"><strong>Watch first, then read.</strong> The replica formula with a worked example, stabilization, and measuring recovery after a Pod failure. Rendered with Manim Community (MIT); source: <code>video-src/</code>. Facts match this page's verified sections.</div></section>
+
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Distinguish HPA, VPA and node autoscaling, and explain how they interact (and conflict).</li>
+      <li>Trace the resource metrics pipeline (cAdvisor → kubelet → metrics-server → <code>metrics.k8s.io</code>) and debug an HPA showing <code>&lt;unknown&gt;</code>.</li>
+      <li>Compute HPA decisions by hand: <code>desiredReplicas = ceil(currentReplicas × currentMetricValue / desiredMetricValue)</code>, including tolerance, not-ready Pods, stabilization and scaling policies.</li>
+      <li>Explain why CPU <em>requests</em> decide HPA behaviour, using <code>reliability-api</code>’s 100m request as the worked example.</li>
+      <li>Write an <code>autoscaling/v2</code> HPA, and know when you need custom/external metrics (prometheus-adapter, KEDA).</li>
+      <li>Design a load test: open vs closed workload model, coordinated omission, Little’s Law, warm-up, percentiles and sample size, load-generator limits.</li>
+      <li>Write and run a k6 script with stages and thresholds against <code>/work</code>; know the Locust equivalent.</li>
+      <li>Run bounded failure experiments (delete a Pod, ship a broken image, break readiness), measure fault time, impact window and recovery time, and write the report.</li>
+      <li>Know what Chaos Mesh and LitmusChaos add, and the safety rules for any fault injection.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>1. Three autoscalers, three different knobs</h2>
+    <p>“Autoscaling” means three different mechanisms acting at three different levels. Confusing them is the most common beginner error in interviews and in incident calls.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="HPA changes the number of Pods, VPA changes the size of each Pod's resource requests, a node autoscaler changes the number of nodes in the cluster">
+        <defs><marker id="m08a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="20" y="20" width="600" height="260" rx="12"/>
+        <text x="36" y="42" class="t-muted">Cluster</text>
+        <rect class="box3" x="40" y="60" width="270" height="200" rx="10"/>
+        <text x="175" y="84" text-anchor="middle" class="t-bold">Node 1</text>
+        <rect class="box2" x="60" y="110" width="70" height="56" rx="6"/><text x="95" y="143" text-anchor="middle">Pod</text>
+        <rect class="box2" x="145" y="110" width="70" height="56" rx="6"/><text x="180" y="143" text-anchor="middle">Pod</text>
+        <rect class="box2" x="226" y="100" width="76" height="76" rx="6"/><text x="264" y="143" text-anchor="middle">Pod</text>
+        <text x="175" y="210" text-anchor="middle" class="t-muted">requests must fit</text>
+        <text x="175" y="228" text-anchor="middle" class="t-muted">node allocatable</text>
+        <rect class="box3" x="330" y="60" width="270" height="200" rx="10"/>
+        <text x="465" y="84" text-anchor="middle" class="t-bold">Node 2</text>
+        <rect class="box2" x="350" y="110" width="70" height="56" rx="6"/><text x="385" y="143" text-anchor="middle">Pod</text>
+        <rect class="box" x="435" y="110" width="70" height="56" rx="6" style="stroke-dasharray:5 4"/><text x="470" y="143" text-anchor="middle" class="t-muted">new</text>
+        <rect class="box" x="520" y="110" width="70" height="56" rx="6" style="stroke-dasharray:5 4"/><text x="555" y="143" text-anchor="middle" class="t-muted">new</text>
+        <rect class="box4" x="650" y="30" width="200" height="60" rx="8"/>
+        <text x="750" y="54" text-anchor="middle" class="t-bold">HPA</text>
+        <text x="750" y="74" text-anchor="middle" class="t-muted">how many Pods (2 → 6)</text>
+        <rect class="box4" x="650" y="120" width="200" height="60" rx="8"/>
+        <text x="750" y="144" text-anchor="middle" class="t-bold">VPA</text>
+        <text x="750" y="164" text-anchor="middle" class="t-muted">how big each Pod’s requests</text>
+        <rect class="box4" x="650" y="210" width="200" height="60" rx="8"/>
+        <text x="750" y="234" text-anchor="middle" class="t-bold">Node autoscaler</text>
+        <text x="750" y="254" text-anchor="middle" class="t-muted">how many Nodes (cloud)</text>
+        <line class="line accent" x1="650" y1="60" x2="592" y2="120" marker-end="url(#m08a)"/>
+        <path class="line accent" d="M650,150 C460,200 320,200 290,178" marker-end="url(#m08a)"/>
+        <line class="line accent" x1="650" y1="240" x2="622" y2="240" marker-end="url(#m08a)"/>
+      </svg>
+      <figcaption>Figure 1 — HPA scales out (more Pods), VPA scales up (bigger requests), node autoscaling adds capacity for Pods that cannot be scheduled.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>HorizontalPodAutoscaler</th><th>VerticalPodAutoscaler</th><th>Node autoscaling (Cluster Autoscaler, Karpenter)</th></tr>
+      <tr><td>Changes</td><td><code>replicas</code> of a Deployment/StatefulSet (via the <code>scale</code> subresource)</td><td>Container resource requests (and proportionally limits)</td><td>Number (and type) of nodes</td></tr>
+      <tr><td>Input</td><td>Metrics: resource (<code>metrics.k8s.io</code>), custom, external</td><td>Historical CPU/memory usage, OOM events</td><td><strong>Pending Pods’ requests</strong> (provisioning) and node utilisation by requests (consolidation) — not real usage</td></tr>
+      <tr><td>Where it lives</td><td>Built into kube-controller-manager; API <code>autoscaling/v2</code></td><td>Separate install (CRD <code>autoscaling.k8s.io/v1</code> + recommender, updater, admission controller)</td><td>Cloud-integrated component (GKE, EKS, …); not in kind</td></tr>
+      <tr><td>Disruption</td><td>New Pods start; removed Pods terminate gracefully</td><td>Depends on mode: evict/recreate, in-place resize, or none</td><td>Consolidation drains and removes nodes</td></tr>
+      <tr><td>In this course</td><td><strong>HPA/reliability-api: min 2, max 6, CPU 60 %</strong></td><td>Recommendation-only (<code>Off</code>) experiment</td><td>Concept only (Module 11 on GKE)</td></tr>
+    </table></div>
+    <div class="callout warn"><span class="label">They act in sequence, not instead of each other</span>HPA can ask for six Pods, but if the six Pods’ requests do not fit on the nodes, the extra Pods stay <code>Pending</code>. Only a node autoscaler fixes that — and only in clouds. In a kind cluster, HPA’s ceiling is whatever your laptop’s Docker VM can schedule.</div>
+
+    <!-- ============================================================ -->
+    <h2>2. metrics-server and the resource metrics API</h2>
+    <p>The HPA does not read Prometheus. For CPU and memory it reads the <strong>Metrics API</strong> (<code>metrics.k8s.io</code>), an aggregated API that is usually served by the <strong>metrics-server</strong> add-on. The pipeline:</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 880 340" role="img" aria-label="Top lane: cAdvisor in the kubelet feeds metrics-server, which serves metrics.k8s.io to HPA, VPA and kubectl top. Bottom lane: app metrics in Prometheus are exposed through prometheus-adapter as custom or external metrics APIs to the HPA; KEDA creates HPAs and serves external metrics">
+        <defs><marker id="m08b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="20" y="28" class="t-bold">Resource metrics pipeline (CPU, memory) — what CPU-based HPA uses</text>
+        <rect class="box" x="20" y="44" width="130" height="58" rx="8"/><text x="85" y="68" text-anchor="middle" class="t-bold">cAdvisor</text><text x="85" y="88" text-anchor="middle" class="t-muted">in the kubelet</text>
+        <rect class="box" x="175" y="44" width="150" height="58" rx="8"/><text x="250" y="68" text-anchor="middle" class="t-bold">kubelet</text><text x="250" y="88" text-anchor="middle" class="t-muted">/metrics/resource</text>
+        <rect class="box3" x="350" y="44" width="140" height="58" rx="8"/><text x="420" y="68" text-anchor="middle" class="t-bold">metrics-server</text><text x="420" y="88" text-anchor="middle" class="t-muted">latest values only</text>
+        <rect class="box2" x="515" y="44" width="180" height="58" rx="8"/><text x="605" y="68" text-anchor="middle" class="t-bold">metrics.k8s.io</text><text x="605" y="88" text-anchor="middle" class="t-muted">API aggregation layer</text>
+        <rect class="box4" x="720" y="44" width="150" height="58" rx="8"/><text x="795" y="68" text-anchor="middle" class="t-bold">HPA · VPA</text><text x="795" y="88" text-anchor="middle" class="t-muted">kubectl top</text>
+        <line class="line" x1="150" y1="73" x2="173" y2="73" marker-end="url(#m08b)"/>
+        <line class="line" x1="325" y1="73" x2="348" y2="73" marker-end="url(#m08b)"/>
+        <line class="line" x1="490" y1="73" x2="513" y2="73" marker-end="url(#m08b)"/>
+        <line class="line" x1="695" y1="73" x2="718" y2="73" marker-end="url(#m08b)"/>
+        <text x="20" y="150" class="t-bold">Custom / external metrics pipeline (optional, needs an adapter)</text>
+        <rect class="box" x="20" y="166" width="130" height="58" rx="8"/><text x="85" y="190" text-anchor="middle" class="t-bold">app /metrics</text><text x="85" y="210" text-anchor="middle" class="t-muted">reliability-api</text>
+        <rect class="box" x="175" y="166" width="150" height="58" rx="8"/><text x="250" y="200" text-anchor="middle" class="t-bold">Prometheus</text>
+        <rect class="box3" x="350" y="166" width="140" height="58" rx="8"/><text x="420" y="190" text-anchor="middle" class="t-bold">prometheus-</text><text x="420" y="210" text-anchor="middle" class="t-bold">adapter</text>
+        <rect class="box2" x="515" y="166" width="180" height="58" rx="8"/><text x="605" y="190" text-anchor="middle" class="t-mono" style="font-size:11px">custom.metrics.k8s.io</text><text x="605" y="210" text-anchor="middle" class="t-mono" style="font-size:11px">external.metrics.k8s.io</text>
+        <rect class="box4" x="720" y="166" width="150" height="58" rx="8"/><text x="795" y="190" text-anchor="middle" class="t-bold">HPA</text><text x="795" y="210" text-anchor="middle" class="t-muted">Pods/Object/External</text>
+        <line class="line" x1="150" y1="195" x2="173" y2="195" marker-end="url(#m08b)"/>
+        <line class="line" x1="325" y1="195" x2="348" y2="195" marker-end="url(#m08b)"/>
+        <line class="line" x1="490" y1="195" x2="513" y2="195" marker-end="url(#m08b)"/>
+        <line class="line" x1="695" y1="195" x2="718" y2="195" marker-end="url(#m08b)"/>
+        <rect class="box3" x="350" y="262" width="345" height="58" rx="8"/>
+        <text x="522" y="286" text-anchor="middle" class="t-bold">KEDA (alternative)</text>
+        <text x="522" y="306" text-anchor="middle" class="t-muted">ScaledObject → creates an HPA, serves external metrics</text>
+        <line class="line dash" x1="300" y1="224" x2="400" y2="260" marker-end="url(#m08b)"/>
+        <line class="line dash" x1="695" y1="290" x2="790" y2="226" marker-end="url(#m08b)"/>
+      </svg>
+      <figcaption>Figure 2 — Installing Prometheus does not make Prometheus an HPA input. CPU HPA reads <code>metrics.k8s.io</code>; app-metric HPA needs an adapter or KEDA.</figcaption>
+    </figure>
+    <h3>What the Metrics API reports</h3>
+    <ul>
+      <li><strong>CPU</strong>: average core usage in CPU units over a short window, derived from the rate of a cumulative CPU counter. 1 CPU = 1 vCPU/core (cloud) or 1 hyper-thread (bare-metal Intel).</li>
+      <li><strong>Memory</strong>: the <em>working set</em> in bytes at collection time — memory in use that cannot be freed under pressure.</li>
+      <li>metrics-server keeps <strong>only the latest values</strong>, no history. Its README states it is meant only for autoscaling purposes, not as a monitoring solution — that is Prometheus’s job. It scrapes on a 15-second cycle by default.</li>
+      <li>The Metrics API has a <code>v1</code> version in current Kubernetes docs, but the HPA page notes that the HPA currently supports <code>metrics.k8s.io/v1beta1</code> for resource metrics, not <code>v1</code> yet. Use whichever version <code>kubectl api-versions | grep metrics</code> shows in your cluster when you query it by hand.</li>
+    </ul>
+
+    <section class="lab"><header>Lab 1 — Install metrics-server in kind and read the Metrics API</header><div class="body">
+      <ol class="steps">
+        <li>Check whether the API already exists (kind does not ship metrics-server):
+<pre><code>kubectl get apiservices | grep metrics
+kubectl top pods -n reliability-lab</code></pre>
+<pre data-title="Example output when metrics-server is missing"><code><span class="o">error: Metrics API not available</span></code></pre></li>
+        <li>Install from the project’s release manifest:
+<pre><code>kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system rollout status deployment/metrics-server --timeout=120s</code></pre></li>
+        <li>If the rollout never becomes ready and the metrics-server logs show TLS/x509 errors when scraping kubelets (common in local clusters whose kubelet serving certificates are not signed by the cluster CA), add the flag the README documents for <em>testing purposes only</em>:
+<pre><code>kubectl -n kube-system logs deploy/metrics-server | tail -5
+kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'</code></pre>
+          Never carry this flag into a real cluster; record it in your README as a lab-only deviation.</li>
+        <li>Read metrics three ways (allow ~1 minute for the first scrape):
+<pre><code>kubectl top nodes
+kubectl -n reliability-lab top pods
+kubectl get --raw "/apis/metrics.k8s.io/v1beta1/namespaces/reliability-lab/pods" | head -c 600; echo</code></pre>
+<pre data-title="Example output (yours will differ in names and values)"><code><span class="o">NAME                               CPU(cores)   MEMORY(bytes)
+reliability-api-6d5f9c7b8d-abcde   2m           41Mi
+reliability-api-6d5f9c7b8d-fghij   2m           40Mi</span></code></pre></li>
+        <li>Generate load (the busybox loop from Module 07, Lab 3) and re-run <code>kubectl top pods</code>. Divide each Pod’s CPU by its 100m request: that percentage is exactly what the HPA will compare against 60 %.</li>
+      </ol>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>3. The HPA algorithm</h2>
+    <p>The <strong>HorizontalPodAutoscaler</strong> is a control loop in kube-controller-manager. It is <em>intermittent</em>, not continuous: by default it runs every <strong>15 seconds</strong> (<code>--horizontal-pod-autoscaler-sync-period</code>). On each pass it finds the target’s Pods via the target’s <code>.spec.selector</code>, fetches their metrics, and computes:</p>
+<pre><code>desiredReplicas = ceil( currentReplicas × currentMetricValue / desiredMetricValue )</code></pre>
+    <p>For a CPU <code>Utilization</code> target, each Pod’s value is <strong>usage ÷ request</strong> (summed over its containers), and <code>currentMetricValue</code> is the mean across Pods. If <em>any</em> container in the Pod lacks a CPU request, utilization is undefined and the HPA takes no action for that metric.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 270" role="img" aria-label="HPA control loop: every 15 seconds read metrics, compute utilization relative to requests, set aside missing or unready pods, compute ratio and check tolerance, compute desired replicas, apply behavior policies and stabilization, clamp to min and max, write the scale subresource, then repeat">
+        <defs><marker id="m08c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="30" width="190" height="64" rx="8"/><text x="115" y="56" text-anchor="middle" class="t-bold">1. Read metrics</text><text x="115" y="76" text-anchor="middle" class="t-muted">every 15 s, per Pod</text>
+        <rect class="box2" x="230" y="30" width="190" height="64" rx="8"/><text x="325" y="56" text-anchor="middle" class="t-bold">2. Utilization</text><text x="325" y="76" text-anchor="middle" class="t-muted">usage ÷ request, mean</text>
+        <rect class="box2" x="440" y="30" width="190" height="64" rx="8"/><text x="535" y="56" text-anchor="middle" class="t-bold">3. Set aside Pods</text><text x="535" y="76" text-anchor="middle" class="t-muted">missing metrics, not ready</text>
+        <rect class="box3" x="650" y="30" width="210" height="64" rx="8"/><text x="755" y="56" text-anchor="middle" class="t-bold">4. ratio vs tolerance</text><text x="755" y="76" text-anchor="middle" class="t-muted">|ratio − 1| ≤ 0.1 → no change</text>
+        <rect class="box2" x="650" y="160" width="210" height="64" rx="8"/><text x="755" y="186" text-anchor="middle" class="t-bold">5. ceil(n × ratio)</text><text x="755" y="206" text-anchor="middle" class="t-muted">conservative recompute</text>
+        <rect class="box3" x="440" y="160" width="190" height="64" rx="8"/><text x="535" y="186" text-anchor="middle" class="t-bold">6. Behavior</text><text x="535" y="206" text-anchor="middle" class="t-muted">up: policies · down: window</text>
+        <rect class="box2" x="230" y="160" width="190" height="64" rx="8"/><text x="325" y="186" text-anchor="middle" class="t-bold">7. Clamp</text><text x="325" y="206" text-anchor="middle" class="t-muted">minReplicas … maxReplicas</text>
+        <rect class="box4" x="20" y="160" width="190" height="64" rx="8"/><text x="115" y="186" text-anchor="middle" class="t-bold">8. Write scale</text><text x="115" y="206" text-anchor="middle" class="t-muted">Deployment.replicas</text>
+        <line class="line" x1="210" y1="62" x2="228" y2="62" marker-end="url(#m08c)"/>
+        <line class="line" x1="420" y1="62" x2="438" y2="62" marker-end="url(#m08c)"/>
+        <line class="line" x1="630" y1="62" x2="648" y2="62" marker-end="url(#m08c)"/>
+        <line class="line" x1="755" y1="94" x2="755" y2="158" marker-end="url(#m08c)"/>
+        <line class="line" x1="650" y1="192" x2="632" y2="192" marker-end="url(#m08c)"/>
+        <line class="line" x1="440" y1="192" x2="422" y2="192" marker-end="url(#m08c)"/>
+        <line class="line" x1="230" y1="192" x2="212" y2="192" marker-end="url(#m08c)"/>
+        <path class="line dash" d="M115,160 L115,96" marker-end="url(#m08c)"/>
+        <text x="124" y="134" class="t-muted">next sync</text>
+        <text x="20" y="256" class="t-muted">Multiple metrics: steps 1–5 run per metric and the largest desired count wins (subject to steps 6–7).</text>
+      </svg>
+      <figcaption>Figure 3 — One HPA sync. Steps 3–5 are why the HPA reacts more cautiously than the bare formula suggests.</figcaption>
+    </figure>
+
+    <h3>Step by step, with the details that matter</h3>
+    <ol>
+      <li><strong>Tolerance.</strong> If the ratio <code>current/desired</code> is within the tolerance of 1.0 (default <strong>0.1</strong>, i.e. 54 %–66 % for a 60 % target), nothing happens. The cluster-wide default is set by <code>--horizontal-pod-autoscaler-tolerance</code>; newer clusters with the <code>HPAConfigurableTolerance</code> feature can also set a per-HPA, per-direction <code>tolerance</code> under <code>behavior.scaleUp</code>/<code>scaleDown</code>.</li>
+      <li><strong>Ignored and set-aside Pods.</strong> Pods being deleted are ignored and failed Pods discarded. Pods with missing metrics are set aside. For CPU, Pods that are not yet ready (or whose latest metric predates readiness) are set aside too.</li>
+      <li><strong>Conservative recomputation.</strong> If metrics were missing, the average is recomputed assuming those Pods use <strong>100 % of the target on scale-down and 0 % on scale-up</strong>. If not-yet-ready Pods exist and the result would be a scale-up, they are assumed to use 0 %. If the recomputed ratio reverses direction or falls inside the tolerance, the HPA does nothing. (The status still reports the original average.)</li>
+      <li><strong>Start-up noise.</strong> Two cluster-wide flags limit the effect of start-up CPU spikes: <code>--horizontal-pod-autoscaler-initial-readiness-delay</code> (default 30 s) and <code>--horizontal-pod-autoscaler-cpu-initialization-period</code> (default 5 min). The docs recommend a startupProbe or readinessProbe that reports Ready only after the warm-up spike — relevant because <code>reliability-api</code> has <code>READY_DELAY_SECONDS</code>.</li>
+      <li><strong>Multiple metrics.</strong> Each metric proposes a count; the HPA takes the largest. If some metrics cannot be fetched and the others suggest scaling down, scaling is skipped — it can still scale <em>up</em>.</li>
+      <li><strong>Behavior</strong> (stabilization window, policies — section 4), then <strong>clamp</strong> to <code>minReplicas</code>/<code>maxReplicas</code>, then write the <code>scale</code> subresource. The Deployment controller does the rest.</li>
+    </ol>
+
+    <h3>Why requests decide everything: the reliability-api numbers</h3>
+    <p><code>reliability-api</code> requests <strong>100m</strong> CPU and the HPA targets <strong>60 %</strong>. So the HPA considers a Pod “at target” when it uses <strong>60 millicores</strong>. One <code>/work?ms=50</code> request burns ≈ 50 ms of CPU, so at target each Pod handles only about 0.06 / 0.05 = <strong>1.2 requests/s</strong>. Work it through:</p>
+    <div class="table-wrap"><table>
+      <tr><th>Load (req/s of /work?ms=50)</th><th>CPU needed (cores)</th><th>Per Pod with 2 Pods</th><th>Utilization vs 100m</th><th>Formula</th><th>After clamp (max 6)</th></tr>
+      <tr><td>1</td><td>0.05</td><td>25m</td><td>25 %</td><td>ceil(2 × 25/60) = 1</td><td>2 (min)</td></tr>
+      <tr><td>2.4</td><td>0.12</td><td>60m</td><td>60 %</td><td>within tolerance</td><td>2</td></tr>
+      <tr><td>10</td><td>0.5</td><td>250m</td><td>250 %</td><td>ceil(2 × 250/60) = 9</td><td>6 (ScalingLimited)</td></tr>
+      <tr><td>20</td><td>1.0</td><td>500m</td><td>500 %</td><td>ceil(2 × 500/60) = 17</td><td>6 (ScalingLimited)</td></tr>
+    </table></div>
+    <p>Two lessons. First, with a tiny request the HPA saturates at <code>maxReplicas</code> under modest load — the 100m request was chosen for scheduling density, not for autoscaling accuracy. Second, a Pod can use far more CPU than it requests (there is no CPU limit), so utilization above 100 % is normal; a single Uvicorn worker running a pure-Python busy loop is effectively limited to about one core. If you set the request to 500m, the same 20 req/s gives 100 % per Pod with 2 Pods → ceil(2 × 100/60) = 4 replicas. <em>Choose requests from measured usage first; then choose the HPA target.</em></p>
+
+    <div class="widget" id="calc-widget">
+      <div class="w-title">HPA formula calculator</div>
+      <div class="w-sub">One sync of the controller for a CPU Utilization target (all Pods ready, no missing metrics).</div>
+      <div class="grid2">
+        <label>Current replicas <input type="number" id="hc-n" value="2" min="1" max="500"></label>
+        <label>Avg CPU usage per Pod (m) <input type="number" id="hc-use" value="250" min="0"></label>
+        <label>CPU request per Pod (m) <input type="number" id="hc-req" value="100" min="1"></label>
+        <label>Target utilization (%) <input type="number" id="hc-tgt" value="60" min="1" max="1000"></label>
+        <label>Tolerance <input type="number" id="hc-tol" value="0.1" step="0.01" min="0" max="1"></label>
+        <label>min / max replicas <span class="row"><input type="number" id="hc-min" value="2" min="1" style="width:46%"><input type="number" id="hc-max" value="6" min="1" style="width:46%"></span></label>
+      </div>
+      <div class="kv" id="hc-kv"></div>
+      <div class="out" id="hc-text"></div>
+    </div>
+
+    <details class="q"><summary>Self-check: 3 Pods, average utilization 70 %, target 60 %. Scale? To what?</summary><div class="a">Ratio = 70/60 ≈ 1.167, outside the 0.1 tolerance. desired = ceil(3 × 1.167) = ceil(3.5) = 4. If one of the 3 Pods were not yet ready, the controller would set it aside and, because this is a scale-up, recompute assuming it uses 0 % — possibly cancelling or shrinking the scale-up.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>4. HPA behavior: stabilization windows and scaling policies</h2>
+    <p>The raw formula reacts to every wobble in the metric. Left alone, replicas would <strong>flap</strong> (also called thrashing): add Pods, load per Pod drops, remove Pods, load per Pod rises, add Pods… The <code>autoscaling/v2</code> <code>behavior</code> field controls this separately for <code>scaleUp</code> and <code>scaleDown</code>. If you omit it, these defaults apply:</p>
+<pre data-title="default behavior (from the Kubernetes HPA docs)"><code>behavior:
+  scaleDown:
+    stabilizationWindowSeconds: 300      <span class="c"># or --horizontal-pod-autoscaler-downscale-stabilization</span>
+    policies:
+    - type: Percent
+      value: 100
+      periodSeconds: 15
+  scaleUp:
+    stabilizationWindowSeconds: 0
+    policies:
+    - type: Percent
+      value: 100
+      periodSeconds: 15
+    - type: Pods
+      value: 4
+      periodSeconds: 15
+    selectPolicy: Max</code></pre>
+    <ul>
+      <li><strong>Stabilization window.</strong> When metrics suggest scaling down, the controller looks at all recommendations within the window and uses the <em>highest</em>. With the default 300 s, the HPA scales down only after five minutes of consistently lower recommendations — approximating a rolling maximum. Scale-up has no window by default: it reacts at the next sync.</li>
+      <li><strong>Policies</strong> cap the change per <code>periodSeconds</code> (max 1800). Default scale-up: at most +100 % <em>or</em> +4 Pods per 15 s, whichever allows more (<code>selectPolicy: Max</code>). So 2 replicas can become 6 in one step (2 + 4), and 6 can become 12. Default scale-down: up to 100 % per 15 s, i.e. straight down to <code>minReplicas</code> once the window allows it.</li>
+      <li><code>selectPolicy: Min</code> picks the most restrictive policy; <code>Disabled</code> turns off scaling in that direction entirely.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 260" role="img" aria-label="Scale-down stabilization: the HPA recommends 6 replicas for two minutes and then 2 replicas, but the applied replica count stays at 6 until the 6-replica recommendations have aged out of the 5-minute window">
+        <line class="line" x1="60" y1="200" x2="830" y2="200"/><line class="line" x1="60" y1="40" x2="60" y2="200"/>
+        <text x="54" y="54" text-anchor="end" class="t-muted">6</text><text x="54" y="154" text-anchor="end" class="t-muted">2</text><text x="54" y="204" text-anchor="end" class="t-muted">0</text>
+        <text x="60" y="220" class="t-muted">0</text><text x="206" y="220" class="t-muted">2 min</text><text x="586" y="220" class="t-muted">7 min</text><text x="790" y="220" class="t-muted">10 min</text>
+        <rect class="zone" x="212.0" y="34" width="380.0" height="130" rx="6"/>
+        <text x="402" y="96" text-anchor="middle" class="t-muted">300 s window still contains a “6” recommendation</text>
+        <circle class="dot-accent" cx="60.0" cy="50.0" r="3"/><circle class="dot-accent" cx="79.0" cy="50.0" r="3"/><circle class="dot-accent" cx="98.0" cy="50.0" r="3"/><circle class="dot-accent" cx="117.0" cy="50.0" r="3"/><circle class="dot-accent" cx="136.0" cy="50.0" r="3"/><circle class="dot-accent" cx="155.0" cy="50.0" r="3"/><circle class="dot-accent" cx="174.0" cy="50.0" r="3"/><circle class="dot-accent" cx="193.0" cy="50.0" r="3"/><circle class="dot-accent" cx="212.0" cy="150.0" r="3"/><circle class="dot-accent" cx="231.0" cy="150.0" r="3"/><circle class="dot-accent" cx="250.0" cy="150.0" r="3"/><circle class="dot-accent" cx="269.0" cy="150.0" r="3"/><circle class="dot-accent" cx="288.0" cy="150.0" r="3"/><circle class="dot-accent" cx="307.0" cy="150.0" r="3"/><circle class="dot-accent" cx="326.0" cy="150.0" r="3"/><circle class="dot-accent" cx="345.0" cy="150.0" r="3"/><circle class="dot-accent" cx="364.0" cy="150.0" r="3"/><circle class="dot-accent" cx="383.0" cy="150.0" r="3"/><circle class="dot-accent" cx="402.0" cy="150.0" r="3"/><circle class="dot-accent" cx="421.0" cy="150.0" r="3"/><circle class="dot-accent" cx="440.0" cy="150.0" r="3"/><circle class="dot-accent" cx="459.0" cy="150.0" r="3"/><circle class="dot-accent" cx="478.0" cy="150.0" r="3"/><circle class="dot-accent" cx="497.0" cy="150.0" r="3"/><circle class="dot-accent" cx="516.0" cy="150.0" r="3"/><circle class="dot-accent" cx="535.0" cy="150.0" r="3"/><circle class="dot-accent" cx="554.0" cy="150.0" r="3"/><circle class="dot-accent" cx="573.0" cy="150.0" r="3"/><circle class="dot-accent" cx="592.0" cy="150.0" r="3"/><circle class="dot-accent" cx="611.0" cy="150.0" r="3"/><circle class="dot-accent" cx="630.0" cy="150.0" r="3"/><circle class="dot-accent" cx="649.0" cy="150.0" r="3"/><circle class="dot-accent" cx="668.0" cy="150.0" r="3"/><circle class="dot-accent" cx="687.0" cy="150.0" r="3"/><circle class="dot-accent" cx="706.0" cy="150.0" r="3"/><circle class="dot-accent" cx="725.0" cy="150.0" r="3"/><circle class="dot-accent" cx="744.0" cy="150.0" r="3"/><circle class="dot-accent" cx="763.0" cy="150.0" r="3"/><circle class="dot-accent" cx="782.0" cy="150.0" r="3"/><circle class="dot-accent" cx="801.0" cy="150.0" r="3"/><circle class="dot-accent" cx="820.0" cy="150.0" r="3"/>
+        <polyline class="line ok" points="60,150 79.0,150 79.0,50 592,50 592,150 820,150"/>
+        <text x="602" y="54" class="t-bold">scale down to 2 at ≈ 7 min</text>
+        <text x="60" y="246" class="t-muted">dots = raw recommendation each 15 s sync · green line = replicas actually applied (highest recommendation in the last 300 s)</text>
+      </svg>
+      <figcaption>Figure 4 — Load drops at 2 min, but scale-down waits until the last high recommendation is older than the stabilization window.</figcaption>
+    </figure>
+
+    <h3>Tuning for a load-test lab</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Goal</th><th>Setting</th><th>Trade-off</th></tr>
+      <tr><td>See scale-down within a short experiment</td><td><code>scaleDown.stabilizationWindowSeconds: 60</code></td><td>More flapping risk with bursty load</td></tr>
+      <tr><td>Avoid over-reacting to a spike</td><td><code>scaleUp.stabilizationWindowSeconds: 30</code></td><td>Slower response; more requests during under-provisioning</td></tr>
+      <tr><td>Remove Pods gently</td><td><code>scaleDown.policies: [{type: Pods, value: 1, periodSeconds: 60}]</code></td><td>Pays for extra Pods longer</td></tr>
+      <tr><td>Freeze replica count during a failure experiment</td><td><code>scaleDown.selectPolicy: Disabled</code> (or delete the HPA and set replicas)</td><td>Remember to restore it</td></tr>
+    </table></div>
+    <p>Change one setting at a time and record it in the experiment report; otherwise you cannot attribute a different result to the change.</p>
+
+    <!-- ============================================================ -->
+    <h2>5. HPA simulator</h2>
+    <p>The simulator below runs a simplified HPA controller every 15 s against a step load on <code>/work</code>. It models: CPU demand = requests/s × CPU cost per request; each Pod can use at most the “per-Pod CPU ceiling” (≈ 1 core for one Uvicorn worker); utilization = usage ÷ request; metrics lag one sync; new Pods count as not-ready for the readiness delay (set aside, and assumed 0 % on scale-up); tolerance; default scale-up policies (+100 % or +4 per 15 s); scale-down stabilization; min/max. It does <em>not</em> model scheduling limits, image pulls, or latency — treat it as intuition, then verify in Lab 2.</p>
+    <div class="widget" id="sim-widget">
+      <div class="w-title">HPA simulator — reliability-api under a traffic spike</div>
+      <div class="w-sub">Try: request 100m vs 500m · target 60 % vs 80 % · stabilization 300 s vs 60 s · readiness delay 5 s vs 60 s.</div>
+      <div class="grid2">
+        <label>Baseline load (req/s) <input type="number" id="hs-base" value="2" min="0" step="0.5"></label>
+        <label>Spike load (req/s) <input type="number" id="hs-spike" value="20" min="0" step="1"></label>
+        <label>Spike starts at (min) <input type="number" id="hs-start" value="3" min="0" max="19"></label>
+        <label>Spike lasts (min) <input type="number" id="hs-dur" value="6" min="0" max="20"></label>
+        <label>CPU per request (ms) <input type="number" id="hs-cost" value="50" min="1"></label>
+        <label>CPU request per Pod (m) <input type="number" id="hs-req" value="100" min="10" step="10"></label>
+        <label>Target utilization (%) <input type="number" id="hs-tgt" value="60" min="10" max="500"></label>
+        <label>min / max replicas <span class="row"><input type="number" id="hs-min" value="2" min="1" style="width:46%"><input type="number" id="hs-max" value="6" min="1" style="width:46%"></span></label>
+        <label>Readiness delay (s) <input type="number" id="hs-ready" value="10" min="0" step="5"></label>
+        <label>Scale-down stabilization (s) <input type="number" id="hs-stab" value="300" min="0" step="15"></label>
+        <label>Per-Pod CPU ceiling (cores) <input type="number" id="hs-ceil" value="1" min="0.1" step="0.1"></label>
+        <label>Tolerance <input type="number" id="hs-tol" value="0.1" min="0" max="1" step="0.01"></label>
+      </div>
+      <svg class="sim-chart" id="hs-chart" viewBox="0 0 720 330" role="img" aria-label="Simulated replicas, ready replicas, load and CPU utilization over 20 minutes"></svg>
+      <div class="legend"><span><i class="acc"></i>desired replicas (spec)</span><span><i class="ok"></i>ready replicas</span><span><i class="dash"></i>offered load (right axis)</span><span><i class="bad"></i>avg CPU utilization</span><span><i class="warn"></i>demand exceeds ready capacity</span></div>
+      <div class="kv" id="hs-kv"></div>
+      <div class="out" id="hs-log"></div>
+    </div>
+    <details class="q"><summary>Self-check (use the simulator): with request 100m and spike 20 req/s, the HPA hits max 6 and stays there. Is the service overloaded?</summary><div class="a">Not necessarily. 20 req/s × 50 ms = 1 core of demand; 6 ready Pods with a ~1-core ceiling each can supply up to 6 cores, so there is no CPU overload — yet utilization stays at ~167 % of the 100m request, far above 60 %, so the HPA reports <code>ScalingLimited</code>. The HPA is “unhappy” because the request is unrealistically small, not because users suffer. Latency and error SLIs, not HPA utilization, tell you whether users suffer.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>6. The HPA manifest for reliability-api</h2>
+<pre data-title="deploy/kubernetes/hpa.yaml"><code>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: reliability-api
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+  behavior:                         <span class="c"># optional; shown with a shorter scale-down window for labs</span>
+    scaleDown:
+      stabilizationWindowSeconds: 120</code></pre>
+    <p>The imperative equivalent (current kubectl syntax from the docs walkthrough) is <code>kubectl -n reliability-lab autoscale deployment reliability-api --cpu=60% --min=2 --max=6</code>. Prefer the YAML: it is reviewable and lives in Git or the Helm chart.</p>
+    <div class="callout danger"><span class="label">Remove spec.replicas from the Deployment manifest</span>Once an HPA manages a Deployment, every <code>kubectl apply -f deployment.yaml</code> that still contains <code>replicas: 2</code> resets the count to 2, fighting the HPA (flapping). The HPA docs recommend removing <code>spec.replicas</code> from the manifest. Beware: removing it naïvely can cause a one-time drop to the default of 1 replica; the docs describe using <code>kubectl apply edit-last-applied</code> (client-side apply) or Server-Side Apply ownership transfer to avoid it. In the Helm chart, render <code>replicas</code> only when autoscaling is disabled.</div>
+<pre data-title="charts/reliability-api/templates/deployment.yaml (fragment)"><code>spec:
+{{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+{{- end }}</code></pre>
+
+    <h3>Reading HPA status</h3>
+    <p><code>kubectl describe hpa</code> shows three conditions. <strong>AbleToScale</strong>: whether the HPA can fetch and update the scale (and whether backoff prevents scaling). <strong>ScalingActive</strong>: whether the HPA is enabled and able to calculate a scale; <code>False</code> usually means metrics problems. <strong>ScalingLimited</strong>: the desired count was capped by min or max.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Likely cause</th><th>Check</th></tr>
+      <tr><td>TARGETS shows <code>&lt;unknown&gt;/60%</code></td><td>No Metrics API (metrics-server missing/unhealthy), or Pods have no CPU request, or metrics not yet scraped</td><td><code>kubectl get apiservices | grep metrics</code>; <code>kubectl top pods</code>; Pod spec requests; HPA events</td></tr>
+      <tr><td>ScalingActive False</td><td>Metric fetch errors; or target scaled to 0 manually (implicit maintenance mode)</td><td><code>kubectl describe hpa</code> condition message</td></tr>
+      <tr><td>Never scales up</td><td>Load too low; utilization inside tolerance; already at max (ScalingLimited)</td><td>Compute the ratio by hand with <code>kubectl top</code></td></tr>
+      <tr><td>Replicas rise but stay Pending</td><td>Requests do not fit on nodes</td><td><code>kubectl describe pod</code> → <code>FailedScheduling … Insufficient cpu</code></td></tr>
+      <tr><td>Replica count oscillates</td><td>Manifest <code>replicas</code> re-applied by CI/Helm; too-short stabilization</td><td><code>kubectl get deploy -w</code> and your pipeline logs</td></tr>
+    </table></div>
+
+    <section class="lab"><header>Lab 2 — Make the HPA scale, then explain every decision</header><div class="body">
+      <p>Prerequisites: Lab 1 (metrics-server), Module 07 dashboard, Deployment with requests 100m and readiness probe on <code>/ready</code>.</p>
+      <ol class="steps">
+        <li>Apply the HPA and watch it in a dedicated terminal:
+<pre><code>kubectl apply -f deploy/kubernetes/hpa.yaml
+kubectl -n reliability-lab get hpa reliability-api --watch</code></pre>
+<pre data-title="Example output (format varies slightly by kubectl version)"><code><span class="o">NAME              REFERENCE                    TARGETS       MINPODS   MAXPODS   REPLICAS   AGE
+reliability-api   Deployment/reliability-api   cpu: 2%/60%   2         6         2          40s</span></code></pre></li>
+        <li>Predict on paper: for one busybox loop (≈ up to 20 req/s, ≈ up to 1 core), what utilization per Pod and what desired replicas? (Use the table in section 3.)</li>
+        <li>Start the load (Module 07 Lab 3 busybox loop, or the k6 Job from section 11). Watch the HPA, the Deployment and the Pods:
+<pre><code>kubectl -n reliability-lab get deploy reliability-api -w
+kubectl -n reliability-lab get pods -l app.kubernetes.io/name=reliability-api -w</code></pre></li>
+        <li>Inspect the decision trail:
+<pre><code>kubectl -n reliability-lab describe hpa reliability-api</code></pre>
+          Look at the Metrics line (current / target), the Conditions table and the Events (<code>SuccessfulRescale … New size: N; reason: cpu resource utilization (percentage of request) above target</code> or similar). Expect <code>ScalingLimited True</code> at 6 replicas if your load is high.</li>
+        <li>Stop the load. Time how long until replicas return to 2. Compare with your <code>stabilizationWindowSeconds</code> (120 s in the manifest above; 300 s default).</li>
+        <li>Change the request to 500m (<code>kubectl -n reliability-lab set resources deployment reliability-api --requests=cpu=500m</code>), repeat, and compare the peak replica count with your prediction.</li>
+      </ol>
+      <p><strong>Evidence:</strong> a table of time → load → utilization → replicas (desired/ready) built from the dashboard panels (Module 07 panels 1, 4, 5), the HPA events, and one paragraph: did latency improve when replicas increased? If not, what limited it (CPU ceiling per Pod, node capacity, load generator)?</p>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>7. Custom and external metrics: prometheus-adapter and KEDA</h2>
+    <p>CPU is a proxy. For <code>/work</code> it is a good one (the endpoint is CPU-bound). For an I/O-bound API or a queue worker, CPU stays low while users wait — you want to scale on requests per second, in-flight requests or queue depth. <code>autoscaling/v2</code> supports four metric source types:</p>
+    <div class="table-wrap"><table>
+      <tr><th>Type</th><th>Meaning</th><th>Target types</th><th>API</th></tr>
+      <tr><td><code>Resource</code></td><td>CPU/memory of the Pods</td><td><code>Utilization</code>, <code>AverageValue</code></td><td><code>metrics.k8s.io</code></td></tr>
+      <tr><td><code>ContainerResource</code></td><td>CPU/memory of one named container (ignore sidecars)</td><td><code>Utilization</code>, <code>AverageValue</code></td><td><code>metrics.k8s.io</code></td></tr>
+      <tr><td><code>Pods</code></td><td>A custom metric describing each Pod, averaged</td><td><code>AverageValue</code> only</td><td><code>custom.metrics.k8s.io</code></td></tr>
+      <tr><td><code>Object</code></td><td>A metric describing another object (e.g. an Ingress)</td><td><code>Value</code>, <code>AverageValue</code></td><td><code>custom.metrics.k8s.io</code></td></tr>
+      <tr><td><code>External</code></td><td>A metric not tied to any Kubernetes object (e.g. a hosted queue)</td><td><code>Value</code>, <code>AverageValue</code></td><td><code>external.metrics.k8s.io</code></td></tr>
+    </table></div>
+    <p>Kubernetes does not ship anything that serves the custom/external APIs. You install an adapter:</p>
+    <ul>
+      <li><strong>prometheus-adapter</strong> implements the custom, resource and external metrics APIs on top of Prometheus. Rules map PromQL to API metrics: <code>seriesQuery</code> (which series to discover), <code>resources</code> (map labels like <code>namespace</code>/<code>pod</code> to Kubernetes objects), <code>name</code> (<code>matches</code>/<code>as</code> to rename, e.g. <code>http_requests_total</code> → <code>http_requests_per_second</code>) and <code>metricsQuery</code> (the PromQL template with <code>&lt;&lt;.LabelMatchers&gt;&gt;</code> and <code>&lt;&lt;.GroupBy&gt;&gt;</code>).</li>
+      <li><strong>KEDA</strong> (“scale applications based on real-world events”) works <em>with</em> the HPA rather than replacing it: its operator creates and manages an HPA for each <code>ScaledObject</code>, its metrics API server serves external metrics, and it handles scaling between zero and one replica itself. It has a Prometheus scaler:</li>
+    </ul>
+<pre data-title="sketch: KEDA ScaledObject scaling reliability-api on request rate"><code>apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+spec:
+  scaleTargetRef:
+    name: reliability-api                 <span class="c"># the Deployment</span>
+  minReplicaCount: 2
+  maxReplicaCount: 6
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://monitoring-kube-prometheus-prometheus.monitoring.svc:9090
+        query: sum(rate(http_requests_total{namespace="reliability-lab", path="/work"}[1m]))
+        threshold: "10"                   <span class="c"># scaling threshold; see the KEDA Prometheus scaler docs</span></code></pre>
+    <p>Do not run this <em>and</em> the CPU HPA on the same Deployment — KEDA creates its own HPA, and two HPAs fighting over one Deployment produce undefined behaviour. The study guide’s advice stands: start with CPU HPA, then add custom metrics only when you can test them.</p>
+    <div class="callout note"><span class="label">Scale to zero</span>The HPA can scale to <code>minReplicas: 0</code> only for object/external metrics (resource metrics need running Pods to measure) and only when the <code>HPAScaleToZero</code> feature gate is enabled on both API server and controller manager. KEDA implements 0↔1 itself. A load-tested API usually should not scale to zero: the first request pays the full start-up and <code>READY_DELAY_SECONDS</code>.</div>
+
+    <!-- ============================================================ -->
+    <h2>8. Vertical Pod Autoscaler</h2>
+    <p>The <strong>VPA</strong> adjusts requests (and, proportionally, limits) to match observed usage — “rightsizing”. It is a CRD (<code>autoscaling.k8s.io/v1</code>) installed separately, with three components: the <strong>recommender</strong> (analyses current and historical CPU/memory and OOM events, writes target, lower-bound and upper-bound recommendations to <code>.status.recommendation</code>), the <strong>updater</strong> (evicts Pods or resizes them in place when they drift from the recommendation, respecting PodDisruptionBudgets) and the <strong>admission controller</strong> (a mutating webhook that sets requests on new Pods). It needs a metrics source such as metrics-server.</p>
+    <div class="table-wrap"><table>
+      <tr><th><code>updateMode</code></th><th>Behaviour</th><th>Use in this course</th></tr>
+      <tr><td><code>Off</code></td><td>Recommendations only, written to status; nothing changes</td><td><strong>Yes</strong> — measure what requests should be</td></tr>
+      <tr><td><code>Initial</code></td><td>Applies recommendations only when Pods are created</td><td>Maybe</td></tr>
+      <tr><td><code>Recreate</code></td><td>Evicts Pods whose requests differ significantly; replacements get new requests</td><td>No (disrupts experiments)</td></tr>
+      <tr><td><code>InPlaceOrRecreate</code></td><td>Resize in place when possible, else evict</td><td>No</td></tr>
+      <tr><td><code>InPlace</code></td><td>Alpha (VPA 1.7.0+, Kubernetes 1.33+ with feature gates); never evicts, retries later</td><td>No</td></tr>
+      <tr><td><code>Auto</code></td><td>Deprecated since VPA 1.4.0; alias for <code>Recreate</code></td><td>No</td></tr>
+    </table></div>
+<pre data-title="deploy/kubernetes/vpa-recommend.yaml (requires VPA installed)"><code>apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: reliability-api
+  updatePolicy:
+    updateMode: "Off"                 <span class="c"># recommend only — safe alongside the CPU HPA</span>
+  resourcePolicy:
+    containerPolicies:
+      - containerName: reliability-api
+        minAllowed: {cpu: 100m, memory: 128Mi}
+        maxAllowed: {cpu: "2", memory: 1Gi}</code></pre>
+    <div class="callout danger"><span class="label">HPA + VPA conflict</span>The VPA project’s known-limitations page: the VPA should not be used with the HPA on the same resource metric (CPU or memory). Both would react to the same signal in opposite ways — VPA raises the request, which lowers HPA utilization, which removes Pods, which raises per-Pod usage… Combine them only on different signals (e.g. VPA for memory, HPA on CPU or on a custom metric), or use VPA in <code>Off</code> mode as a sizing advisor.</div>
+
+    <!-- ============================================================ -->
+    <h2>9. Node autoscaling and how the layers interact</h2>
+    <p>Node autoscalers <strong>provision</strong> nodes when Pods cannot be scheduled, and <strong>consolidate</strong> (remove) under-utilised nodes. Both decisions use Pod <em>resource requests</em>, not real usage. Kubernetes SIG Autoscaling sponsors two: <strong>Cluster Autoscaler</strong> (resizes pre-configured node groups) and <strong>Karpenter</strong> (auto-provisions individual nodes from NodePool constraints and manages node lifecycle). Cloud platforms such as GKE integrate their own (Module 11).</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 880 230" role="img" aria-label="Scaling cascade: load rises, HPA raises replicas, new Pods are Pending because requests do not fit, a node autoscaler provisions a node, Pods are scheduled and started, then become Ready and join Service endpoints">
+        <defs><marker id="m08d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box" x="20" y="40" width="120" height="74" rx="8"/><text x="80" y="66" text-anchor="middle" class="t-bold">Load rises</text><text x="80" y="86" text-anchor="middle" class="t-muted">CPU above</text><text x="80" y="102" text-anchor="middle" class="t-muted">target</text>
+        <rect class="box2" x="165" y="40" width="120" height="74" rx="8"/><text x="225" y="66" text-anchor="middle" class="t-bold">HPA</text><text x="225" y="86" text-anchor="middle" class="t-muted">replicas</text><text x="225" y="102" text-anchor="middle" class="t-muted">2 → 6</text>
+        <rect class="box3" x="310" y="40" width="120" height="74" rx="8"/><text x="370" y="66" text-anchor="middle" class="t-bold">Pending</text><text x="370" y="86" text-anchor="middle" class="t-muted">Insufficient</text><text x="370" y="102" text-anchor="middle" class="t-muted">cpu</text>
+        <rect class="box2" x="455" y="40" width="120" height="74" rx="8"/><text x="515" y="66" text-anchor="middle" class="t-bold">Node</text><text x="515" y="86" text-anchor="middle" class="t-muted">autoscaler</text><text x="515" y="102" text-anchor="middle" class="t-muted">adds node</text>
+        <rect class="box" x="600" y="40" width="120" height="74" rx="8"/><text x="660" y="66" text-anchor="middle" class="t-bold">Scheduled</text><text x="660" y="86" text-anchor="middle" class="t-muted">pull image,</text><text x="660" y="102" text-anchor="middle" class="t-muted">start</text>
+        <rect class="box4" x="745" y="40" width="120" height="74" rx="8"/><text x="805" y="66" text-anchor="middle" class="t-bold">Ready</text><text x="805" y="86" text-anchor="middle" class="t-muted">joins Service</text><text x="805" y="102" text-anchor="middle" class="t-muted">endpoints</text>
+        <line class="line" x1="140" y1="77" x2="163" y2="77" marker-end="url(#m08d)"/>
+        <line class="line" x1="285" y1="77" x2="308" y2="77" marker-end="url(#m08d)"/>
+        <line class="line" x1="430" y1="77" x2="453" y2="77" marker-end="url(#m08d)"/>
+        <line class="line" x1="575" y1="77" x2="598" y2="77" marker-end="url(#m08d)"/>
+        <line class="line" x1="720" y1="77" x2="743" y2="77" marker-end="url(#m08d)"/>
+        <text x="80" y="140" text-anchor="middle" class="t-muted">metric window</text>
+        <text x="225" y="140" text-anchor="middle" class="t-muted">≥ one 15 s sync</text>
+        <text x="370" y="140" text-anchor="middle" class="t-muted">only if no room</text>
+        <text x="515" y="140" text-anchor="middle" class="t-muted">VM boot (cloud)</text>
+        <text x="660" y="140" text-anchor="middle" class="t-muted">image size</text>
+        <text x="805" y="140" text-anchor="middle" class="t-muted">readiness probe,</text>
+        <text x="805" y="156" text-anchor="middle" class="t-muted">READY_DELAY</text>
+        <line class="line accent" x1="20" y1="190" x2="865" y2="190" marker-end="url(#m08d)"/>
+        <text x="442" y="214" text-anchor="middle" class="t-bold">time-to-capacity = sum of every stage — while it elapses, existing Pods absorb the load</text>
+      </svg>
+      <figcaption>Figure 5 — Autoscaling is a pipeline of delays. Your measured “time to scale” must name which stages it includes.</figcaption>
+    </figure>
+    <p>Consequences for design: keep headroom (target below 100 %), keep images small and start-up fast, set requests from measurements (VPA <code>Off</code> mode helps), and do not expect autoscaling to absorb a spike faster than the sum of the delays in Figure 5. In kind, the “add node” stage does not exist; new Pods either fit on the existing nodes or stay Pending.</p>
+    <details class="q"><summary>Self-check: the Cluster Autoscaler never adds a node although your Pods are at 300 % CPU utilization. Why?</summary><div class="a">Node provisioning is triggered by <em>unschedulable</em> Pods, based on requests — not by high usage of running Pods. If all Pods fit, there is nothing to provision. High usage must first be turned into more Pods (HPA); only if those cannot be scheduled does the node autoscaler act.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>10. Load-testing theory</h2>
+    <p>A <strong>load test</strong> answers: <em>does the service behave acceptably under a defined traffic pattern?</em> The important word is <em>defined</em>. “I hit it with 100 users and the average was 80 ms” is not a result; it is an anecdote. A useful test states the workload model, the rate or concurrency, the duration and warm-up, the request mix, the success criteria (written <em>before</em> the run), the environment, and the measured percentiles with sample counts.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Test type (k6 terminology)</th><th>Purpose</th><th>reliability-api example</th></tr>
+      <tr><td>Smoke</td><td>Validate the script works and the system performs adequately under minimal load</td><td>1 VU, 30 s, all checks pass</td></tr>
+      <tr><td>Average-load</td><td>Performance under expected normal conditions</td><td>Baseline 2 replicas, 5 req/s for 5 min</td></tr>
+      <tr><td>Stress</td><td>Performance at its limits when load exceeds the average</td><td>Ramp to 20+ req/s; observe HPA and latency</td></tr>
+      <tr><td>Soak</td><td>Reliability over extended periods</td><td>2 h at baseline: memory growth? restarts?</td></tr>
+      <tr><td>Spike</td><td>Behaviour and survival under sudden, short, massive increases</td><td>2 → 30 req/s in 10 s: how many errors before HPA catches up?</td></tr>
+      <tr><td>Breakpoint</td><td>Gradually increase load to find capacity limits</td><td>Ramp until p95 &gt; 250 ms or errors &gt; 1 %</td></tr>
+    </table></div>
+
+    <h3>Closed vs open workload models</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 280" role="img" aria-label="Closed model: a fixed number of virtual users each send a request, wait for the response, optionally think, and repeat. Open model: requests arrive at a fixed rate regardless of responses and queue when the server is slow">
+        <defs><marker id="m08e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="10" y="10" width="410" height="260" rx="10"/>
+        <text x="215" y="34" text-anchor="middle" class="t-bold">Closed model (VUs / users)</text>
+        <rect class="box2" x="30" y="56" width="170" height="44" rx="8"/><text x="115" y="83" text-anchor="middle">N virtual users</text>
+        <rect class="box" x="230" y="56" width="170" height="44" rx="8"/><text x="315" y="83" text-anchor="middle">send request</text>
+        <rect class="box3" x="230" y="146" width="170" height="44" rx="8"/><text x="315" y="173" text-anchor="middle">wait for response</text>
+        <rect class="box" x="30" y="146" width="170" height="44" rx="8"/><text x="115" y="173" text-anchor="middle">think, then repeat</text>
+        <line class="line" x1="200" y1="78" x2="228" y2="78" marker-end="url(#m08e)"/>
+        <line class="line" x1="315" y1="100" x2="315" y2="144" marker-end="url(#m08e)"/>
+        <line class="line" x1="230" y1="168" x2="202" y2="168" marker-end="url(#m08e)"/>
+        <line class="line" x1="115" y1="146" x2="115" y2="102" marker-end="url(#m08e)"/>
+        <text x="215" y="224" text-anchor="middle" class="t-muted">sent rate = N ÷ (response time + think time)</text>
+        <text x="215" y="244" text-anchor="middle" class="t-bold">slow server ⇒ load generator slows down too</text>
+        <rect class="zone" x="440" y="10" width="410" height="260" rx="10"/>
+        <text x="645" y="34" text-anchor="middle" class="t-bold">Open model (arrival rate)</text>
+        <rect class="box2" x="460" y="56" width="150" height="44" rx="8"/><text x="535" y="83" text-anchor="middle">arrivals at λ/s</text>
+        <rect class="box3" x="640" y="56" width="190" height="44" rx="8"/><text x="735" y="83" text-anchor="middle">queue (if busy)</text>
+        <rect class="box" x="640" y="146" width="190" height="44" rx="8"/><text x="735" y="173" text-anchor="middle">server (capacity μ/s)</text>
+        <line class="line" x1="610" y1="78" x2="638" y2="78" marker-end="url(#m08e)"/>
+        <line class="line" x1="735" y1="100" x2="735" y2="144" marker-end="url(#m08e)"/>
+        <text x="535" y="140" text-anchor="middle" class="t-muted">new arrivals do not</text>
+        <text x="535" y="158" text-anchor="middle" class="t-muted">wait for old responses</text>
+        <text x="645" y="224" text-anchor="middle" class="t-muted">λ &lt; μ: stable · λ ≥ μ: queue grows without bound</text>
+        <text x="645" y="244" text-anchor="middle" class="t-bold">slow server ⇒ queue and latency grow</text>
+      </svg>
+      <figcaption>Figure 6 — k6 VU executors (<code>constant-vus</code>, <code>ramping-vus</code>, <code>stages</code>) are closed; arrival-rate executors (<code>constant-arrival-rate</code>, <code>ramping-arrival-rate</code>) are open.</figcaption>
+    </figure>
+    <p>In a <strong>closed model</strong>, the iteration duration dictates how many iterations run: each VU waits for its response before sending again. Real public traffic is closer to an <strong>open model</strong>: new users arrive whether or not the service is slow. The k6 docs put the consequence plainly: when the target slows down, a closed-model test waits, iteration durations grow, and the arrival rate tapers off. The test “goes easy” on the system exactly when it is struggling.</p>
+
+    <h3>Coordinated omission</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 240" role="img" aria-label="During a one second server stall, a closed-loop generator sends one request and records one slow sample, while an open-model generator sends ten requests that all wait, recording ten slow samples">
+        <text x="20" y="40" class="t-muted">intended</text>
+        <line class="line" x1="60" y1="44" x2="60" y2="56"/>
+        <line class="line" x1="98" y1="44" x2="98" y2="56"/>
+        <line class="line" x1="136" y1="44" x2="136" y2="56"/>
+        <line class="line" x1="174" y1="44" x2="174" y2="56"/>
+        <line class="line" x1="212" y1="44" x2="212" y2="56"/>
+        <line class="line" x1="250" y1="44" x2="250" y2="56"/>
+        <line class="line" x1="288" y1="44" x2="288" y2="56"/>
+        <line class="line" x1="326" y1="44" x2="326" y2="56"/>
+        <line class="line" x1="364" y1="44" x2="364" y2="56"/>
+        <line class="line" x1="402" y1="44" x2="402" y2="56"/>
+        <line class="line" x1="440" y1="44" x2="440" y2="56"/>
+        <line class="line" x1="478" y1="44" x2="478" y2="56"/>
+        <line class="line" x1="516" y1="44" x2="516" y2="56"/>
+        <line class="line" x1="554" y1="44" x2="554" y2="56"/>
+        <line class="line" x1="592" y1="44" x2="592" y2="56"/>
+        <line class="line" x1="630" y1="44" x2="630" y2="56"/>
+        <line class="line" x1="668" y1="44" x2="668" y2="56"/>
+        <line class="line" x1="706" y1="44" x2="706" y2="56"/>
+        <line class="line" x1="744" y1="44" x2="744" y2="56"/>
+        <line class="line" x1="782" y1="44" x2="782" y2="56"/>
+        <rect class="box4" x="60" y="102" width="19" height="14"/>
+        <rect class="box4" x="98" y="102" width="19" height="14"/>
+        <rect class="box4" x="136" y="102" width="19" height="14"/>
+        <rect class="box4" x="174" y="102" width="19" height="14"/>
+        <rect class="box4" x="212" y="102" width="19" height="14"/>
+        <rect class="box4" x="668" y="102" width="19" height="14"/>
+        <rect class="box4" x="706" y="102" width="19" height="14"/>
+        <rect class="box4" x="744" y="102" width="19" height="14"/>
+        <rect class="box4" x="782" y="102" width="19" height="14"/>
+        <rect class="box3" x="250" y="102" width="380" height="14"/>
+        <rect class="box4" x="60" y="160" width="19" height="14"/>
+        <rect class="box4" x="98" y="160" width="19" height="14"/>
+        <rect class="box4" x="136" y="160" width="19" height="14"/>
+        <rect class="box4" x="174" y="160" width="19" height="14"/>
+        <rect class="box4" x="212" y="160" width="19" height="14"/>
+        <rect class="box4" x="668" y="160" width="19" height="14"/>
+        <rect class="box4" x="706" y="160" width="19" height="14"/>
+        <rect class="box4" x="744" y="160" width="19" height="14"/>
+        <rect class="box4" x="782" y="160" width="19" height="14"/>
+        <rect class="box4" x="630" y="160" width="19" height="14"/>
+        <line class="line bad" x1="250" y1="150.0" x2="630" y2="150.0"/>
+        <line class="line bad" x1="288" y1="154.6" x2="630" y2="154.6"/>
+        <line class="line bad" x1="326" y1="159.2" x2="630" y2="159.2"/>
+        <line class="line bad" x1="364" y1="163.8" x2="630" y2="163.8"/>
+        <line class="line bad" x1="402" y1="168.4" x2="630" y2="168.4"/>
+        <line class="line bad" x1="440" y1="173.0" x2="630" y2="173.0"/>
+        <line class="line bad" x1="478" y1="177.6" x2="630" y2="177.6"/>
+        <line class="line bad" x1="516" y1="182.2" x2="630" y2="182.2"/>
+        <line class="line bad" x1="554" y1="186.8" x2="630" y2="186.8"/>
+        <line class="line bad" x1="592" y1="191.4" x2="630" y2="191.4"/>
+        <rect class="zone" x="250" y="30" width="380" height="172" rx="6"/>
+        <text x="440" y="24" text-anchor="middle" class="t-bold">server stalls for 1 s</text>
+        <text x="20" y="114" class="t-bold">closed</text>
+        <text x="440" y="134" text-anchor="middle" class="t-muted">1 request in flight → 1 slow sample recorded; the other 9 intended requests were never sent</text>
+        <text x="20" y="172" class="t-bold">open</text>
+        <text x="440" y="222" text-anchor="middle" class="t-muted">10 requests arrive on schedule, all wait → 10 slow samples (900 … 100 ms)</text>
+        <text x="60" y="76" class="t-muted">0 s</text><text x="430" y="76" class="t-muted">1 s</text><text x="790" y="76" class="t-muted">2 s</text>
+      </svg>
+      <figcaption>Figure 7 — Coordinated omission: the measuring client “coordinates” with the slow server and omits exactly the samples that would have been bad.</figcaption>
+    </figure>
+    <p>With 20 intended requests in Figure 7, the closed generator records 10 samples of which 1 is slow (10 % → p95 is slow but p90 looks fine), while the open generator records 20 samples of which 10 are slow — the honest picture of what users arriving during the stall experienced. Use arrival-rate executors when your question is “what latency do users see at X requests/s”, and watch k6’s <code>dropped_iterations</code> metric: it counts iterations that could not start because no VU was free — evidence that the generator could not keep the promised rate.</p>
+
+    <h3>Little’s Law</h3>
+    <p>For any stable system, the average number of requests in the system <strong>L</strong> equals the arrival rate <strong>λ</strong> times the average time each spends in it <strong>W</strong>: <code>L = λ × W</code>. It needs no assumptions about distributions, and it is your sanity check for every test:</p>
+    <ul>
+      <li>20 closed-loop VUs with no think time against <code>reliability-api</code> with 2 Pods (≈ 2 cores → ≈ 40 req/s of 50 ms work): L = 20, λ ≈ 40/s, so W ≈ 20 / 40 = <strong>0.5 s</strong> average latency — mostly queueing, although each request only needs 50 ms of CPU.</li>
+      <li>Scale to 6 Pods (≈ 120 req/s capacity): the same 20 VUs push λ up toward 20 / (0.05 s + overhead) ≈ 400/s → now limited by Pods again… or by the load generator, or by the node’s total CPU. Little’s Law tells you which number must have changed.</li>
+    </ul>
+
+    <div class="widget" id="lm-widget">
+      <div class="w-title">Workload model explorer — closed vs open, with Little’s Law</div>
+      <div class="w-sub">Service: <code>/work?ms=S</code>, each ready Pod serves about 1 request at a time (one CPU-bound worker). Capacity μ ≈ replicas × 1000 / S req/s.</div>
+      <div class="grid2">
+        <label>Service time S (ms) <input type="number" id="lm-s" value="50" min="1"></label>
+        <label>Ready replicas <input type="number" id="lm-r" value="2" min="1" max="100"></label>
+        <label>Closed: VUs <input type="number" id="lm-n" value="20" min="1"></label>
+        <label>Closed: think time (ms) <input type="number" id="lm-z" value="0" min="0"></label>
+        <label>Open: arrival rate λ (req/s) <input type="number" id="lm-l" value="30" min="0"></label>
+        <label>Open: test duration (s) <input type="number" id="lm-t" value="60" min="1"></label>
+      </div>
+      <div class="kv" id="lm-kv"></div>
+      <div class="out" id="lm-text"></div>
+    </div>
+
+    <h3>Warm-up, steady state and duration</h3>
+    <p>The first seconds of a test are not representative: connections are being established, the HPA has not reacted, Python code paths are cold, and Pods with <code>READY_DELAY_SECONDS</code> are not yet serving. Define a <strong>warm-up</strong> stage, exclude it from the SLO evaluation (tag it, or evaluate only the steady-state window in PromQL), and make the steady-state stage long enough to include several HPA syncs and scrape intervals (minutes, not seconds).</p>
+
+    <h3>Percentiles and sample size</h3>
+    <p>A percentile is only as trustworthy as the number of samples behind it. With N requests, only N × (1 − p) samples lie beyond the p-th percentile:</p>
+    <div class="table-wrap"><table>
+      <tr><th>Requests in window</th><th>Samples above p95</th><th>Samples above p99</th><th>Verdict</th></tr>
+      <tr><td>100</td><td>5</td><td>1</td><td>p99 is literally one request — do not report it</td></tr>
+      <tr><td>1,000</td><td>50</td><td>10</td><td>p95 usable; p99 noisy</td></tr>
+      <tr><td>10,000</td><td>500</td><td>100</td><td>p99 reasonable</td></tr>
+      <tr><td>100,000</td><td>5,000</td><td>1,000</td><td>p99.9 starts to mean something</td></tr>
+    </table></div>
+    <p>Rules: report the sample count next to every percentile; never average percentiles across runs or Pods (aggregate raw data or histogram buckets); repeat each configuration at least three times and report the spread; and remember that Prometheus percentiles are bucket-interpolated estimates (Module 07), while k6 computes percentiles from its own raw samples — they measure different things (server handler time vs client-observed time) and will differ.</p>
+
+    <h3>The load generator is part of the experiment</h3>
+    <p>If the generator runs out of CPU, memory or network, it sends less than you asked and its own timing measurements inflate. The k6 docs on large tests advise keeping load-generator CPU utilisation within 80 % and memory under 90 %, monitoring network throughput, and using <code>discardResponseBodies: true</code> to save memory. In a kind cluster the generator Pod shares the same machine as <code>reliability-api</code>: every CPU cycle k6 uses is unavailable to the Pods under test. Record where the generator ran, give it its own resource requests, and check its CPU on the dashboard. Also avoid <code>kubectl port-forward</code> as a load path: it is a debugging tunnel through the API server and kubelet, forwards to a single Pod chosen at start, and becomes the bottleneck itself.</p>
+
+    <details class="q"><summary>Self-check: your closed-model test reports p95 = 120 ms at 50 VUs and also at 100 VUs, but throughput did not change. What happened?</summary><div class="a">The system (or the generator) is saturated: throughput is capped, so doubling VUs only doubles the number of requests waiting (Little’s Law: W = L/λ should have doubled). If reported latency did not double, the latency is probably being measured somewhere that excludes the queueing — or the generator itself is saturated and its VUs are not actually sending. Check generator CPU, <code>http_reqs</code> rate, and server-side request rate.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>11. k6: a load test for /work</h2>
+    <p><strong>k6</strong> runs JavaScript test scripts. Init code runs once per VU; the <code>default</code> function runs repeatedly for the configured duration. <strong>Checks</strong> validate responses but do not fail the test by themselves; <strong>thresholds</strong> are pass/fail criteria — when any threshold fails, k6 exits with a non-zero code (99, <code>ThresholdsHaveFailed</code>), which is what makes it CI-friendly.</p>
+<pre data-title="experiments/load/work-stages.js — closed model with stages"><code>import http from 'k6/http';
+import { check } from 'k6';
+
+const BASE = __ENV.BASE_URL || 'http://reliability-api.reliability-lab.svc.cluster.local';
+
+export const options = {
+  discardResponseBodies: true,
+  stages: [
+    { duration: '1m', target: 5 },    <span class="c">// warm-up (exclude from SLO evaluation)</span>
+    { duration: '4m', target: 5 },    <span class="c">// baseline steady state</span>
+    { duration: '1m', target: 20 },   <span class="c">// ramp</span>
+    { duration: '6m', target: 20 },   <span class="c">// stress steady state (HPA should react)</span>
+    { duration: '1m', target: 0 },    <span class="c">// ramp down</span>
+  ],
+  thresholds: {
+    http_req_failed: ['rate&lt;0.01'],                 <span class="c">// &lt; 1 % errors</span>
+    http_req_duration: ['p(95)&lt;250', 'p(99)&lt;500'],  <span class="c">// ms, client-observed</span>
+    checks: ['rate&gt;0.99'],
+  },
+  summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max', 'count'],
+};
+
+export default function () {
+  const res = http.get(`${BASE}/work?ms=50`);
+  check(res, { 'status is 200': (r) =&gt; r.status === 200 });
+}</code></pre>
+<pre data-title="experiments/load/work-open.js — open model (arrival rate)"><code>import http from 'k6/http';
+
+const BASE = __ENV.BASE_URL || 'http://reliability-api.reliability-lab.svc.cluster.local';
+
+export const options = {
+  discardResponseBodies: true,
+  scenarios: {
+    work: {
+      executor: 'ramping-arrival-rate',
+      startRate: 2,                 <span class="c">// iterations per timeUnit at start</span>
+      timeUnit: '1s',
+      preAllocatedVUs: 20,
+      maxVUs: 200,                  <span class="c">// cap; watch dropped_iterations</span>
+      stages: [
+        { target: 2, duration: '2m' },
+        { target: 20, duration: '1m' },
+        { target: 20, duration: '6m' },
+        { target: 2, duration: '1m' },
+      ],
+    },
+  },
+  thresholds: {
+    http_req_failed: ['rate&lt;0.01'],
+    http_req_duration: ['p(95)&lt;250'],
+    dropped_iterations: ['count&lt;1'],  <span class="c">// the generator must deliver the promised rate</span>
+  },
+};
+
+export default function () {
+  http.get(`${BASE}/work?ms=50`);
+}</code></pre>
+    <h3>Running k6 inside the cluster</h3>
+    <p>Run the generator as a Kubernetes Job so it reaches the Service by DNS (no port-forward), its logs are your evidence, and it is reproducible:</p>
+<pre data-title="experiments/load/k6-job.yaml"><code>apiVersion: batch/v1
+kind: Job
+metadata:
+  name: k6-work
+  namespace: reliability-lab
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: k6
+          image: grafana/k6               <span class="c"># pin a version tag for reproducible reports</span>
+          args: ["run", "--summary-mode=full", "/scripts/work-stages.js"]
+          env:
+            - name: BASE_URL
+              value: http://reliability-api.reliability-lab.svc.cluster.local
+          resources:
+            requests: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: k6-scripts</code></pre>
+<pre><code>kubectl -n reliability-lab create configmap k6-scripts \
+  --from-file=experiments/load/work-stages.js --from-file=experiments/load/work-open.js
+kubectl apply -f experiments/load/k6-job.yaml
+kubectl -n reliability-lab logs -f job/k6-work            <span class="c"># live progress + end-of-test summary</span>
+kubectl -n reliability-lab get job k6-work                 <span class="c"># Complete vs Failed (thresholds → exit 99)</span>
+kubectl -n reliability-lab delete job k6-work              <span class="c"># before re-running with the same name</span></code></pre>
+    <p>For a quick local run against a reachable URL: <code>k6 run work-stages.js</code>, or with Docker <code>docker run --rm -i grafana/k6 run - &lt;work-stages.js</code> (the script is piped on stdin because the container cannot see your file). To keep every sample for later analysis, add <code>--out json=results.json</code> (one JSON object per line: metric declarations and <code>Point</code> samples with timestamps and tags).</p>
+    <h3>Seeing k6 in Grafana (dashboard panel 7)</h3>
+    <p>k6 can stream metrics to Prometheus via remote write: <code>k6 run -o experimental-prometheus-rw script.js</code> with <code>K6_PROMETHEUS_RW_SERVER_URL</code> pointing at <code>…/api/v1/write</code>. Prometheus must accept remote writes (<code>--web.enable-remote-write-receiver</code>; in kube-prometheus-stack the value <code>prometheus.prometheusSpec.enableRemoteWriteReceiver=true</code>). Metrics arrive prefixed <code>k6_</code>, e.g. <code>k6_http_reqs_total</code> and <code>k6_vus</code>.</p>
+<pre><code>helm upgrade monitoring prometheus-community/kube-prometheus-stack -n monitoring \
+  --reuse-values --set prometheus.prometheusSpec.enableRemoteWriteReceiver=true
+<span class="c"># then in the Job: args ["run", "-o", "experimental-prometheus-rw", "/scripts/work-stages.js"]</span>
+<span class="c"># env K6_PROMETHEUS_RW_SERVER_URL=http://monitoring-kube-prometheus-prometheus.monitoring.svc:9090/api/v1/write</span></code></pre>
+    <h3>Reading k6 results</h3>
+    <div class="table-wrap"><table>
+      <tr><th>k6 metric</th><th>Type</th><th>Meaning</th><th>Compare with (Prometheus)</th></tr>
+      <tr><td><code>http_reqs</code></td><td>Counter</td><td>Requests k6 generated</td><td>Served rate <code>sum(rate(http_requests_total[…]))</code> — the gap is lost or failed requests</td></tr>
+      <tr><td><code>http_req_duration</code></td><td>Trend</td><td>Sending + waiting + receiving (client view)</td><td>Server <code>histogram_quantile</code> — difference = network + queueing outside the handler</td></tr>
+      <tr><td><code>http_req_waiting</code></td><td>Trend</td><td>Time to first byte</td><td>—</td></tr>
+      <tr><td><code>http_req_failed</code></td><td>Rate</td><td>Fraction of failed requests</td><td>Server error ratio (sees only requests that reached a Pod)</td></tr>
+      <tr><td><code>checks</code></td><td>Rate</td><td>Fraction of successful checks</td><td>—</td></tr>
+      <tr><td><code>vus</code>, <code>vus_max</code></td><td>Gauge</td><td>Active / pre-allocated VUs</td><td>—</td></tr>
+      <tr><td><code>dropped_iterations</code></td><td>Counter</td><td>Iterations not started (no free VU / time)</td><td>Non-zero = generator could not deliver the rate</td></tr>
+    </table></div>
+    <p>The default end-of-test trend stats are <code>avg, min, med, max, p(90), p(95)</code>; the script above adds <code>p(99)</code> and <code>count</code>. Do not paste the summary into your report without the workload definition next to it.</p>
+
+    <!-- ============================================================ -->
+    <h2>12. Locust as an alternative</h2>
+    <p><strong>Locust</strong> describes user behaviour in Python, which may feel more natural to you. Each simulated user runs tasks; <code>wait_time</code> controls pacing: <code>between(min, max)</code>, <code>constant(t)</code>, <code>constant_throughput(rate)</code> (task runs at most X times per second per user), <code>constant_pacing(interval)</code>, and <code>poisson(rate)</code>. <code>constant_throughput</code> approximates a fixed arrival rate per user, but it is still a user-based model: if responses are slower than the pacing interval, the user cannot catch up.</p>
+<pre data-title="experiments/load/locustfile.py"><code>from locust import HttpUser, task, constant_throughput
+
+class WorkUser(HttpUser):
+    wait_time = constant_throughput(1)       # ≤ 1 request/s per user
+
+    @task
+    def work(self):
+        with self.client.get("/work?ms=50", catch_response=True) as r:
+            if r.status_code != 200:
+                r.failure(f"status {r.status_code}")</code></pre>
+<pre><code>locust -f experiments/load/locustfile.py --headless \
+  -u 20 -r 2 -t 10m -H http://reliability-api.reliability-lab.svc.cluster.local \
+  --csv experiments/reports/locust-run1 --html experiments/reports/locust-run1.html</code></pre>
+    <p><code>-u</code> = users, <code>-r</code> = spawn rate (users/s), <code>-t</code> = run time, <code>-H</code> = host; <code>--csv</code> writes request statistics and failures, <code>--html</code> a report. Without <code>--headless</code>, the web UI listens on port 8089. A single Locust process is limited by Python’s single core; the docs describe distributed mode and the faster <code>FastHttpUser</code> for heavier loads.</p>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>k6</th><th>Locust</th></tr>
+      <tr><td>Script language</td><td>JavaScript</td><td>Python</td></tr>
+      <tr><td>Open model</td><td>Built-in arrival-rate executors</td><td>Approximate via pacing per user</td></tr>
+      <tr><td>Pass/fail</td><td>Thresholds → non-zero exit</td><td>Inspect stats / custom exit logic</td></tr>
+      <tr><td>Prometheus</td><td>Remote-write output</td><td>Via exporters/plugins</td></tr>
+      <tr><td>Best for</td><td>CI gates, precise rates</td><td>Complex Python user flows</td></tr>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>13. Designing experiments</h2>
+    <p>Treat every run as an experiment: one hypothesis, one changed variable, everything else fixed and recorded. Write the success criteria <em>before</em> running; thresholds chosen after seeing results are not evidence.</p>
+    <div class="table-wrap"><table>
+      <tr><th>ID</th><th>Hypothesis</th><th>Independent variable</th><th>Held constant</th><th>Measured</th><th>Pass criteria (test SLO)</th></tr>
+      <tr><td>E1</td><td>2 replicas serve 5 req/s within SLO</td><td>— (baseline)</td><td>Image, requests, node, generator placement</td><td>req/s, p50/p95/p99, errors, CPU</td><td>p95 &lt; 250 ms, errors &lt; 1 %</td></tr>
+      <tr><td>E2</td><td>Throughput scales ~linearly with replicas</td><td>Fixed replicas 1 / 2 / 4 (HPA off)</td><td>Open-model rate ramp</td><td>Max rate before p95 &gt; 250 ms</td><td>4 replicas ≥ 3× the 1-replica rate</td></tr>
+      <tr><td>E3</td><td>HPA restores SLO within 2 min of a step to 20 req/s</td><td>HPA on (min 2, max 6, 60 %)</td><td>Step profile, stabilization setting</td><td>Time to first scale, time to SLO recovery, replicas</td><td>SLO met again ≤ 120 s after step</td></tr>
+      <tr><td>E4</td><td>Deleting 1 of 2 Pods under load causes &lt; 1 % errors</td><td>Pod deletion at t = 120 s</td><td>Load 5 req/s, HPA frozen</td><td>Failed requests, impact window, replacement Ready time</td><td>errors &lt; 1 %, recovery ≤ 60 s</td></tr>
+      <tr><td>E5</td><td>A broken image never receives traffic</td><td>Image tag that does not exist</td><td>Load 5 req/s</td><td>Errors, rollout status, Ready replicas</td><td>0 extra errors, rollout reports failure</td></tr>
+      <tr><td>E6</td><td>Pods that never become ready never receive traffic</td><td><code>READY_DELAY_SECONDS=600</code> on a new rollout</td><td>Load 5 req/s</td><td>Errors, endpoints, rollout progress</td><td>0 extra errors; rollout stalls, old Pods serve</td></tr>
+    </table></div>
+    <div class="callout warn"><span class="label">Threats to validity — write them in every report</span>Generator on the same node as the app; laptop thermal throttling or other apps; image cached vs pulled; HPA state left over from the previous run (scale-down window!); different Pod placement across runs; too few samples for the percentile reported; Prometheus scrape interval coarser than the event you are timing.</div>
+
+    <!-- ============================================================ -->
+    <h2>14. Failure testing</h2>
+    <p><strong>Failure testing</strong> asks whether the system behaves as expected when a <em>defined</em> fault occurs. It borrows the method of chaos engineering: define a measurable <strong>steady state</strong>; <strong>hypothesise</strong> that it continues during the fault; <strong>introduce</strong> a realistic variable (a crashed server, a bad release); <strong>try to disprove</strong> the hypothesis by looking for a difference. And always minimise the blast radius.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 220" role="img" aria-label="Failure experiment loop: define steady state, state the hypothesis, limit the blast radius, inject the fault, observe and measure, restore and report, then repeat">
+        <defs><marker id="m08f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="40" width="122" height="84" rx="8"/><text x="81" y="64" text-anchor="middle" class="t-bold">1. Steady</text><text x="81" y="82" text-anchor="middle" class="t-bold">state</text><text x="81" y="104" text-anchor="middle" class="t-muted">SLIs at baseline</text>
+        <rect class="box2" x="159" y="40" width="122" height="84" rx="8"/><text x="220" y="64" text-anchor="middle" class="t-bold">2. Hypothesis</text><text x="220" y="86" text-anchor="middle" class="t-muted">“errors &lt; 1 %,</text><text x="220" y="104" text-anchor="middle" class="t-muted">recovery ≤ 60 s”</text>
+        <rect class="box3" x="298" y="40" width="122" height="84" rx="8"/><text x="359" y="64" text-anchor="middle" class="t-bold">3. Blast</text><text x="359" y="82" text-anchor="middle" class="t-bold">radius</text><text x="359" y="104" text-anchor="middle" class="t-muted">1 Pod, lab ns</text>
+        <rect class="box3" x="437" y="40" width="122" height="84" rx="8"/><text x="498" y="64" text-anchor="middle" class="t-bold">4. Inject</text><text x="498" y="86" text-anchor="middle" class="t-muted">record exact</text><text x="498" y="104" text-anchor="middle" class="t-muted">fault time</text>
+        <rect class="box2" x="576" y="40" width="122" height="84" rx="8"/><text x="637" y="64" text-anchor="middle" class="t-bold">5. Observe</text><text x="637" y="86" text-anchor="middle" class="t-muted">impact window,</text><text x="637" y="104" text-anchor="middle" class="t-muted">recovery time</text>
+        <rect class="box4" x="715" y="40" width="122" height="84" rx="8"/><text x="776" y="64" text-anchor="middle" class="t-bold">6. Restore</text><text x="776" y="86" text-anchor="middle" class="t-muted">&amp; report</text><text x="776" y="104" text-anchor="middle" class="t-muted">pass / fail</text>
+        <line class="line" x1="142" y1="82" x2="157" y2="82" marker-end="url(#m08f)"/>
+        <line class="line" x1="281" y1="82" x2="296" y2="82" marker-end="url(#m08f)"/>
+        <line class="line" x1="420" y1="82" x2="435" y2="82" marker-end="url(#m08f)"/>
+        <line class="line" x1="559" y1="82" x2="574" y2="82" marker-end="url(#m08f)"/>
+        <line class="line" x1="698" y1="82" x2="713" y2="82" marker-end="url(#m08f)"/>
+        <path class="line dash" d="M776,124 L776,170 L81,170 L81,126" marker-end="url(#m08f)"/>
+        <text x="430" y="192" text-anchor="middle" class="t-muted">abort criteria defined in step 3 — stop immediately if exceeded</text>
+      </svg>
+      <figcaption>Figure 8 — The loop is the same for a one-line <code>kubectl delete pod</code> and for a chaos platform.</figcaption>
+    </figure>
+
+    <div class="callout danger"><span class="label">Safety rules (non-negotiable)</span>
+      <ol style="margin:0">
+        <li>Only in your own lab cluster/namespace (<code>reliability-lab</code>), never a shared or production cluster without explicit written authorisation and isolation.</li>
+        <li>Write the hypothesis, success thresholds and <strong>abort criteria</strong> before injecting.</li>
+        <li>Smallest blast radius first: one Pod, one fault, short duration.</li>
+        <li>Know the rollback command and test it before the experiment.</li>
+        <li>Silence expected alerts (Module 07) and tell anyone who shares the environment.</li>
+        <li>Freeze other variables: no HPA changes, no deploys during the experiment.</li>
+      </ol></div>
+
+    <h3>Experiment A — delete one Pod under load</h3>
+    <p>What actually happens when you delete one of the two <code>reliability-api</code> Pods? Step through the sequence:</p>
+    <div class="widget stepper" data-steps='[
+      {"title":"You delete Pod A","html":"<code>kubectl delete pod</code> asks the API server to delete Pod A. The API server sets a <em>deletionTimestamp</em>; the Pod is now terminating (default grace period 30 s)."},
+      {"title":"Two things happen in parallel","html":"The kubelet runs any preStop hook and sends SIGTERM to Uvicorn. At the same time the EndpointSlice controller marks Pod A’s endpoint as terminating/not ready and kube-proxy on every node removes it from the Service rules. These are independent — if Uvicorn stops accepting connections before every node has updated its rules, a few requests can fail. A short preStop sleep and graceful shutdown narrow this race."},
+      {"title":"ReplicaSet notices the shortfall","html":"The ReplicaSet controller sees 1 of 2 desired Pods (terminating Pods do not count) and creates Pod C. The scheduler places it on a node with room for its requests."},
+      {"title":"Pod C starts, but is not Ready yet","html":"The kubelet starts the container (image already cached in kind). The readiness probe on <code>/ready</code> returns 503 until <code>READY_DELAY_SECONDS</code> has passed, so Pod C receives no traffic yet. Meanwhile Pod B carries all the load — this is the reduced-capacity part of the impact window."},
+      {"title":"Pod C becomes Ready","html":"The readiness probe succeeds, the Pod’s Ready condition turns True, the EndpointSlice adds Pod C and kube-proxy routes to it. Capacity is back to 2 Pods: this is the <em>replica recovery</em> time."},
+      {"title":"Pod A exits","html":"Uvicorn finishes in-flight requests and exits after SIGTERM (or is killed with SIGKILL when the grace period ends). The deletion completes."}
+    ]'>
+      <div class="w-title">Step through: what Kubernetes does when a Pod is deleted under load</div>
+      <div class="w-sub">Figure 9 — sequence across components. Click Next.</div>
+      <svg viewBox="0 0 880 390" role="img" aria-label="Sequence diagram across kubectl, API server, ReplicaSet controller, EndpointSlice controller, kube-proxy, old Pod A and new Pod C">
+        <defs><marker id="m08g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box" x="10" y="14" width="104" height="34" rx="6"/><text x="62" y="36" text-anchor="middle" class="t-bold" style="font-size:12px">kubectl</text>
+        <rect class="box2" x="136" y="14" width="104" height="34" rx="6"/><text x="188" y="36" text-anchor="middle" class="t-bold" style="font-size:12px">API server</text>
+        <rect class="box" x="262" y="14" width="104" height="34" rx="6"/><text x="314" y="36" text-anchor="middle" class="t-bold" style="font-size:12px">ReplicaSet</text>
+        <rect class="box" x="388" y="14" width="104" height="34" rx="6"/><text x="440" y="36" text-anchor="middle" class="t-bold" style="font-size:12px">EndpointSlice</text>
+        <rect class="box" x="514" y="14" width="104" height="34" rx="6"/><text x="566" y="36" text-anchor="middle" class="t-bold" style="font-size:12px">kube-proxy</text>
+        <rect class="box3" x="640" y="14" width="104" height="34" rx="6"/><text x="692" y="36" text-anchor="middle" class="t-bold" style="font-size:12px">Pod A (old)</text>
+        <rect class="box4" x="766" y="14" width="104" height="34" rx="6"/><text x="818" y="36" text-anchor="middle" class="t-bold" style="font-size:12px">Pod C (new)</text>
+        <line class="line dash" x1="62" y1="48" x2="62" y2="380"/><line class="line dash" x1="188" y1="48" x2="188" y2="380"/><line class="line dash" x1="314" y1="48" x2="314" y2="380"/><line class="line dash" x1="440" y1="48" x2="440" y2="380"/><line class="line dash" x1="566" y1="48" x2="566" y2="380"/><line class="line dash" x1="692" y1="48" x2="692" y2="380"/><line class="line dash" x1="818" y1="48" x2="818" y2="380"/>
+        <g data-step="0"><line class="line accent" x1="62" y1="80" x2="186" y2="80" marker-end="url(#m08g)"/><text x="70" y="74" class="t-muted">delete pod A</text></g>
+        <g data-step="1"><line class="line accent" x1="188" y1="112" x2="690" y2="112" marker-end="url(#m08g)"/><text x="400" y="106" class="t-muted">terminating → kubelet: preStop, SIGTERM (grace 30 s)</text>
+          <line class="line accent" x1="188" y1="142" x2="438" y2="142" marker-end="url(#m08g)"/><text x="196" y="136" class="t-muted">A not ready / terminating</text>
+          <line class="line accent" x1="440" y1="170" x2="564" y2="170" marker-end="url(#m08g)"/><text x="448" y="164" class="t-muted">remove A</text></g>
+        <g data-step="2"><line class="line accent" x1="188" y1="200" x2="312" y2="200" marker-end="url(#m08g)"/><text x="196" y="194" class="t-muted">1 of 2 Pods</text>
+          <line class="line accent" x1="314" y1="228" x2="190" y2="228" marker-end="url(#m08g)"/><text x="200" y="222" class="t-muted">create Pod C</text></g>
+        <g data-step="3"><line class="line accent" x1="188" y1="258" x2="816" y2="258" marker-end="url(#m08g)"/><text x="470" y="252" class="t-muted">scheduled · container starts · /ready = 503 during READY_DELAY</text></g>
+        <g data-step="4"><line class="line ok" x1="818" y1="290" x2="190" y2="290" marker-end="url(#m08g)"/><text x="520" y="284" class="t-muted">readiness passes → Ready=True</text>
+          <line class="line ok" x1="440" y1="318" x2="564" y2="318" marker-end="url(#m08g)"/><text x="448" y="312" class="t-muted">add C</text></g>
+        <g data-step="5"><line class="line bad" x1="692" y1="352" x2="190" y2="352" marker-end="url(#m08g)"/><text x="330" y="346" class="t-muted">in-flight requests done → process exits → Pod A removed</text></g>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+    <h3>Measuring recovery</h3>
+    <p>Define the terms <em>before</em> the experiment (study guide §13.3) and measure them from data, not from watching a terminal:</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Recovery timeline: errors spike right after the fault at 60 seconds and stop at 64 seconds; p95 latency exceeds its threshold until 75 seconds; ready replicas drop from 2 to 1 at the fault and return to 2 at 72 seconds; impact window and recovery time span from 60 to 75 seconds">
+        <text x="20" y="54" class="t-bold">errors</text>
+        <line class="line" x1="120" y1="80" x2="820" y2="80"/>
+        <polyline class="line bad" points="120,80 440,80 442,46 452,52 460,64 466,80 820,80"/>
+        <text x="20" y="128" class="t-bold">p95</text>
+        <line class="line" x1="120" y1="150" x2="820" y2="150"/>
+        <line class="line dash" x1="120" y1="120" x2="820" y2="120"/><text x="824" y="124" class="t-muted">SLO</text>
+        <polyline class="line accent" points="120,136 440,136 450,104 500,108 520,114 535,124 550,136 820,136"/>
+        <text x="20" y="196" class="t-bold">ready Pods</text>
+        <polyline class="line ok" points="120,186 440,186 440,206 516,206 516,186 820,186"/>
+        <text x="124" y="182" class="t-muted">2</text><text x="452" y="222" class="t-muted">1</text>
+        <line class="line" x1="440" y1="30" x2="440" y2="236"/><text x="440" y="24" text-anchor="middle" class="t-bold">fault t=60 s</text>
+        <line class="line dash" x1="466" y1="40" x2="466" y2="236"/>
+        <line class="line dash" x1="516" y1="166" x2="516" y2="236"/><text x="516" y="250" text-anchor="middle" class="t-muted">Pod C Ready 72 s</text>
+        <line class="line" x1="535" y1="30" x2="535" y2="236"/><text x="600" y="24" text-anchor="middle" class="t-bold">recovered 75 s</text>
+        <text x="471" y="46" class="t-muted">last error</text>
+        <line class="line accent" x1="440" y1="270" x2="535" y2="270"/><line class="line accent" x1="440" y1="262" x2="440" y2="278"/><line class="line accent" x1="535" y1="262" x2="535" y2="278"/>
+        <text x="550" y="274" class="t-bold">impact = recovery = 15 s (here)</text>
+        <text x="120" y="294" class="t-muted">0 s</text><text x="790" y="294" class="t-muted">120 s</text>
+      </svg>
+      <figcaption>Figure 10 — Illustrative shape, not a measurement. Errors stopped at 64 s but the latency SLI recovered only at 75 s; recovery is defined by the <em>last</em> SLI to return.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <tr><th>Term</th><th>Definition (decide before the run)</th><th>Measured from</th></tr>
+      <tr><td><strong>Fault time</strong> T<sub>f</sub></td><td>The moment the fault is injected</td><td><code>date +%s</code> printed immediately before <code>kubectl delete</code></td></tr>
+      <tr><td><strong>Impact window</strong></td><td>Period during which requests fail <em>or</em> violate the latency target</td><td>Probe log / k6 JSON / Prometheus at fine resolution</td></tr>
+      <tr><td><strong>Recovery time</strong></td><td>T<sub>r</sub> − T<sub>f</sub>, where T<sub>r</sub> is when all agreed SLIs are back within target (and stay there)</td><td>Same</td></tr>
+      <tr><td><strong>Replica recovery</strong></td><td>Time until the replacement Pod is Ready</td><td>Pod <code>Ready</code> condition <code>lastTransitionTime</code></td></tr>
+      <tr><td><strong>Result</strong></td><td>Failed-request %, impact duration, whether replicas recovered, whether the SLO held over the test window</td><td>Report</td></tr>
+    </table></div>
+    <div class="callout warn"><span class="label">Resolution limits what you can claim</span>With a 15 s Prometheus scrape interval and <code>rate(...[1m])</code>, a 4-second error burst is smeared over a minute. Measure short events with a per-request log (probe below, or k6 <code>--out json</code>), and state the resolution of each number in the report.</div>
+
+    <div class="widget" id="rc-widget">
+      <div class="w-title">Recovery-metric calculator</div>
+      <div class="w-sub">Enter times in seconds since the experiment started, and request counts from your probe/k6 data.</div>
+      <div class="grid2">
+        <label>Fault injected at (s) <input type="number" id="rc-f" value="60" step="0.1"></label>
+        <label>First bad request at (s) <input type="number" id="rc-b1" value="60.4" step="0.1"></label>
+        <label>Last bad request at (s) <input type="number" id="rc-b2" value="63.8" step="0.1"></label>
+        <label>Latency back under SLO at (s) <input type="number" id="rc-lat" value="75" step="0.1"></label>
+        <label>Replacement Pod Ready at (s) <input type="number" id="rc-ready" value="72" step="0.1"></label>
+        <label>Experiment end (s) <input type="number" id="rc-end" value="180" step="1"></label>
+        <label>Total requests <input type="number" id="rc-tot" value="900" min="1"></label>
+        <label>Failed requests <input type="number" id="rc-fail" value="3" min="0"></label>
+        <label>Max failed % (test SLO) <input type="number" id="rc-slo" value="1" step="0.1" min="0"></label>
+        <label>Max recovery time (s) <input type="number" id="rc-rmax" value="60" min="0"></label>
+      </div>
+      <svg class="sim-chart" id="rc-chart" viewBox="0 0 720 130" role="img" aria-label="Timeline of the entered experiment times"></svg>
+      <div class="kv" id="rc-kv"></div>
+      <div class="out" id="rc-text"></div>
+    </div>
+
+    <section class="lab"><header>Lab 3 — Delete a Pod under load and measure the impact</header><div class="body">
+      <p>Hypothesis (write it first): <em>“Deleting 1 of 2 reliability-api Pods at ~5 req/s causes &lt; 1 % failed requests and the service is back within SLO in ≤ 60 s.”</em></p>
+      <ol class="steps">
+        <li>Freeze the HPA so it cannot change replicas mid-experiment (restore afterwards):
+<pre><code>kubectl -n reliability-lab patch hpa reliability-api -p '{"spec":{"minReplicas":2,"maxReplicas":2}}'
+kubectl -n reliability-lab get pods -l app.kubernetes.io/name=reliability-api</code></pre></li>
+        <li>Start an in-cluster probe that logs one line per request with a timestamp (1-second resolution — note it in the report):
+<pre><code>kubectl -n reliability-lab run probe --image=busybox --restart=Never -- /bin/sh -c \
+  'while true; do if wget -q -T 2 -O /dev/null "http://reliability-api/work?ms=50"; then s=ok; else s=FAIL; fi; echo "$(date +%s) $s"; done'</code></pre>
+          Optionally run the k6 Job in parallel for realistic background load.</li>
+        <li>Wait at least 60 s of steady state (check the dashboard: errors 0, p95 stable). Then record the fault time and delete one Pod:
+<pre><code>POD=$(kubectl -n reliability-lab get pods -l app.kubernetes.io/name=reliability-api -o jsonpath='{.items[0].metadata.name}')
+echo "FAULT $(date +%s) deleting $POD"
+kubectl -n reliability-lab delete pod "$POD" --wait=false
+kubectl -n reliability-lab get pods -l app.kubernetes.io/name=reliability-api -w</code></pre></li>
+        <li>After ~2 minutes, collect the replacement’s Ready time and the probe log:
+<pre><code>kubectl -n reliability-lab get pods -l app.kubernetes.io/name=reliability-api \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.conditions[?(@.type=="Ready")].lastTransitionTime}{"\n"}{end}'
+kubectl -n reliability-lab logs probe &gt; experiments/reports/e4-probe.log
+grep -c ok experiments/reports/e4-probe.log; grep -c FAIL experiments/reports/e4-probe.log
+grep FAIL experiments/reports/e4-probe.log | head -1; grep FAIL experiments/reports/e4-probe.log | tail -1
+<span class="c"># requests and failures per second:</span>
+awk '{n[$1]++; if ($2=="FAIL") f[$1]++} END {for (t in n) print t, n[t], f[t]+0}' \
+  experiments/reports/e4-probe.log | sort -n</code></pre>
+          The Ready timestamp is RFC 3339 in UTC; convert it to epoch seconds to compare with the probe log (GNU <code>date -d</code>, or on macOS <code>date -j -u -f "%Y-%m-%dT%H:%M:%SZ" &lt;ts&gt; +%s</code>).</li>
+        <li>Feed the numbers into the recovery calculator above. Interpret: zero FAIL lines means graceful termination plus endpoint removal hid the fault entirely; a handful of FAILs within a second or two of the fault points at the termination/endpoint-removal race (consider a preStop sleep); a long gap of FAILs means something worse (e.g. only one Pod was Ready to begin with — check your starting state).</li>
+        <li>Clean up and restore:
+<pre><code>kubectl -n reliability-lab delete pod probe
+kubectl -n reliability-lab patch hpa reliability-api -p '{"spec":{"minReplicas":2,"maxReplicas":6}}'</code></pre></li>
+      </ol>
+      <p><strong>Evidence:</strong> the probe log, the FAULT line, the Ready timestamp, a dashboard screenshot with annotations at fault and recovery, and the filled report template (section 16). Repeat three times; report all three.</p>
+    </div></section>
+
+    <h3>Experiment B — ship a broken image</h3>
+    <p>With the default RollingUpdate strategy (maxUnavailable 25 % rounded <em>down</em>, maxSurge 25 % rounded <em>up</em>), a 2-replica Deployment may create 1 extra Pod and may not remove any old Pod until a new one is available. A new Pod that can never pull its image therefore never replaces anything: users should see <strong>no extra errors</strong>, and the rollout should report failure.</p>
+    <h3>Experiment C — break readiness</h3>
+    <p>Set <code>READY_DELAY_SECONDS=600</code> on a rollout. New Pods start and pass liveness (<code>/health</code>) but return 503 on <code>/ready</code> for 10 minutes, so they never join the Service endpoints within the test. The rollout stalls; old Pods keep serving. This proves your readiness probe protects users — and shows what would happen if it pointed at <code>/health</code> instead (traffic would reach Pods that are not ready).</p>
+
+    <section class="lab"><header>Lab 4 — Broken image and broken readiness, then roll back</header><div class="body">
+      <p>Keep the probe from Lab 3 running in the background (start it again if you deleted it). The container name is assumed to be <code>reliability-api</code>; check with <code>kubectl -n reliability-lab get deploy reliability-api -o jsonpath='{.spec.template.spec.containers[*].name}'</code>.</p>
+      <ol class="steps">
+        <li><strong>Broken image.</strong>
+<pre><code>echo "FAULT $(date +%s) broken image"
+kubectl -n reliability-lab set image deployment/reliability-api reliability-api=reliability-api:does-not-exist
+kubectl -n reliability-lab rollout status deployment/reliability-api --timeout=90s; echo "exit=$?"
+kubectl -n reliability-lab get pods -l app.kubernetes.io/name=reliability-api</code></pre>
+<pre data-title="Example output (yours will differ in names/IDs/timings)"><code><span class="o">Waiting for deployment "reliability-api" rollout to finish: 1 out of 2 new replicas have been updated...
+error: timed out waiting for the condition
+exit=1
+NAME                               READY   STATUS             RESTARTS   AGE
+reliability-api-6d5f9c7b8d-abcde   1/1     Running            0          25m
+reliability-api-6d5f9c7b8d-k7m2p   1/1     Running            0          9m
+reliability-api-7f4c8d9e6a-x9z8w   0/1     ImagePullBackOff   0          92s</span></code></pre>
+          Read the cause from Events: <code>kubectl -n reliability-lab describe pod &lt;new-pod&gt; | tail -15</code>. Without <code>--timeout</code>, <code>rollout status</code> waits for the Deployment’s progress deadline (<code>progressDeadlineSeconds</code>, default 600 s) and then reports <code>exceeded its progress deadline</code> with exit code 1 — the signal a CI/CD pipeline uses to fail a deploy (Module 09).</li>
+        <li>Roll back and confirm:
+<pre><code>kubectl -n reliability-lab rollout undo deployment/reliability-api
+kubectl -n reliability-lab rollout status deployment/reliability-api
+echo "RECOVERED $(date +%s)"</code></pre></li>
+        <li><strong>Broken readiness.</strong>
+<pre><code>echo "FAULT $(date +%s) readiness delay 600"
+kubectl -n reliability-lab set env deployment/reliability-api READY_DELAY_SECONDS=600
+kubectl -n reliability-lab get pods -l app.kubernetes.io/name=reliability-api -w        <span class="c"># new Pod: Running but 0/1 READY</span>
+kubectl -n reliability-lab get endpointslices -l kubernetes.io/service-name=reliability-api -o yaml | grep -B2 -A3 "ready:"</code></pre>
+          Confirm the new Pod’s endpoint shows <code>ready: false</code> (or is absent) while the old Pods’ endpoints are <code>ready: true</code>. Then <code>kubectl -n reliability-lab rollout undo deployment/reliability-api</code>.</li>
+        <li>Count FAIL lines in the probe log between each FAULT and RECOVERED timestamp. The hypothesis for both experiments is <strong>zero</strong> additional failures.</li>
+      </ol>
+      <p><strong>Discussion question for your notes:</strong> what would happen in Experiment C if the Deployment had <code>maxUnavailable: 100%</code>? (All old Pods could be removed before new ones are Ready → the Service would have no ready endpoints → every request fails.)</p>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>15. Chaos tools overview</h2>
+    <p>Once manual experiments are understood, chaos platforms make fault injection declarative, schedulable and repeatable. They add power — and risk — so the safety rules above apply doubly.</p>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Chaos Mesh</th><th>LitmusChaos</th></tr>
+      <tr><td>What</td><td>Open-source cloud-native chaos engineering platform; CNCF incubating project</td><td>Cloud-native chaos engineering framework with cross-cloud support; CNCF incubating project</td></tr>
+      <tr><td>Fault types</td><td>PodChaos, NetworkChaos, StressChaos, IOChaos, TimeChaos, DNSChaos, HTTPChaos, KernelChaos, …</td><td>Experiments from ChaosHub, composed into chaos scenarios with resilience probes</td></tr>
+      <tr><td>Architecture</td><td>Chaos Dashboard (UI), Chaos Controller Manager (CRD controllers), Chaos Daemon (privileged DaemonSet that enters target Pods’ namespaces)</td><td>ChaosCenter control plane, Kubernetes custom resources declaring chaos intent</td></tr>
+      <tr><td>Safety features</td><td>Namespace filtering via annotations, RBAC, admission webhooks</td><td>Declarative scope via CRs, probes to verify steady state; resilience score</td></tr>
+    </table></div>
+<pre data-title="experiments/failure/podchaos-kill-one.yaml (Chaos Mesh installed per its docs)"><code>apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: reliability-api-pod-kill
+  namespace: reliability-lab
+spec:
+  action: pod-kill              <span class="c"># also: pod-failure, container-kill</span>
+  mode: one                     <span class="c"># one | all | fixed | fixed-percent | random-max-percent</span>
+  selector:
+    namespaces:
+      - reliability-lab
+    labelSelectors:
+      'app.kubernetes.io/name': 'reliability-api'</code></pre>
+    <p>This is Experiment A as a resource: it kills one randomly selected matching Pod once. The <code>pod-failure</code> action instead swaps containers to a “pause” image for a <code>duration</code>; the Chaos Mesh docs warn that a container without liveness/readiness probes then still appears Running and Ready while doing nothing — one more reason your probes matter. Chaos Daemon runs privileged on every node: install chaos tooling only in clusters you own.</p>
+
+    <!-- ============================================================ -->
+    <h2>16. The experiment report template</h2>
+    <p>Every load or failure run ends in a short, honest report in <code>experiments/reports/</code>. Keep measured values, examples and guesses visibly separate (study guide §22).</p>
+<pre data-title="experiments/reports/TEMPLATE.md"><code># Experiment E&lt;n&gt; — &lt;title&gt;            Date: YYYY-MM-DD   Run: 1 of 3
+
+## Hypothesis (written before the run)
+"&lt;steady state&gt; continues when &lt;fault/load&gt;; errors &lt; X %, p95 &lt; Y ms, recovery ≤ Z s."
+Abort criteria: &lt;e.g. errors &gt; 20 % for 60 s → rollback&gt;
+
+## Environment
+- Cluster: kind reliability-lab (N nodes), host CPU/RAM: …
+- App: reliability-api image tag/digest …, replicas …, requests 100m/128Mi, limits mem 256Mi
+- HPA: on/off (min, max, target, behavior) · metrics-server flags: …
+- Load generator: k6 vX / Locust vX, where it ran, its requests/limits
+- Prometheus scrape interval: … · probe resolution: …
+
+## Workload
+- Model: closed (VUs) / open (arrival rate) · profile (stages) · warm-up excluded: yes/no
+- Request mix: GET /work?ms=50 (100 %)
+
+## Fault (failure tests)
+- Type: delete pod / broken image / readiness · injected at T_f = &lt;epoch&gt; · command: …
+
+## Results (measured)
+| Metric                    | Value | Source / resolution        |
+|---------------------------|-------|----------------------------|
+| Requests (total / failed) |       | k6 summary / probe log     |
+| Failed %                  |       | computed                   |
+| p50 / p95 / p99 (client)  |       | k6 (n = …)                 |
+| p95 (server)              |       | Prometheus histogram, 15 s |
+| Impact window             |       | probe log, 1 s             |
+| Recovery time             |       | probe log + dashboard      |
+| Replica recovery          |       | Pod Ready lastTransition   |
+| Peak replicas (HPA)       |       | kube-state-metrics         |
+
+## Verdict
+PASS / FAIL / INCONCLUSIVE against the pre-registered thresholds. Missing data ⇒ INCONCLUSIVE, never PASS.
+
+## Interpretation
+- What the evidence shows (facts) · What we think explains it (hypotheses, labelled) · What we did not measure
+
+## Threats to validity
+- …
+
+## Next experiment
+- …</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>Troubleshooting scaling and testing</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Possible cause</th><th>First diagnostic step</th></tr>
+      <tr><td>HPA TARGETS <code>&lt;unknown&gt;</code></td><td>metrics-server missing/unhealthy; no CPU request; Pods just started</td><td><code>kubectl get apiservices | grep metrics</code>, <code>kubectl top pods</code>, <code>kubectl describe hpa</code></td></tr>
+      <tr><td>HPA does not add replicas</td><td>Load too low; inside tolerance; at max; no metrics; scaling delay</td><td>HPA conditions + compute the ratio by hand</td></tr>
+      <tr><td>New replicas Pending</td><td>Requests do not fit on nodes; no node autoscaler (kind)</td><td><code>kubectl describe pod</code> → FailedScheduling</td></tr>
+      <tr><td>More replicas, latency unchanged</td><td>Load generator saturated; shared node CPU; closed model hiding queueing; bottleneck elsewhere</td><td>Generator CPU, served vs offered rate, node CPU (node-exporter)</td></tr>
+      <tr><td>Replica count flaps</td><td>Manifest <code>replicas</code> re-applied; too-short stabilization; bursty load</td><td><code>kubectl get deploy -w</code>, pipeline logs, HPA events</td></tr>
+      <tr><td>k6 reports high <code>dropped_iterations</code></td><td><code>maxVUs</code> too low for the latency × rate (Little’s Law)</td><td>Raise <code>maxVUs</code> to ≥ rate × expected latency; check generator CPU</td></tr>
+      <tr><td>Load test errors but server error ratio is 0</td><td>Requests never reached a Pod (no ready endpoint, connection refused, client timeout)</td><td>Compare k6 <code>http_req_failed</code> with Prometheus; check endpoints and readiness</td></tr>
+      <tr><td>Recovery time cannot be determined</td><td>Missing fault timestamp or coarse data</td><td>Mark INCONCLUSIVE; re-run with a per-request probe log</td></tr>
+    </table></div>
+
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Task</th><th>Command / formula</th></tr>
+      <tr><td>Install metrics-server</td><td><code>kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml</code></td></tr>
+      <tr><td>Resource usage</td><td><code>kubectl top pods -n reliability-lab</code></td></tr>
+      <tr><td>HPA formula</td><td><code>ceil(current × currentMetric / target)</code>, skip if within ±0.1</td></tr>
+      <tr><td>CPU utilization</td><td><code>usage ÷ request</code> (100m request → 60 % = 60m)</td></tr>
+      <tr><td>Create HPA (imperative)</td><td><code>kubectl autoscale deployment reliability-api --cpu=60% --min=2 --max=6</code></td></tr>
+      <tr><td>Watch / explain HPA</td><td><code>kubectl get hpa -w</code> · <code>kubectl describe hpa reliability-api</code></td></tr>
+      <tr><td>Default behavior</td><td>down: 300 s window, 100 %/15 s · up: no window, max(100 %, 4 Pods)/15 s</td></tr>
+      <tr><td>Little’s Law</td><td><code>L = λ × W</code></td></tr>
+      <tr><td>Samples beyond pXX</td><td><code>N × (1 − p)</code></td></tr>
+      <tr><td>Run k6</td><td><code>k6 run script.js</code> · <code>docker run --rm -i grafana/k6 run - &lt;script.js</code></td></tr>
+      <tr><td>k6 failed thresholds</td><td>non-zero exit (99)</td></tr>
+      <tr><td>Locust headless</td><td><code>locust -f locustfile.py --headless -u 20 -r 2 -t 10m -H http://…</code></td></tr>
+      <tr><td>Delete one Pod</td><td><code>kubectl delete pod &lt;name&gt; --wait=false</code> (print <code>date +%s</code> first)</td></tr>
+      <tr><td>Rollout status / undo</td><td><code>kubectl rollout status deploy/reliability-api --timeout=90s</code> · <code>kubectl rollout undo deploy/reliability-api</code></td></tr>
+      <tr><td>Recovery time</td><td><code>T(all SLIs back in target) − T(fault)</code></td></tr>
+    </table></div>
+
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>HPA</dt><dd>Controller that sets a workload’s replica count from metrics.</dd>
+      <dt>VPA</dt><dd>Add-on that recommends or applies container resource requests.</dd>
+      <dt>Node autoscaler</dt><dd>Provisions/consolidates nodes based on Pod requests (Cluster Autoscaler, Karpenter).</dd>
+      <dt>Metrics API</dt><dd><code>metrics.k8s.io</code>, usually served by metrics-server; latest CPU/memory only.</dd>
+      <dt>Utilization</dt><dd>Usage as a percentage of the resource request.</dd>
+      <dt>Tolerance</dt><dd>Band around 1.0 (default 0.1) inside which the HPA does not scale.</dd>
+      <dt>Stabilization window</dt><dd>Period whose highest (down) recommendation is used, to prevent flapping.</dd>
+      <dt>Scaling policy</dt><dd>Limit on replicas added/removed per period.</dd>
+      <dt>Closed model</dt><dd>Fixed number of users who wait for responses before sending again.</dd>
+      <dt>Open model</dt><dd>Requests arrive at a set rate independent of responses.</dd>
+      <dt>Coordinated omission</dt><dd>Measurement bias where a slowed client fails to send — and record — the requests that would have been slow.</dd>
+      <dt>Little’s Law</dt><dd>L = λW for a stable system.</dd>
+      <dt>Steady state</dt><dd>Measurable normal behaviour used as the experiment baseline.</dd>
+      <dt>Blast radius</dt><dd>The scope of what an experiment can affect.</dd>
+      <dt>Impact window</dt><dd>Time during which requests fail or violate latency targets.</dd>
+      <dt>Recovery time</dt><dd>Time from fault until all agreed SLIs are back within target.</dd>
+    </dl>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. 4 Pods, average CPU 45 % of request, target 60 %, min 2. What does the HPA do?</summary><div class="a">Ratio = 0.75, outside tolerance. Raw desired = ceil(4 × 0.75) = 3. Because this is a scale-down, the stabilization window applies: the HPA uses the highest recommendation of the last 300 s (default). If load was higher recently, it stays at 4 until those recommendations age out.</div></details>
+    <details class="q"><summary>2. Why can the same load produce 6 replicas with a 100m request and 4 replicas with 500m?</summary><div class="a">Utilization is usage ÷ request. At 1 core of total demand over 2 Pods: 500m ÷ 100m = 500 % → ceil(2 × 500/60) = 17 → clamped to 6; 500m ÷ 500m = 100 % → ceil(2 × 100/60) = 4.</div></details>
+    <details class="q"><summary>3. Prometheus is installed and scraping <code>http_requests_total</code>. Can the HPA scale on it now?</summary><div class="a">No. The HPA reads metrics only through the metrics APIs. Request-rate scaling needs prometheus-adapter (custom/external metrics API) or KEDA (which creates the HPA and serves external metrics).</div></details>
+    <details class="q"><summary>4. Why must you not run VPA in Recreate mode and a CPU HPA on the same Deployment?</summary><div class="a">Both react to CPU: VPA raises requests, which lowers HPA utilization, which removes Pods, which raises per-Pod usage, which VPA then raises again… The VPA project lists this as a known limitation. Use VPA in Off mode, or let them act on different signals.</div></details>
+    <details class="q"><summary>5. Explain coordinated omission in one sentence and name the k6 feature that avoids it.</summary><div class="a">A closed-loop client waits on a slow server and therefore never sends (or measures) the requests that would have experienced the slowness, making tail latency look better than users saw; arrival-rate executors (<code>constant-arrival-rate</code>, <code>ramping-arrival-rate</code>) keep sending on schedule.</div></details>
+    <details class="q"><summary>6. An open-model test at 40 req/s shows mean latency 250 ms. How many requests are in the system on average?</summary><div class="a">Little’s Law: L = 40 × 0.25 = 10. With 2 single-worker Pods, about 8 of those are queued — latency is mostly waiting, not work.</div></details>
+    <details class="q"><summary>7. A test ran 200 requests and reports p99 = 900 ms. What do you write in the report?</summary><div class="a">That p99 is determined by about 2 samples (200 × 0.01) and is not statistically meaningful; report p50/p90 with n = 200, or run longer to collect enough samples.</div></details>
+    <details class="q"><summary>8. In Lab 3 you saw 3 FAIL lines, all within 1 s after the fault. What is the most likely mechanism and a mitigation?</summary><div class="a">The race between Pod A receiving SIGTERM and every node’s kube-proxy removing A from the Service rules: some connections still went to a Pod that had stopped accepting them. Mitigate with a short preStop sleep so the endpoint is removed before shutdown begins, plus graceful shutdown in the app, and client retries for idempotent requests.</div></details>
+    <details class="q"><summary>9. Why did the broken-image rollout cause zero user-visible errors, and which setting would have made it harmful?</summary><div class="a">With 2 replicas, maxUnavailable 25 % rounds down to 0, so no old Pod is removed until a new Pod is available; the new Pod never becomes available, so old Pods keep serving. A large maxUnavailable (e.g. 100 %) would allow old Pods to be removed first, leaving no ready endpoints.</div></details>
+    <details class="q"><summary>10. You run HPA Lab 2 on kind and Pods stay Pending at 5 replicas. Will a node autoscaler help?</summary><div class="a">kind has no node autoscaler — nodes are Docker containers on your machine. Reduce requests (if measurements justify it), add kind worker nodes in the cluster config, or accept the ceiling and document it. On GKE (Module 11), node autoscaling would provision capacity for the Pending Pods.</div></details>
+    <details class="q"><summary>11. Why freeze the HPA during a Pod-deletion experiment?</summary><div class="a">To keep one independent variable. If the HPA scales up during the fault, recovery depends on HPA timing as well as on the ReplicaSet replacement, and you cannot attribute the result. Test HPA-assisted recovery as a separate experiment.</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/">Horizontal Pod Autoscaling (algorithm, tolerance, behavior defaults, metrics APIs, scale to zero) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale-walkthrough/">HorizontalPodAutoscaler walkthrough (kubectl autoscale, status conditions, Pods/Object/External metrics) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/debug/debug-cluster/resource-metrics-pipeline/">Resource metrics pipeline — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/autoscaling/vertical-pod-autoscale/">Vertical Pod Autoscaling — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/cluster-administration/node-autoscaling/">Node autoscaling — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Deployments (maxUnavailable/maxSurge defaults, progress deadline, rollout status exit code) — kubernetes.io</a></li>
+      <li><a href="https://github.com/kubernetes-sigs/metrics-server/blob/master/README.md">metrics-server README — github.com/kubernetes-sigs</a></li>
+      <li><a href="https://github.com/kubernetes/autoscaler/blob/master/vertical-pod-autoscaler/docs/known-limitations.md">VPA known limitations — github.com/kubernetes/autoscaler</a></li>
+      <li><a href="https://github.com/kubernetes-sigs/prometheus-adapter/blob/master/README.md">prometheus-adapter README — github.com/kubernetes-sigs</a></li>
+      <li><a href="https://keda.sh/docs/latest/concepts/">KEDA concepts</a> · <a href="https://keda.sh/docs/latest/scalers/prometheus/">KEDA Prometheus scaler — keda.sh</a></li>
+      <li><a href="https://grafana.com/docs/k6/latest/using-k6/scenarios/concepts/open-vs-closed/">k6: open and closed models</a> · <a href="https://grafana.com/docs/k6/latest/using-k6/scenarios/executors/">executors</a> · <a href="https://grafana.com/docs/k6/latest/using-k6/scenarios/executors/ramping-arrival-rate/">ramping-arrival-rate</a> — grafana.com/docs</li>
+      <li><a href="https://grafana.com/docs/k6/latest/using-k6/thresholds/">k6 thresholds</a> · <a href="https://grafana.com/docs/k6/latest/using-k6/checks/">checks</a> · <a href="https://grafana.com/docs/k6/latest/using-k6/k6-options/reference/">options reference</a> · <a href="https://grafana.com/docs/k6/latest/using-k6/metrics/reference/">built-in metrics</a> — grafana.com/docs</li>
+      <li><a href="https://grafana.com/docs/k6/latest/testing-guides/test-types/">k6 test types</a> · <a href="https://grafana.com/docs/k6/latest/testing-guides/running-large-tests/">running large tests</a> — grafana.com/docs</li>
+      <li><a href="https://grafana.com/docs/k6/latest/set-up/install-k6/">Install k6</a> · <a href="https://grafana.com/docs/k6/latest/get-started/running-k6/">Running k6</a> · <a href="https://grafana.com/docs/k6/latest/results-output/real-time/json/">JSON output</a> · <a href="https://grafana.com/docs/k6/latest/results-output/end-of-test/">end-of-test summary</a> · <a href="https://grafana.com/docs/k6/latest/results-output/real-time/prometheus-remote-write/">Prometheus remote write</a> — grafana.com/docs</li>
+      <li><a href="https://github.com/grafana/k6/blob/master/errext/exitcodes/codes.go">k6 exit codes (ThresholdsHaveFailed = 99) — github.com/grafana/k6</a></li>
+      <li><a href="https://docs.locust.io/en/stable/quickstart.html">Locust quickstart</a> · <a href="https://docs.locust.io/en/stable/writing-a-locustfile.html">writing a locustfile</a> · <a href="https://docs.locust.io/en/stable/configuration.html">configuration</a> — docs.locust.io</li>
+      <li><a href="https://chaos-mesh.org/docs/">Chaos Mesh overview</a> · <a href="https://chaos-mesh.org/docs/simulate-pod-chaos-on-kubernetes/">Simulate Pod faults (PodChaos)</a> — chaos-mesh.org</li>
+      <li><a href="https://docs.litmuschaos.io/docs/introduction/what-is-litmus">What is LitmusChaos — docs.litmuschaos.io</a></li>
+      <li><a href="https://principlesofchaos.org/">Principles of Chaos Engineering — principlesofchaos.org</a></li>
+      <li><a href="https://github.com/prometheus-community/helm-charts/blob/main/charts/kube-prometheus-stack/values.yaml">kube-prometheus-stack values.yaml (enableRemoteWriteReceiver) — github.com/prometheus-community</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="07-observability.html"><small>◀ Previous</small>Module 07 · Observability: Prometheus, Grafana, SLOs</a>
+      <a class="next" href="09-cicd-github-actions.html"><small>Next ▶</small>Module 09 · CI/CD with GitHub Actions</a>
+    </nav>
+  </article></main>
+</div>
+<script>
+(function () {
+  function $(id) { return document.getElementById(id); }
+  function num(id, d) { var v = parseFloat($(id).value); return isFinite(v) ? v : d; }
+  function on(ids, fn) { ids.forEach(function (id) { $(id).addEventListener("input", fn); $(id).addEventListener("change", fn); }); }
+  function mmss(t) { var m = Math.floor(t / 60), s = Math.round(t % 60); return m + ":" + (s < 10 ? "0" : "") + s; }
+
+  /* ---------- HPA formula calculator ---------- */
+  function calc() {
+    var n = Math.max(1, Math.round(num("hc-n", 2))), use = Math.max(0, num("hc-use", 0)), req = Math.max(1, num("hc-req", 100));
+    var tgt = Math.max(1, num("hc-tgt", 60)), tol = Math.max(0, num("hc-tol", 0.1));
+    var mn = Math.max(1, Math.round(num("hc-min", 1))), mx = Math.max(mn, Math.round(num("hc-max", 10)));
+    var util = use / req * 100, ratio = util / tgt, within = Math.abs(ratio - 1) <= tol;
+    var raw = within ? n : Math.ceil(n * ratio - 1e-9), fin = Math.min(mx, Math.max(mn, raw));
+    $("hc-kv").innerHTML =
+      '<div>Utilization<b>' + util.toFixed(0) + ' %</b></div>' +
+      '<div>Ratio<b>' + ratio.toFixed(3) + '</b></div>' +
+      '<div>Raw desired<b>' + raw + '</b></div>' +
+      '<div>After min/max<b class="' + (fin > n ? "warn" : fin < n ? "ok" : "") + '">' + fin + '</b></div>';
+    var t = "utilization = " + use + "m ÷ " + req + "m = " + util.toFixed(1) + " %\n" +
+      "ratio = " + util.toFixed(1) + " ÷ " + tgt + " = " + ratio.toFixed(3) + "\n";
+    if (within) t += "|ratio − 1| = " + Math.abs(ratio - 1).toFixed(3) + " ≤ tolerance " + tol + " → no scaling\n";
+    else t += "desired = ceil(" + n + " × " + ratio.toFixed(3) + ") = ceil(" + (n * ratio).toFixed(3) + ") = " + raw + "\n";
+    if (raw > mx) t += "clamped to maxReplicas " + mx + " → condition ScalingLimited=True\n";
+    if (raw < mn) t += "clamped to minReplicas " + mn + "\n";
+    if (fin < n) t += "scale-down: the stabilization window (default 300 s) may delay this\n";
+    if (fin > n) t += "scale-up: default policy allows at most max(+100 %, +4 Pods) per 15 s → " + Math.min(fin, Math.max(n * 2, n + 4)) + " next step\n";
+    t += "a Pod is 'at target' when it uses " + (req * tgt / 100).toFixed(0) + "m of CPU";
+    $("hc-text").textContent = t;
+  }
+  on(["hc-n", "hc-use", "hc-req", "hc-tgt", "hc-tol", "hc-min", "hc-max"], calc);
+  calc();
+
+  /* ---------- HPA simulator ---------- */
+  function simulate(p) {
+    var dt = 15, T = 1200, pods = [], series = [], recs = [], log = [];
+    for (var i = 0; i < p.min; i++) pods.push({ readyAt: -1 });
+    var lastUtil = null, lastReady = 0;
+    for (var t = 0; t <= T; t += dt) {
+      var inSpike = t >= p.start * 60 && t < (p.start + p.dur) * 60;
+      var load = inSpike ? p.spike : p.base;
+      var demand = load * p.cost / 1000;
+      var ready = pods.filter(function (x) { return x.readyAt <= t; }).length;
+      var notReady = pods.length - ready;
+      var cap = ready * p.ceil, served = Math.min(demand, cap);
+      var util = ready > 0 ? (served / ready) * 1000 / p.req * 100 : 0;
+      series.push({ t: t, load: load, spec: pods.length, ready: ready, util: util, over: demand > cap + 1e-9 });
+      if (lastUtil !== null && lastReady > 0) {
+        var cur = pods.length, ratio = lastUtil / p.tgt, considered = lastReady, raw = cur, why = "";
+        var orig = ratio;
+        if (orig > 1 && notReady > 0) {
+          ratio = (lastUtil * lastReady / (lastReady + notReady)) / p.tgt;
+          considered = lastReady + notReady;
+          if (ratio <= 1) why = "not-ready Pods counted as 0 % → no scale-up";
+        }
+        if (!why && Math.abs(ratio - 1) > p.tol) raw = Math.ceil(ratio * considered - 1e-9);
+        recs.push({ t: t, v: raw });
+        recs = recs.filter(function (r) { return r.t > t - p.stab - 1e-9; });
+        var down = raw; recs.forEach(function (r) { if (r.v > down) down = r.v; });
+        var desired = cur;
+        if (raw > cur) desired = raw; else if (down < cur) desired = down;
+        var limitUp = Math.max(cur * 2, cur + 4);
+        var note = [];
+        if (desired > limitUp) { desired = limitUp; note.push("capped by scale-up policy"); }
+        if (raw > p.max) note.push("raw above max → ScalingLimited");
+        if (desired > p.max) desired = p.max;
+        if (desired < p.min) { desired = p.min; note.push("held at min " + p.min); }
+        if (raw < cur && desired === cur && cur > p.min) note.push("held by " + p.stab + " s stabilization window");
+        if (desired !== cur) {
+          log.push(mmss(t) + "  util " + lastUtil.toFixed(0) + "% (" + lastReady + " ready" + (notReady ? ", " + notReady + " not ready" : "") + ")  raw " + raw + " → " + cur + "→" + desired + (note.length ? "  [" + note.join("; ") + "]" : ""));
+          if (desired > cur) for (var k = cur; k < desired; k++) pods.push({ readyAt: t + p.ready });
+          else {
+            pods.sort(function (a, b) { return b.readyAt - a.readyAt; });   /* not-ready / newest first */
+            pods.splice(0, cur - desired);
+          }
+        } else if (why && log.length < 60) {
+          log.push(mmss(t) + "  " + why);
+        }
+      }
+      series[series.length - 1].spec = pods.length;   /* replicas after this sync's decision */
+      lastUtil = util; lastReady = ready;
+    }
+    return { series: series, log: log };
+  }
+  function render(p, r) {
+    var s = r.series, T = 1200, X = function (t) { return 50 + t / T * 640; };
+    var maxR = Math.max(p.max, Math.max.apply(null, s.map(function (d) { return d.spec; }))) + 1;
+    var maxL = Math.max(1, p.base, p.spike) * 1.1;
+    var maxU = Math.max(p.tgt * 1.3, Math.max.apply(null, s.map(function (d) { return d.util; }))) * 1.1;
+    var YR = function (v) { return 170 - v / maxR * 140; }, YL = function (v) { return 170 - v / maxL * 140; };
+    var YU = function (v) { return 305 - v / maxU * 95; };
+    var g = "";
+    s.forEach(function (d) { if (d.over) g += '<rect class="dot-warn" opacity="0.28" x="' + X(d.t).toFixed(1) + '" y="30" width="' + (640 * 15 / T).toFixed(1) + '" height="140"/>'; });
+    g += '<line class="line" x1="50" y1="170" x2="690" y2="170"/><line class="line" x1="50" y1="30" x2="50" y2="170"/><line class="line" x1="690" y1="30" x2="690" y2="170"/>';
+    g += '<line class="line" x1="50" y1="305" x2="690" y2="305"/><line class="line" x1="50" y1="205" x2="50" y2="305"/>';
+    for (var m = 0; m <= 20; m += 5) g += '<text class="t-muted" x="' + X(m * 60) + '" y="322" text-anchor="middle">' + m + ' min</text>';
+    for (var rr = 0; rr <= maxR; rr += Math.max(1, Math.ceil(maxR / 6))) g += '<text class="t-muted" x="44" y="' + (YR(rr) + 4).toFixed(1) + '" text-anchor="end">' + rr + '</text>';
+    g += '<text class="t-muted" x="696" y="' + (YL(maxL / 1.1) + 4).toFixed(1) + '">' + (maxL / 1.1).toFixed(0) + '/s</text><text class="t-muted" x="696" y="174">0</text>';
+    g += '<text class="t-bold" x="56" y="22">replicas</text><text class="t-bold" x="56" y="198">avg CPU utilization (% of request)</text>';
+    g += '<line class="line bad dash" x1="50" y1="' + YU(p.tgt).toFixed(1) + '" x2="690" y2="' + YU(p.tgt).toFixed(1) + '"/>';
+    g += '<text class="t-muted" x="44" y="' + (YU(p.tgt) + 4).toFixed(1) + '" text-anchor="end">' + p.tgt + '%</text>';
+    g += '<text class="t-muted" x="44" y="' + (YU(maxU / 1.1) + 4).toFixed(1) + '" text-anchor="end">' + (maxU / 1.1).toFixed(0) + '%</text>';
+    function step(key, Y) {
+      var pts = [];
+      s.forEach(function (d, i) { var y = Y(d[key]).toFixed(1); pts.push(X(d.t).toFixed(1) + "," + y); var nt = i + 1 < s.length ? s[i + 1].t : T; pts.push(X(nt).toFixed(1) + "," + y); });
+      return pts.join(" ");
+    }
+    g += '<polyline class="line dash" points="' + step("load", YL) + '"/>';
+    g += '<polyline class="line ok" style="stroke-width:3" points="' + step("ready", YR) + '"/>';
+    g += '<polyline class="line accent" points="' + step("spec", YR) + '"/>';
+    g += '<polyline class="line bad" points="' + s.map(function (d) { return X(d.t).toFixed(1) + "," + YU(d.util).toFixed(1); }).join(" ") + '"/>';
+    $("hs-chart").innerHTML = g;
+  }
+  function sim() {
+    var p = {
+      base: Math.max(0, num("hs-base", 2)), spike: Math.max(0, num("hs-spike", 20)), start: Math.max(0, num("hs-start", 3)),
+      dur: Math.max(0, num("hs-dur", 6)), cost: Math.max(1, num("hs-cost", 50)), req: Math.max(10, num("hs-req", 100)),
+      tgt: Math.max(1, num("hs-tgt", 60)), min: Math.max(1, Math.round(num("hs-min", 2))), max: 6,
+      ready: Math.max(0, num("hs-ready", 10)), stab: Math.max(0, num("hs-stab", 300)), ceil: Math.max(0.05, num("hs-ceil", 1)),
+      tol: Math.max(0, num("hs-tol", 0.1))
+    };
+    p.max = Math.max(p.min, Math.round(num("hs-max", 6)));
+    var r = simulate(p), s = r.series;
+    render(p, r);
+    var peak = 0, overS = 0, firstUp = null, back = null, spikeStart = p.start * 60, spikeEnd = (p.start + p.dur) * 60;
+    var startReplicas = null;
+    s.forEach(function (d) {
+      if (d.spec > peak) peak = d.spec;
+      if (d.over) overS += 15;
+      if (d.t === Math.ceil(spikeStart / 15) * 15) startReplicas = d.spec;
+      if (firstUp === null && d.t > spikeStart && startReplicas !== null && d.spec > startReplicas) firstUp = d.t - spikeStart;
+      if (back === null && d.t >= spikeEnd && d.spec === p.min && d.t > spikeStart) back = d.t - spikeEnd;
+    });
+    $("hs-kv").innerHTML =
+      '<div>Peak replicas<b>' + peak + '</b></div>' +
+      '<div>First scale-up after spike<b>' + (firstUp === null ? "none" : firstUp + " s") + '</b></div>' +
+      '<div>Time over capacity<b class="' + (overS > 0 ? "bad" : "ok") + '">' + overS + ' s</b></div>' +
+      '<div>Back to min after spike<b>' + (back === null ? "not within 20 min" : back + " s") + '</b></div>' +
+      '<div>Pod “at target” uses<b>' + (p.req * p.tgt / 100).toFixed(0) + 'm</b></div>';
+    $("hs-log").textContent = (r.log.length ? r.log.slice(0, 40).join("\n") : "no scaling events") +
+      "\n\nModel: HPA sync every 15 s using the previous sync's utilization; ready capacity = ready Pods × ceiling; simplified, not a replacement for Lab 2.";
+  }
+  on(["hs-base", "hs-spike", "hs-start", "hs-dur", "hs-cost", "hs-req", "hs-tgt", "hs-min", "hs-max", "hs-ready", "hs-stab", "hs-ceil", "hs-tol"], sim);
+  sim();
+
+  /* ---------- workload model explorer ---------- */
+  function lm() {
+    var S = Math.max(1, num("lm-s", 50)), R = Math.max(1, num("lm-r", 2)), N = Math.max(1, num("lm-n", 20));
+    var Z = Math.max(0, num("lm-z", 0)), L = Math.max(0, num("lm-l", 30)), T = Math.max(1, num("lm-t", 60));
+    var mu = R * 1000 / S;
+    var xUn = N / ((S + Z) / 1000), X = Math.min(xUn, mu), W = Math.max(S, N / X * 1000 - Z);
+    var rho = L / mu, html = "", txt = "";
+    html += '<div>Capacity μ<b>' + mu.toFixed(1) + ' req/s</b></div>';
+    html += '<div>Closed: throughput<b>' + X.toFixed(1) + ' req/s</b></div>';
+    html += '<div>Closed: latency W<b class="' + (W > 2 * S ? "warn" : "ok") + '">' + W.toFixed(0) + ' ms</b></div>';
+    if (rho < 1) {
+      var Wo = S / (1 - rho);
+      html += '<div>Open: utilization ρ<b>' + (rho * 100).toFixed(0) + ' %</b></div>';
+      html += '<div>Open: latency ≈<b class="' + (Wo > 2 * S ? "warn" : "ok") + '">' + Wo.toFixed(0) + ' ms</b></div>';
+      txt = "Open model is stable (λ < μ). Latency ≈ S ÷ (1 − ρ) is a single-queue approximation: it explodes as ρ → 100 %.\n" +
+        "Little: in-system requests L = λ × W ≈ " + (L * Wo / 1000).toFixed(1) + "\n";
+    } else {
+      var backlog = (L - mu) * T;
+      html += '<div>Open: utilization ρ<b class="bad">' + (rho * 100).toFixed(0) + ' %</b></div>';
+      html += '<div>Open: backlog after ' + T + ' s<b class="bad">' + backlog.toFixed(0) + ' req</b></div>';
+      txt = "Open model is UNSTABLE (λ ≥ μ): the queue grows by " + (L - mu).toFixed(1) + " req/s. After " + T + " s the newest request waits ≈ " +
+        (backlog / mu).toFixed(1) + " s (until clients time out and errors begin).\n";
+    }
+    txt += "Closed model: " + N + " VUs can offer up to " + xUn.toFixed(1) + " req/s; the service caps it at " + mu.toFixed(1) + ".\n" +
+      "Little: L = X × W → " + X.toFixed(1) + " × " + (W / 1000).toFixed(3) + " s = " + (X * W / 1000).toFixed(1) + " requests in service (≤ N = " + N + ").\n" +
+      (xUn > mu ? "The closed test hides the overload: throughput simply flattens and VUs wait — no queue explosion, no extra load. That is coordinated omission at work." : "The closed test is not saturating the service.");
+    $("lm-kv").innerHTML = html;
+    $("lm-text").textContent = txt;
+  }
+  on(["lm-s", "lm-r", "lm-n", "lm-z", "lm-l", "lm-t"], lm);
+  lm();
+
+  /* ---------- recovery-metric calculator ---------- */
+  function rc() {
+    var f = num("rc-f", 0), b1 = num("rc-b1", f), b2 = num("rc-b2", b1), lat = num("rc-lat", b2), ready = num("rc-ready", f);
+    var end = Math.max(1, num("rc-end", 180)), tot = Math.max(1, num("rc-tot", 1)), fail = Math.max(0, num("rc-fail", 0));
+    var slo = Math.max(0, num("rc-slo", 1)), rmax = Math.max(0, num("rc-rmax", 60));
+    var recAt = Math.max(b2, lat), impact = Math.max(0, recAt - Math.min(b1, recAt)), recovery = recAt - f, rep = ready - f;
+    var pct = fail / tot * 100, pass = pct <= slo && recovery <= rmax;
+    var warn = [];
+    if (b1 < f) warn.push("first bad request precedes the fault → baseline was not steady; result INCONCLUSIVE");
+    if (b2 < b1) warn.push("last bad request is earlier than the first — check your inputs");
+    if (recAt > end) warn.push("service did not recover before the experiment ended → FAIL / extend the run");
+    $("rc-kv").innerHTML =
+      '<div>Impact window<b>' + impact.toFixed(1) + ' s</b></div>' +
+      '<div>Recovery time<b class="' + (recovery <= rmax ? "ok" : "bad") + '">' + recovery.toFixed(1) + ' s</b></div>' +
+      '<div>Replica recovery<b>' + rep.toFixed(1) + ' s</b></div>' +
+      '<div>Failed requests<b class="' + (pct <= slo ? "ok" : "bad") + '">' + pct.toFixed(2) + ' %</b></div>' +
+      '<div>Verdict<b class="' + (warn.length ? "warn" : pass ? "ok" : "bad") + '">' + (warn.length ? "CHECK" : pass ? "PASS" : "FAIL") + '</b></div>';
+    $("rc-text").textContent =
+      "recovery time = max(last bad request " + b2 + " s, latency OK " + lat + " s) − fault " + f + " s = " + recovery.toFixed(1) + " s\n" +
+      "replica recovery = Ready " + ready + " s − fault " + f + " s = " + rep.toFixed(1) + " s" +
+      (rep < recovery ? "  (users were affected after capacity returned — look for queue drain / slow warm-up)" : "") + "\n" +
+      "failed = " + fail + " / " + tot + " = " + pct.toFixed(2) + " % (limit " + slo + " %), recovery limit " + rmax + " s" +
+      (warn.length ? "\n⚠ " + warn.join("\n⚠ ") : "");
+    var X = function (t) { return 20 + Math.min(Math.max(t, 0), end) / end * 680; }, g = "";
+    g += '<line class="line" x1="20" y1="70" x2="700" y2="70"/>';
+    g += '<rect class="dot-bad" opacity="0.22" x="' + X(Math.min(b1, recAt)).toFixed(1) + '" y="40" width="' + Math.max(1, X(recAt) - X(Math.min(b1, recAt))).toFixed(1) + '" height="30"/>';
+    g += '<line class="line" x1="' + X(f).toFixed(1) + '" y1="28" x2="' + X(f).toFixed(1) + '" y2="80"/><text class="t-bold" x="' + X(f).toFixed(1) + '" y="22" text-anchor="middle">fault</text>';
+    g += '<line class="line ok" x1="' + X(ready).toFixed(1) + '" y1="70" x2="' + X(ready).toFixed(1) + '" y2="100"/><text class="t-muted" x="' + X(ready).toFixed(1) + '" y="114" text-anchor="middle">Pod Ready</text>';
+    g += '<line class="line accent" x1="' + X(recAt).toFixed(1) + '" y1="28" x2="' + X(recAt).toFixed(1) + '" y2="80"/><text class="t-bold" x="' + X(recAt).toFixed(1) + '" y="96" text-anchor="middle">recovered</text>';
+    g += '<text class="t-muted" x="20" y="88">0 s</text><text class="t-muted" x="700" y="88" text-anchor="end">' + end + ' s</text>';
+    $("rc-chart").innerHTML = g;
+  }
+  on(["rc-f", "rc-b1", "rc-b2", "rc-lat", "rc-ready", "rc-end", "rc-tot", "rc-fail", "rc-slo", "rc-rmax"], rc);
+  rc();
+})();
+</script>
+</body>
+</html>

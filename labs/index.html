@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hands-on Labs — DevOps Lab</title>
+<link rel="stylesheet" href="../notes-animated/assets/style.css">
+<script src="../notes-animated/assets/notes.js"></script>
+<style>
+  .lab-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; }
+  .lab-card h4 { margin: 0 0 6px; }
+  .lab-card p { margin: 4px 0 10px; font-size: 14.5px; color: var(--muted); }
+  a.lab-card { text-decoration: none; color: inherit; display: block; transition: border-color .15s, transform .15s; }
+  a.lab-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+  a.lab-card.ready { border-color: var(--accent); }
+  a.lab-card.ready h4 { color: var(--accent); }
+  .lab-card.soon { opacity: .65; cursor: default; }
+  .lab-card .status { font-size: 12px; font-weight: 700; letter-spacing: .04em; }
+  .lab-card.soon .status { color: var(--muted); }
+  .lab-card.ready .status { color: var(--ok); }
+  .num-badge { font-family: var(--mono); font-size: 11px; color: var(--accent); display: block; margin-bottom: 2px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../index.html">DevOps Lab</a>
+  <span class="crumb">Labs</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+    <h1>Hands-on Labs</h1>
+    <p class="lede">Each lab is the practical companion to the corresponding course module. Commands are runnable in GitHub Codespaces — Docker is pre-installed. Copy any code block with one click.</p>
+    <div class="meta">
+      <span class="pill accent">1 lab available</span>
+      <span class="pill">12 coming soon</span>
+      <span class="pill">GitHub Codespaces ready</span>
+    </div>
+
+    <div class="callout note">
+      <span class="label">GitHub Codespaces Setup</span>
+      <p><strong>Docker is pre-installed</strong> in every Codespace — no setup needed. Open the repo, click <em>Code → Open with Codespaces</em>, and every lab command works in the integrated terminal.</p>
+      <p>A few things to know: <strong>files persist</strong> between Codespace sessions (the filesystem is not reset unless you rebuild the container); <strong>Docker images reset</strong> on a full rebuild (keep your Dockerfiles in the repo so you can re-pull or rebuild instantly); and <strong>forwarded ports</strong> are available in the browser so you can reach your containers without extra tooling.</p>
+    </div>
+
+    <h2>All Labs</h2>
+    <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));">
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 01</span>
+        <h4>Linux &amp; Networking</h4>
+        <p>Processes, ports, DNS, namespaces, cgroups.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <a class="lab-card ready" href="02-docker.html">
+        <span class="num-badge">LAB 02</span>
+        <h4>Docker</h4>
+        <p>Complete command reference — images, containers, volumes, networks, Dockerfile, Compose, health checks, failure cases, and cleanup.</p>
+        <span class="status">✅ Available</span>
+      </a>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 03</span>
+        <h4>Kubernetes Architecture</h4>
+        <p>Control plane, Pods, Deployments, kubectl essentials.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 04</span>
+        <h4>Workloads: Probes &amp; Resources</h4>
+        <p>Liveness/readiness/startup probes, resource limits, OOMKill, rolling updates.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 05</span>
+        <h4>Networking, Config &amp; RBAC</h4>
+        <p>Services, DNS, Ingress, ConfigMaps, Secrets, NetworkPolicy, RBAC.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 06</span>
+        <h4>kind &amp; Helm</h4>
+        <p>Local kind clusters, loading local images, Helm charts, install/upgrade/rollback.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 07</span>
+        <h4>Observability</h4>
+        <p>Prometheus scraping, PromQL, Grafana dashboards, SLI/SLO/error budgets.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 08</span>
+        <h4>Scaling, Load &amp; Failure</h4>
+        <p>HPA, k6 load testing, failure experiments, measuring recovery.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 09</span>
+        <h4>CI/CD — GitHub Actions</h4>
+        <p>Workflow syntax, build &amp; push to GHCR, image scanning, kind in CI.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 10</span>
+        <h4>Terraform</h4>
+        <p>HCL, providers, plan/apply/destroy, state, modules.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 11</span>
+        <h4>GKE &amp; Google Cloud</h4>
+        <p>GKE Autopilot, Artifact Registry, Workload Identity, cost controls.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 12</span>
+        <h4>AI Inference on Kubernetes</h4>
+        <p>GPU scheduling, KServe, vLLM, benchmarking.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+      <div class="lab-card soon">
+        <span class="num-badge">LAB 13</span>
+        <h4>Troubleshooting &amp; Capstone</h4>
+        <p>Layered debugging, break-it labs, capstone milestones.</p>
+        <span class="status">⏳ Coming soon</span>
+      </div>
+
+    </div>
+
+    <h2>Lab structure</h2>
+    <p>Each lab page follows the same pattern:</p>
+    <div class="grid">
+      <div class="card">
+        <h4>🔧 Environment setup</h4>
+        <p>Verify the tools you need are available and at the right version.</p>
+      </div>
+      <div class="card">
+        <h4>📋 Command reference</h4>
+        <p>Every important command with all flags — annotated with comments, showing real output.</p>
+      </div>
+      <div class="card">
+        <h4>🧪 Experiments</h4>
+        <p>Guided experiments to build intuition — including deliberate failure scenarios.</p>
+      </div>
+      <div class="card">
+        <h4>⚠️ Failure cases</h4>
+        <p>Common mistakes, the error messages they produce, and how to fix them.</p>
+      </div>
+    </div>
+
+  </article></main>
+</div>
+</body>
+</html>

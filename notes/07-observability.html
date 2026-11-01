@@ -1,0 +1,1543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 07 · Observability: Prometheus, Grafana, SLOs — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/notes.js"></script>
+<style>
+  /* page-local helpers for widgets (theme tokens only) */
+  .bars { margin-top: 10px; }
+  .bars .bar-row { display: grid; grid-template-columns: 88px 1fr 64px; gap: 8px; align-items: center; font-family: var(--mono); font-size: 12.5px; margin: 3px 0; }
+  .bars .bar-track { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; height: 16px; position: relative; overflow: hidden; }
+  .bars .bar-fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent-soft); border-right: 2px solid var(--accent); }
+  .bars .bar-fill.inc { background: var(--ok-soft); border-right-color: var(--ok); }
+  .bars .bar-fill.hot { background: var(--warn-soft); border-right-color: var(--warn); }
+  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin-top: 12px; }
+  .kv div { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13.5px; }
+  .kv b { display: block; font-family: var(--mono); font-size: 16px; }
+  .kv .bad { color: var(--bad); } .kv .ok { color: var(--ok); } .kv .warn { color: var(--warn); }
+  .widget .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 4px 16px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 07 · Observability: Prometheus, Grafana, SLOs</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="07"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 07 · Observability: Prometheus, Grafana, SLOs</h1>
+    <p class="lede">So far you can build, deploy and roll out <code>reliability-api</code>. This module teaches you to <em>see</em> it: what to measure (RED, USE, the four golden signals), how Prometheus collects and stores those measurements, how to ask questions in PromQL, how the kube-prometheus-stack discovers your Pods through a ServiceMonitor, how to build a Grafana dashboard that answers operational questions, how to alert without drowning in noise, and how SLOs and error budgets turn graphs into decisions. Module 08 depends on everything here: you cannot judge autoscaling or recovery without trustworthy measurements.</p>
+    <div class="meta"><span class="pill accent">Prereq: Module 06 (kind &amp; Helm)</span><span class="pill">≈ 6 h study + 5 h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Explain the difference between monitoring and observability, and when to reach for metrics, logs, traces or profiles.</li>
+      <li>Apply RED, USE and the four golden signals to decide <em>which</em> metrics <code>reliability-api</code> needs.</li>
+      <li>Draw the Prometheus architecture from memory: service discovery, scraping, TSDB, rules, Alertmanager, Pushgateway, exporters.</li>
+      <li>Describe the data model (metric name + labels = series; series = samples) and estimate the cardinality cost of a label before adding it.</li>
+      <li>Choose between counter, gauge, histogram and summary; read <code>_bucket{le}</code>, <code>_sum</code>, <code>_count</code>; explain how <code>histogram_quantile()</code> interpolates.</li>
+      <li>Write PromQL for request rate, error ratio, latency percentiles, per-Pod CPU/memory and replica state.</li>
+      <li>Install kube-prometheus-stack and get <code>reliability-api</code> scraped through a <code>ServiceMonitor</code>; debug a target that does not appear.</li>
+      <li>Build the eight dashboard panels from the study guide, write alert rules, and configure Alertmanager routing, grouping and inhibition.</li>
+      <li>Define SLIs and SLOs for a test window, calculate an error budget and explain burn-rate alerting.</li>
+      <li>Emit structured logs and understand where traces (OpenTelemetry spans) fit.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>1. Monitoring vs observability</h2>
+    <p><strong>Monitoring</strong> asks a predefined question continuously: <em>“Is the system behaving within the conditions we care about?”</em> You decide in advance what “bad” means (error ratio above 1 %, p95 latency above 250 ms, no ready replicas) and get told when it happens. <strong>Observability</strong> is the broader property of a system that lets you infer its internal state from the outputs it emits, including for questions you did not anticipate when you wrote the code. Monitoring is something you <em>do</em>; observability is something a system <em>has</em>, to a greater or lesser degree.</p>
+    <p><strong>The problem it solves.</strong> When you ran <code>reliability-api</code> on your laptop you could add a <code>print()</code> and re-run. In a cluster there are N replicas, they get rescheduled, they are replaced during rollouts, and the failure you need to understand happened 40 minutes ago on a Pod that no longer exists. You need data that was <em>already being recorded</em> before the problem started, kept outside the Pod, and queryable across all replicas.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="One reliability-api Pod emits four kinds of telemetry: metrics, logs, traces and profiles, each answering a different question">
+        <defs><marker id="m07a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="260" y="16" width="340" height="54" rx="8"/>
+        <text x="430" y="40" text-anchor="middle" class="t-bold">reliability-api Pod</text>
+        <text x="430" y="58" text-anchor="middle" class="t-muted">FastAPI + Uvicorn on :8000</text>
+        <line class="line" x1="330" y1="70" x2="115" y2="128" marker-end="url(#m07a)"/>
+        <line class="line" x1="400" y1="70" x2="325" y2="128" marker-end="url(#m07a)"/>
+        <line class="line" x1="460" y1="70" x2="535" y2="128" marker-end="url(#m07a)"/>
+        <line class="line" x1="530" y1="70" x2="745" y2="128" marker-end="url(#m07a)"/>
+        <rect class="box" x="20" y="130" width="190" height="150" rx="8"/>
+        <text x="115" y="154" text-anchor="middle" class="t-bold">Metrics</text>
+        <text x="32" y="178" class="t-muted">numbers sampled over time</text>
+        <text x="32" y="198" class="t-muted">cheap, aggregatable</text>
+        <text x="32" y="218" class="t-muted">http_requests_total</text>
+        <text x="32" y="250" class="t-bold" style="font-size:12px">“How much? How slow?”</text>
+        <rect class="box" x="230" y="130" width="190" height="150" rx="8"/>
+        <text x="325" y="154" text-anchor="middle" class="t-bold">Logs</text>
+        <text x="242" y="178" class="t-muted">discrete events (text/JSON)</text>
+        <text x="242" y="198" class="t-muted">rich context, costly volume</text>
+        <text x="242" y="218" class="t-muted">“ERROR db timeout …”</text>
+        <text x="242" y="250" class="t-bold" style="font-size:12px">“What exactly happened?”</text>
+        <rect class="box" x="440" y="130" width="190" height="150" rx="8"/>
+        <text x="535" y="154" text-anchor="middle" class="t-bold">Traces</text>
+        <text x="452" y="178" class="t-muted">one request’s path</text>
+        <text x="452" y="198" class="t-muted">tree of timed spans</text>
+        <text x="452" y="218" class="t-muted">GET /work → 52 ms</text>
+        <text x="452" y="250" class="t-bold" style="font-size:12px">“Where did time go?”</text>
+        <rect class="box" x="650" y="130" width="190" height="150" rx="8"/>
+        <text x="745" y="154" text-anchor="middle" class="t-bold">Profiles</text>
+        <text x="662" y="178" class="t-muted">CPU / memory samples</text>
+        <text x="662" y="198" class="t-muted">per function / line</text>
+        <text x="662" y="218" class="t-muted">busy loop ≈ all CPU</text>
+        <text x="662" y="250" class="t-bold" style="font-size:12px">“Which code burns it?”</text>
+      </svg>
+      <figcaption>Figure 1 — The same Pod emits four signal types. Each answers a different question; none replaces the others.</figcaption>
+    </figure>
+
+    <h3>Metrics, logs, traces, profiles compared</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Signal</th><th>Unit of data</th><th>Strength</th><th>Weakness</th><th>reliability-api example</th><th>Typical tool</th></tr>
+      <tr><td>Metrics</td><td>Numeric sample (float + timestamp) per series</td><td>Cheap to store and query over months; easy aggregation across replicas; ideal for dashboards and alerts</td><td>Pre-aggregated: you lose individual requests; high-cardinality labels explode cost</td><td><code>rate(http_requests_total[5m])</code> = requests/s</td><td>Prometheus</td></tr>
+      <tr><td>Logs</td><td>Timestamped event record</td><td>Arbitrary detail (IDs, error messages, stack traces)</td><td>Volume and cost grow with traffic; hard to aggregate unless structured</td><td>JSON line with <code>path</code>, <code>status</code>, <code>duration_ms</code></td><td><code>kubectl logs</code>, Loki, Elasticsearch</td></tr>
+      <tr><td>Traces</td><td>Span (named, timed operation) linked by trace ID</td><td>Shows causality and latency breakdown across services</td><td>Needs instrumentation and context propagation; usually sampled</td><td>Span for <code>GET /work</code> with child span for the busy loop</td><td>OpenTelemetry → Tempo/Jaeger</td></tr>
+      <tr><td>Profiles</td><td>Stack samples of CPU/memory usage</td><td>Pinpoints the code responsible for resource use</td><td>Advanced; overhead and tooling vary; optional for this project</td><td>Shows the <code>while</code> loop in <code>work()</code> dominating CPU</td><td>pprof-style profilers, Pyroscope</td></tr>
+    </table></div>
+    <p>OpenTelemetry currently lists traces, metrics, logs and baggage as supported signals, with profiles still in development. For this course, metrics carry most of the weight; logs and traces get an introduction in section 14.</p>
+
+    <h3>Symptoms vs causes</h3>
+    <p>The Google SRE book separates <em>what</em> is broken (symptom: “serving HTTP 500s”, “p95 latency 2 s”) from <em>why</em> (cause: “database refusing connections”, “CPU throttled”). Good monitoring pages a human on <strong>symptoms users feel</strong> and gives them dashboards to find <strong>causes</strong>. For <code>reliability-api</code>, “error ratio above budget” is a symptom worth paging on; “one Pod restarted” is a cause worth a dashboard panel, not a page, because the Service routed around it.</p>
+
+    <div class="callout warn"><span class="label">Evidence discipline</span>A graph shows correlation, not cause. When CPU and latency rise together during a load test, you have measured both; you have not proven one caused the other. Write “latency rose while CPU reached 100 % of request” rather than “CPU caused latency” unless you ran an experiment that isolates the variable (Module 08).</div>
+
+    <details class="q"><summary>Self-check: your Pod was OOMKilled 30 minutes ago and has been replaced. Which signals can still tell you what happened?</summary><div class="a">Metrics in Prometheus (memory working set climbing, restart counter incremented via kube-state-metrics) survive because Prometheus scraped and stored them before the Pod died. <code>kubectl logs --previous</code> can show the last container’s logs only while the Pod object still exists and the kubelet still has them; if the Pod was deleted or evicted, node-level logs are gone unless you ship logs to a cluster-level backend. Kubernetes Events (<code>kubectl describe pod</code>) also expire. That is why telemetry must be collected <em>outside</em> the Pod.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>2. What to measure: RED, USE and the four golden signals</h2>
+    <p>Instrumenting “everything” produces noise and cost. Three well-known checklists tell you what matters:</p>
+    <div class="grid">
+      <div class="card"><h4>RED (for request-driven services)</h4><p>Proposed by Tom Wilkie for microservices. For every service: <strong>R</strong>ate (requests per second), <strong>E</strong>rrors (how many of those fail), <strong>D</strong>uration (how long they take, as a distribution).</p></div>
+      <div class="card"><h4>USE (for resources)</h4><p>Brendan Gregg’s method: for every resource (CPU, memory, disk, network) check <strong>U</strong>tilization (time busy), <strong>S</strong>aturation (queued work it cannot service yet), <strong>E</strong>rrors (error events).</p></div>
+      <div class="card"><h4>Four golden signals (SRE book)</h4><p><strong>Latency</strong> (distinguish successful vs failed requests), <strong>Traffic</strong> (demand), <strong>Errors</strong> (explicit, implicit or by policy), <strong>Saturation</strong> (how “full” the service is, emphasising the most constrained resource).</p></div>
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 280" role="img" aria-label="RED applies to the request path from load generator through Service to Pod; USE applies to resources such as Pod CPU and node memory; golden signals span both">
+        <defs><marker id="m07b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box" x="20" y="60" width="150" height="56" rx="8"/>
+        <text x="95" y="84" text-anchor="middle" class="t-bold">Load generator</text>
+        <text x="95" y="102" text-anchor="middle" class="t-muted">k6 / curl loop</text>
+        <rect class="box" x="230" y="60" width="160" height="56" rx="8"/>
+        <text x="310" y="84" text-anchor="middle" class="t-bold">Service</text>
+        <text x="310" y="102" text-anchor="middle" class="t-muted">reliability-api :80</text>
+        <rect class="box2" x="450" y="30" width="170" height="50" rx="8"/>
+        <text x="535" y="60" text-anchor="middle">Pod A :8000</text>
+        <rect class="box2" x="450" y="96" width="170" height="50" rx="8"/>
+        <text x="535" y="126" text-anchor="middle">Pod B :8000</text>
+        <line class="line" x1="170" y1="88" x2="228" y2="88" marker-end="url(#m07b)"/>
+        <line class="line" x1="390" y1="80" x2="448" y2="58" marker-end="url(#m07b)"/>
+        <line class="line" x1="390" y1="96" x2="448" y2="120" marker-end="url(#m07b)"/>
+        <rect class="box3" x="680" y="30" width="160" height="116" rx="8"/>
+        <text x="760" y="54" text-anchor="middle" class="t-bold">Node resources</text>
+        <text x="760" y="78" text-anchor="middle" class="t-muted">CPU (cores)</text>
+        <text x="760" y="98" text-anchor="middle" class="t-muted">memory (bytes)</text>
+        <text x="760" y="118" text-anchor="middle" class="t-muted">network, disk</text>
+        <line class="line dash" x1="620" y1="88" x2="678" y2="88"/>
+        <rect class="zone" x="210" y="20" width="430" height="140" rx="10"/>
+        <text x="425" y="182" text-anchor="middle" class="t-bold">RED on the request path</text>
+        <text x="425" y="200" text-anchor="middle" class="t-muted">rate · errors · duration (from /metrics)</text>
+        <rect class="zone" x="664" y="20" width="190" height="140" rx="10"/>
+        <text x="760" y="182" text-anchor="middle" class="t-bold">USE on resources</text>
+        <text x="760" y="200" text-anchor="middle" class="t-muted">utilization · saturation · errors</text>
+        <line class="line accent" x1="210" y1="228" x2="854" y2="228"/>
+        <text x="532" y="252" text-anchor="middle" class="t-bold">Golden signals span both: latency · traffic · errors · saturation</text>
+      </svg>
+      <figcaption>Figure 2 — RED describes the work; USE describes the machines doing the work. Saturation is where they meet.</figcaption>
+    </figure>
+
+    <h3>Applied to reliability-api</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Signal</th><th>Question</th><th>Source metric</th><th>Notes</th></tr>
+      <tr><td>Rate / Traffic</td><td>How many requests per second are served?</td><td><code>http_requests_total</code> (counter)</td><td>Use <code>rate()</code>; never graph the raw counter</td></tr>
+      <tr><td>Errors</td><td>What fraction fails?</td><td><code>http_requests_total{status=~"5.."}</code></td><td>The canonical app only records status 200 on <code>/work</code> (see section 6) — errors must also be measured at the load generator</td></tr>
+      <tr><td>Duration / Latency</td><td>How slow is the tail?</td><td><code>http_request_duration_seconds</code> (histogram)</td><td>p50/p95/p99 via <code>histogram_quantile()</code></td></tr>
+      <tr><td>Utilization</td><td>How busy are the Pods?</td><td><code>container_cpu_usage_seconds_total</code> (cAdvisor)</td><td>Compare against the 100m request — the same ratio HPA uses</td></tr>
+      <tr><td>Saturation</td><td>Is work queuing?</td><td>CPU throttling (<code>container_cpu_cfs_throttled_periods_total</code>), in-flight requests gauge (extension), latency growth</td><td>Python’s busy loop holds one core per worker; a single Uvicorn worker saturates near 1 CPU</td></tr>
+      <tr><td>Errors (resource)</td><td>Are resources failing?</td><td>Restarts (<code>kube_pod_container_status_restarts_total</code>), OOM kills</td><td>From kube-state-metrics</td></tr>
+    </table></div>
+
+    <details class="q"><summary>Self-check: why does the SRE book insist on separating the latency of successful and failed requests?</summary><div class="a">A fast failure (e.g. an immediate 503 because no backend is ready) pulls average and percentile latency <em>down</em>, making an outage look like a speed improvement. Slow errors, in turn, hide inside “all requests” latency. Label or filter by status so you can see each population.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>3. Prometheus architecture</h2>
+    <p><strong>Prometheus</strong> is an open-source monitoring and alerting toolkit. Its core server <em>scrapes</em> (pulls) metrics over HTTP from targets, stores them as time series in a local time-series database (TSDB), evaluates recording and alerting rules, and serves the PromQL query API. Alerts are sent to a separate component, <strong>Alertmanager</strong>, which deduplicates, groups, routes and notifies. Step through the diagram below.</p>
+
+    <div class="widget stepper" data-steps='[
+      {"title":"Service discovery finds targets","html":"Prometheus asks a discovery mechanism (here the Kubernetes API, via <code>kubernetes_sd_configs</code>) for the current list of Pods/Endpoints. When the Deployment replaces a Pod, the target list changes automatically — no static IPs."},
+      {"title":"Retrieval scrapes /metrics (pull)","html":"Every <code>scrape_interval</code> (Prometheus default 1m; the Prometheus Operator default is 30s) the scraper sends <code>GET /metrics</code> to each target: your reliability-api Pods and exporters such as node-exporter and kube-state-metrics. Each scrape also records synthetic series such as <code>up</code> (1 = reachable, 0 = scrape failed)."},
+      {"title":"Samples are appended to the TSDB","html":"Each scraped value becomes a sample (float64 + millisecond timestamp) appended to its series. Data is first protected by a write-ahead log and organised in two-hour blocks that are later compacted. Local storage is not clustered or replicated; default retention is 15 days (the kube-prometheus-stack chart sets its own default)."},
+      {"title":"Rules are evaluated","html":"Every <code>evaluation_interval</code> (default 1m) Prometheus runs recording rules (pre-compute expensive queries into new series) and alerting rules (PromQL conditions). Rule results are written back into the TSDB."},
+      {"title":"Firing alerts go to Alertmanager","html":"Prometheus does not send emails or chat messages itself. It pushes active alerts to Alertmanager, which groups, deduplicates, inhibits, silences and routes them to receivers (email, chat, pager)."},
+      {"title":"Grafana and humans query via PromQL","html":"Grafana (and the Prometheus web UI on :9090) call the HTTP API with PromQL. The dashboard is for the operator; it does not fix or scale anything by itself."},
+      {"title":"Special case: Pushgateway","html":"Short-lived batch jobs may finish before a scrape. They can push their final metrics to a Pushgateway, which Prometheus then scrapes. The docs call this valid only for service-level batch jobs; it is a single point of failure, loses the per-instance <code>up</code> signal, and never forgets pushed series."}
+    ]'>
+      <div class="w-title">Step through: one scrape cycle, end to end</div>
+      <div class="w-sub">Figure 3 — Prometheus architecture. Click Next to highlight each stage.</div>
+      <svg viewBox="0 0 880 400" role="img" aria-label="Prometheus architecture: service discovery and targets on the left, Prometheus server with retrieval, TSDB, rules and HTTP API in the middle, Alertmanager and receivers on the right, Grafana below, Pushgateway bottom left">
+        <defs><marker id="m07c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="zone" x="300" y="16" width="330" height="236" rx="12"/>
+        <text x="465" y="36" text-anchor="middle" class="t-muted">Prometheus server</text>
+        <g data-step="0">
+          <rect class="box3" x="20" y="30" width="230" height="52" rx="8"/>
+          <text x="135" y="52" text-anchor="middle" class="t-bold">Service discovery</text>
+          <text x="135" y="70" text-anchor="middle" class="t-muted">Kubernetes API (pods, endpoints)</text>
+          <line class="line" x1="250" y1="62" x2="318" y2="66" marker-end="url(#m07c)"/>
+        </g>
+        <g data-step="0,1">
+          <rect class="box2" x="320" y="48" width="290" height="40" rx="8"/>
+          <text x="465" y="73" text-anchor="middle" class="t-bold">Retrieval (scraper)</text>
+        </g>
+        <g data-step="1">
+          <rect class="box" x="20" y="110" width="230" height="52" rx="8"/>
+          <text x="135" y="132" text-anchor="middle" class="t-bold">reliability-api Pods</text>
+          <text x="135" y="150" text-anchor="middle" class="t-muted">GET :8000/metrics</text>
+          <rect class="box" x="20" y="180" width="230" height="52" rx="8"/>
+          <text x="135" y="202" text-anchor="middle" class="t-bold">Exporters</text>
+          <text x="135" y="220" text-anchor="middle" class="t-muted">node-exporter, kube-state-metrics</text>
+          <line class="line accent" x1="330" y1="88" x2="252" y2="134" marker-end="url(#m07c)"/>
+          <line class="line accent" x1="340" y1="88" x2="252" y2="200" marker-end="url(#m07c)"/>
+          <text x="262" y="112" class="t-muted">pull</text>
+        </g>
+        <g data-step="1,2,3,5">
+          <rect class="box4" x="320" y="112" width="135" height="60" rx="8"/>
+          <text x="387" y="138" text-anchor="middle" class="t-bold">TSDB</text>
+          <text x="387" y="156" text-anchor="middle" class="t-muted">local disk</text>
+          <line class="line" x1="387" y1="88" x2="387" y2="110" marker-end="url(#m07c)"/>
+        </g>
+        <g data-step="3,4">
+          <rect class="box4" x="475" y="112" width="135" height="60" rx="8"/>
+          <text x="542" y="138" text-anchor="middle" class="t-bold">Rules</text>
+          <text x="542" y="156" text-anchor="middle" class="t-muted">record + alert</text>
+          <line class="line" x1="455" y1="142" x2="473" y2="142" marker-end="url(#m07c)" marker-start="url(#m07c)"/>
+        </g>
+        <g data-step="5">
+          <rect class="box2" x="320" y="192" width="290" height="44" rx="8"/>
+          <text x="465" y="219" text-anchor="middle" class="t-bold">HTTP API / PromQL (:9090)</text>
+          <rect class="box" x="370" y="300" width="190" height="52" rx="8"/>
+          <text x="465" y="322" text-anchor="middle" class="t-bold">Grafana</text>
+          <text x="465" y="340" text-anchor="middle" class="t-muted">dashboards (queries)</text>
+          <line class="line accent" x1="465" y1="298" x2="465" y2="238" marker-end="url(#m07c)"/>
+        </g>
+        <g data-step="4">
+          <rect class="box3" x="690" y="112" width="170" height="60" rx="8"/>
+          <text x="775" y="138" text-anchor="middle" class="t-bold">Alertmanager</text>
+          <text x="775" y="156" text-anchor="middle" class="t-muted">group · inhibit · route</text>
+          <line class="line accent" x1="610" y1="142" x2="688" y2="142" marker-end="url(#m07c)"/>
+          <rect class="box" x="690" y="210" width="170" height="60" rx="8"/>
+          <text x="775" y="236" text-anchor="middle" class="t-bold">Receivers</text>
+          <text x="775" y="254" text-anchor="middle" class="t-muted">email · chat · pager</text>
+          <line class="line" x1="775" y1="172" x2="775" y2="208" marker-end="url(#m07c)"/>
+        </g>
+        <g data-step="6">
+          <rect class="box" x="20" y="290" width="150" height="52" rx="8"/>
+          <text x="95" y="312" text-anchor="middle" class="t-bold">Batch job</text>
+          <text x="95" y="330" text-anchor="middle" class="t-muted">exits quickly</text>
+          <rect class="box3" x="196" y="290" width="150" height="52" rx="8"/>
+          <text x="271" y="320" text-anchor="middle" class="t-bold">Pushgateway</text>
+          <line class="line" x1="170" y1="316" x2="194" y2="316" marker-end="url(#m07c)"/>
+          <line class="line dash" x1="300" y1="288" x2="350" y2="90" marker-end="url(#m07c)"/>
+          <text x="20" y="370" class="t-muted">push, then Prometheus scrapes the gateway (use sparingly)</text>
+        </g>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+    <h3>Why pull?</h3>
+    <p>Pull means Prometheus decides when and what to scrape. Benefits: a failed scrape is itself a signal (<code>up == 0</code>); you can curl a target’s <code>/metrics</code> by hand to see exactly what Prometheus sees; targets need no knowledge of the monitoring system. Cost: Prometheus must be able to reach every target over the network, and very short-lived processes may never be scraped (hence the Pushgateway exception).</p>
+
+    <h3>Jobs, instances and synthetic series</h3>
+    <p>An endpoint you can scrape is an <strong>instance</strong> (usually one process — one <code>reliability-api</code> container). A collection of instances with the same purpose is a <strong>job</strong>. On every scrape Prometheus attaches <code>job</code> and <code>instance</code> labels and records:</p>
+    <div class="table-wrap"><table>
+      <tr><th>Series</th><th>Meaning</th><th>Why you care</th></tr>
+      <tr><td><code>up</code></td><td>1 if the scrape succeeded, 0 if it failed</td><td>First query when a Grafana panel is blank</td></tr>
+      <tr><td><code>scrape_duration_seconds</code></td><td>How long the scrape took</td><td>Slow <code>/metrics</code> handlers or huge outputs</td></tr>
+      <tr><td><code>scrape_samples_scraped</code></td><td>Samples the target exposed</td><td>Detect cardinality growth per target</td></tr>
+      <tr><td><code>scrape_samples_post_metric_relabeling</code></td><td>Samples left after metric relabeling</td><td>Verify drop rules work</td></tr>
+      <tr><td><code>scrape_series_added</code></td><td>Approximate new series in this scrape</td><td>Churn detector (e.g. a label with a request ID)</td></tr>
+    </table></div>
+
+    <h3>Exporters</h3>
+    <p>An <strong>exporter</strong> translates metrics from something that does not speak Prometheus format into a <code>/metrics</code> endpoint. In this course you meet three: <strong>node-exporter</strong> (hardware and OS metrics from *NIX kernels, default port 9100), <strong>kube-state-metrics</strong> (state of Kubernetes objects from the API server) and the kubelet’s built-in <strong>cAdvisor</strong> endpoint (container CPU/memory). <code>reliability-api</code> itself needs no exporter because it is <em>instrumented directly</em> with <code>prometheus_client</code>.</p>
+
+    <h3>When Prometheus is the wrong tool</h3>
+    <p>The Prometheus overview is explicit: if you need 100 % accuracy, such as per-request billing, Prometheus is not a good choice because collected data will likely not be detailed and complete enough. Metrics are sampled aggregates. Use logs or a transactional store for exact per-event accounting, and Prometheus for operational trends.</p>
+
+    <details class="q"><summary>Self-check: a Grafana panel for reliability-api is blank. What do you check first, and why?</summary><div class="a">Open the Prometheus UI (Status → Targets, or query <code>up{namespace="reliability-lab"}</code>). If the target is missing, it is a discovery problem (ServiceMonitor selector, labels, port name). If <code>up == 0</code>, Prometheus found it but the scrape failed (wrong port/path, NetworkPolicy, app down). If <code>up == 1</code> but the panel is blank, the problem is the query or Grafana data source. Checking Prometheus first splits the problem in half.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>4. The data model: series, labels, samples</h2>
+    <p>Prometheus stores every measurement as part of a <strong>time series</strong>: a stream of timestamped values identified by a <strong>metric name</strong> plus a set of key/value <strong>labels</strong>. The notation is <code>&lt;metric name&gt;{&lt;label name&gt;="&lt;label value&gt;", …}</code>. Each point in the stream is a <strong>sample</strong>: a float64 (or native histogram) value plus a millisecond-precision timestamp.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Anatomy of a series: metric name plus label set identifies one series; each series is a list of timestamped samples; different label values create different series">
+        <text x="30" y="40" class="t-mono" style="font-size:13px">http_requests_total{path="/work", status="200", pod="reliability-api-6d5f9-abcde"}</text>
+        <line class="line accent" x1="30" y1="52" x2="182" y2="52"/>
+        <line class="line ok" x1="190" y1="52" x2="694" y2="52"/>
+        <text x="30" y="72" class="t-bold">metric name</text>
+        <text x="30" y="88" class="t-muted">what is measured</text>
+        <text x="190" y="72" class="t-bold">label set</text>
+        <text x="190" y="88" class="t-muted">which one — every unique combination is a separate series</text>
+        <text x="30" y="128" class="t-bold">one series = ordered samples (timestamp, float64)</text>
+        <rect class="box2" x="30" y="140" width="150" height="34" rx="6"/><text x="105" y="162" text-anchor="middle" class="t-mono">10:00:00 → 1520</text>
+        <rect class="box2" x="190" y="140" width="150" height="34" rx="6"/><text x="265" y="162" text-anchor="middle" class="t-mono">10:00:30 → 1581</text>
+        <rect class="box2" x="350" y="140" width="150" height="34" rx="6"/><text x="425" y="162" text-anchor="middle" class="t-mono">10:01:00 → 1644</text>
+        <rect class="box2" x="510" y="140" width="150" height="34" rx="6"/><text x="585" y="162" text-anchor="middle" class="t-mono">10:01:30 → 1702</text>
+        <text x="680" y="162" class="t-muted">… every scrape</text>
+        <text x="30" y="210" class="t-bold">three label combinations → three series</text>
+        <text x="30" y="234" class="t-mono" style="font-size:11px">{path="/work",status="200",pod="…abcde"}</text>
+        <text x="30" y="256" class="t-mono" style="font-size:11px">{path="/work",status="200",pod="…fghij"}</text>
+        <text x="30" y="278" class="t-mono" style="font-size:11px">{path="/work",status="500",pod="…abcde"}</text>
+        <line class="line dash" x1="360" y1="230" x2="830" y2="230"/>
+        <line class="line dash" x1="360" y1="252" x2="830" y2="252"/>
+        <line class="line dash" x1="360" y1="274" x2="830" y2="274"/>
+        <circle class="dot-accent" cx="380" cy="230" r="4"/><circle class="dot-accent" cx="470" cy="230" r="4"/><circle class="dot-accent" cx="560" cy="230" r="4"/><circle class="dot-accent" cx="650" cy="230" r="4"/><circle class="dot-accent" cx="740" cy="230" r="4"/><circle class="dot-accent" cx="830" cy="230" r="4"/>
+        <circle class="dot-ok" cx="380" cy="252" r="4"/><circle class="dot-ok" cx="470" cy="252" r="4"/><circle class="dot-ok" cx="560" cy="252" r="4"/><circle class="dot-ok" cx="650" cy="252" r="4"/><circle class="dot-ok" cx="740" cy="252" r="4"/><circle class="dot-ok" cx="830" cy="252" r="4"/>
+        <circle class="dot-bad" cx="560" cy="274" r="4"/><circle class="dot-bad" cx="650" cy="274" r="4"/><circle class="dot-bad" cx="740" cy="274" r="4"/><circle class="dot-bad" cx="830" cy="274" r="4"/>
+      </svg>
+      <figcaption>Figure 4 — Identity = name + labels. The third series only starts to exist when the first 500 is counted.</figcaption>
+    </figure>
+
+    <h3>Rules for names and labels</h3>
+    <ul>
+      <li>Metric names should match <code>[a-zA-Z_:][a-zA-Z0-9_:]*</code>; colons are reserved for recording rules (section 7). Label names should match <code>[a-zA-Z_][a-zA-Z0-9_]*</code>; names beginning with <code>__</code> are reserved for Prometheus internals (you will meet <code>__address__</code> and <code>__meta_*</code> in relabeling).</li>
+      <li>A label with an empty value is treated as if the label did not exist.</li>
+      <li>Use base units: <strong>seconds</strong> and <strong>bytes</strong>, with the unit as a plural suffix (<code>http_request_duration_seconds</code>). Counters end in <code>_total</code>. One metric = one unit and one quantity: never mix milliseconds and seconds in the same metric.</li>
+    </ul>
+
+    <h3>Exposition format</h3>
+    <p>Targets expose plain text. <code># HELP</code> gives a docstring; <code># TYPE</code> declares <code>counter</code>, <code>gauge</code>, <code>histogram</code>, <code>summary</code> or <code>untyped</code>; then one line per series: <code>name{labels} value [timestamp]</code>. You will see real output from <code>reliability-api</code> in section 6.</p>
+
+    <h3>Cardinality: the most common way to hurt Prometheus</h3>
+    <p><strong>Cardinality</strong> is the number of distinct series a metric produces. Every series costs memory in the Prometheus head block, index space, disk and query time. Series count is the <em>product</em> of the number of distinct values of each label. The Prometheus naming guide warns: do not use labels for dimensions with high cardinality such as user IDs, email addresses or other unbounded sets. The instrumentation guide suggests keeping the cardinality of a metric below 10 where possible, and investigating alternatives for anything that is over 100 or could grow that large.</p>
+    <div class="callout danger"><span class="label">Classic mistake</span>Labelling requests with the raw URL. <code>/work?ms=50</code>, <code>/work?ms=51</code>, … or <code>/users/8231</code> each create a new series per distinct value. Label with the <em>route template</em> or an allow-list of known paths, never the raw path or query string. The canonical app hard-codes <code>"/work"</code>, which is exactly right.</div>
+
+    <div class="widget" id="card-widget">
+      <div class="w-title">Cardinality calculator — reliability-api</div>
+      <div class="w-sub">Series = product of distinct label values. Histograms multiply again by (buckets + _sum + _count). Toggle the bad label to see why it is banned.</div>
+      <div class="grid2">
+        <label>Distinct <code>path</code> values <input type="number" id="cd-paths" value="1" min="1" max="1000"></label>
+        <label>Distinct <code>status</code> values <input type="number" id="cd-status" value="1" min="1" max="100"></label>
+        <label>Pods (each adds its own <code>pod</code>/<code>instance</code>) <input type="number" id="cd-pods" value="2" min="1" max="500"></label>
+        <label>Histogram buckets incl. +Inf <input type="number" id="cd-buckets" value="15" min="1" max="200"></label>
+        <label><input type="checkbox" id="cd-created" checked> client_python <code>_created</code> series</label>
+        <label><input type="checkbox" id="cd-user"> add <code>user_id</code> label with <input type="number" id="cd-users" value="10000" min="1" max="10000000" style="width:110px"> users</label>
+      </div>
+      <div class="kv" id="cd-out"></div>
+      <div class="out" id="cd-text"></div>
+    </div>
+
+    <details class="q"><summary>Self-check: you add a <code>method</code> label (GET/POST/PUT) and grow from 2 to 6 replicas. By what factor does the histogram’s series count change?</summary><div class="a">Labels multiply: 3 methods × (6/2) pods = 9× more series. Each label set of a histogram carries every bucket plus <code>_sum</code> and <code>_count</code> (plus <code>_created</code> in client_python), so 15 buckets turn one label set into 17–18 series. Scaling replicas is a cardinality event too — HPA can triple your series count during a load test.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>5. Metric types: counter, gauge, histogram, summary</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Type</th><th>Definition (Prometheus docs)</th><th>Use for</th><th>Query with</th><th>Never</th></tr>
+      <tr><td><strong>Counter</strong></td><td>Cumulative value that only increases, or resets to zero on restart</td><td>Requests served, errors, bytes sent, CPU seconds consumed</td><td><code>rate()</code>, <code>increase()</code></td><td>Use for values that can go down; graph the raw value</td></tr>
+      <tr><td><strong>Gauge</strong></td><td>A single value that can go up and down</td><td>Memory in use, in-flight requests, queue depth, replica count</td><td>Direct, <code>avg_over_time()</code>, <code>max_over_time()</code></td><td><code>rate()</code> a gauge</td></tr>
+      <tr><td><strong>Histogram</strong></td><td>Counts observations into configurable buckets; exposes <code>_bucket{le}</code> (cumulative), <code>_sum</code>, <code>_count</code></td><td>Latency, request size — anything where you need a distribution aggregated across Pods</td><td><code>histogram_quantile()</code> over <code>rate(..._bucket)</code>; mean = <code>rate(_sum)/rate(_count)</code></td><td>Pick buckets without looking at real data</td></tr>
+      <tr><td><strong>Summary</strong></td><td>Computes configured quantiles client-side over a sliding window; exposes <code>{quantile="φ"}</code>, <code>_sum</code>, <code>_count</code></td><td>A single instance where you need accurate fixed quantiles</td><td>Read quantile series directly</td><td>Average or sum quantiles across Pods — summaries are not aggregatable</td></tr>
+    </table></div>
+
+    <h3>How a classic histogram works</h3>
+    <p>A histogram has a fixed list of bucket upper bounds. When the app calls <code>LATENCY.labels("/work").observe(0.052)</code>, the client library increments <strong>every bucket whose upper bound <code>le</code> (“less than or equal”) is ≥ 0.052</strong>, adds 0.052 to <code>_sum</code> and 1 to <code>_count</code>. So buckets are <em>cumulative</em>: <code>le="0.1"</code> includes everything already counted in <code>le="0.075"</code>. The last bucket, <code>le="+Inf"</code>, always equals <code>_count</code>. Every bucket is itself a counter, which is why you <code>rate()</code> buckets before computing quantiles.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 320" role="img" aria-label="Cumulative histogram buckets for 1000 requests and how histogram_quantile interpolates the 95th percentile inside the bucket from 0.075 to 0.1 seconds">
+        <line class="line" x1="60" y1="250" x2="800" y2="250"/>
+        <line class="line" x1="60" y1="60" x2="60" y2="250"/>
+        <text x="54" y="74" text-anchor="end" class="t-muted">1000</text>
+        <text x="54" y="254" text-anchor="end" class="t-muted">0</text>
+        <rect class="box4" x="185" y="228.4" width="70" height="21.6"/>
+        <rect class="box2" x="290" y="228.4" width="70" height="21.6"/><rect class="box4" x="290" y="82.6" width="70" height="145.8"/>
+        <rect class="box2" x="395" y="82.6" width="70" height="167.4"/><rect class="box4" x="395" y="75.4" width="70" height="7.2"/>
+        <rect class="box2" x="500" y="75.4" width="70" height="174.6"/><rect class="box4" x="500" y="70.9" width="70" height="4.5"/>
+        <rect class="box2" x="605" y="70.9" width="70" height="179.1"/><rect class="box4" x="605" y="70" width="70" height="0.9"/>
+        <rect class="box2" x="710" y="70" width="70" height="180"/>
+        <line class="line" x1="80" y1="250" x2="150" y2="250"/>
+        <text x="115" y="244" text-anchor="middle" class="t-mono">0</text>
+        <text x="220" y="222" text-anchor="middle" class="t-mono">120</text>
+        <text x="325" y="66" text-anchor="middle" class="t-mono">930</text>
+        <text x="430" y="54" text-anchor="middle" class="t-mono">970</text>
+        <text x="535" y="64" text-anchor="middle" class="t-mono">995</text>
+        <text x="640" y="63" text-anchor="middle" class="t-mono">1000</text>
+        <text x="745" y="63" text-anchor="middle" class="t-mono">1000</text>
+        <text x="115" y="270" text-anchor="middle" class="t-mono" style="font-size:11px">le=0.025</text>
+        <text x="220" y="270" text-anchor="middle" class="t-mono" style="font-size:11px">le=0.05</text>
+        <text x="325" y="270" text-anchor="middle" class="t-mono" style="font-size:11px">le=0.075</text>
+        <text x="430" y="270" text-anchor="middle" class="t-mono" style="font-size:11px">le=0.1</text>
+        <text x="535" y="270" text-anchor="middle" class="t-mono" style="font-size:11px">le=0.25</text>
+        <text x="640" y="270" text-anchor="middle" class="t-mono" style="font-size:11px">le=0.5</text>
+        <text x="745" y="270" text-anchor="middle" class="t-mono" style="font-size:11px">le=+Inf</text>
+        <line class="line bad dash" x1="60" y1="79" x2="470" y2="79"/>
+        <text x="66" y="96" class="t-muted">rank = 0.95 × 1000 = 950</text>
+        <text x="60" y="296" class="t-bold">p95 ≈ 0.075 + (0.1 − 0.075) × (950 − 930) / (970 − 930) = 0.0875 s</text>
+        <text x="60" y="314" class="t-muted">histogram_quantile assumes observations are spread linearly inside the chosen bucket</text>
+        <rect class="box2" x="75" y="122" width="14" height="14"/><text x="95" y="134" class="t-muted">already counted by lower buckets</text>
+        <rect class="box4" x="75" y="144" width="14" height="14"/><text x="95" y="156" class="t-muted">observations new to this bucket</text>
+      </svg>
+      <figcaption>Figure 5 — 1000 requests to <code>/work?ms=50</code>. The 0.075 bucket holds 810 of them (930 − 120). The estimate can only be as precise as the bucket containing the rank.</figcaption>
+    </figure>
+
+    <h4>The interpolation algorithm, step by step</h4>
+    <ol>
+      <li>Take the total count (the <code>+Inf</code> bucket) and compute the rank: <code>q × total</code>.</li>
+      <li>Find the first bucket whose cumulative count is ≥ rank.</li>
+      <li>Assume observations are uniformly spread between that bucket’s lower bound (the previous <code>le</code>, or 0 for the first bucket) and its upper bound, and interpolate linearly.</li>
+      <li>Special case: if the rank lands in the <code>+Inf</code> bucket, Prometheus returns the upper bound of the second-highest bucket — it cannot invent a value above your largest finite bucket. A p99 that is “stuck” exactly on your top bucket is a sign your buckets are too small.</li>
+    </ol>
+
+    <div class="widget" id="hist-widget">
+      <div class="w-title">Histogram bucket visualizer</div>
+      <div class="w-sub">Generate synthetic <code>/work</code> latencies, choose a bucket layout, and compare the <em>true</em> percentile with what <code>histogram_quantile()</code> would estimate from the buckets.</div>
+      <div class="grid2">
+        <label>Latency shape
+          <select id="hw-shape">
+            <option value="work">/work?ms=50 on idle Pod (tight ~52 ms)</option>
+            <option value="tail">/work under load (slow tail)</option>
+            <option value="bimodal">Bimodal (fast + 400 ms stalls)</option>
+            <option value="wide">Wide uniform 0–1 s</option>
+          </select></label>
+        <label>Bucket layout
+          <select id="hw-buckets">
+            <option value="default">client_python default (.005 … 10)</option>
+            <option value="coarse">Coarse: .1, .5, 1</option>
+            <option value="tuned">Tuned for /work: .04 .05 .055 .06 .075 .1 .15 .25 .5 1</option>
+          </select></label>
+        <label>Requests (sample size): <span id="hw-nv">1000</span><input type="range" id="hw-n" min="20" max="20000" step="20" value="1000"></label>
+        <label>Quantile
+          <select id="hw-q"><option value="0.5">0.50 (median)</option><option value="0.9">0.90</option><option value="0.95" selected>0.95</option><option value="0.99">0.99</option></select></label>
+      </div>
+      <div class="bars" id="hw-bars"></div>
+      <div class="kv" id="hw-kv"></div>
+      <div class="out" id="hw-text"></div>
+    </div>
+
+    <h3>Choosing buckets for reliability-api</h3>
+    <p>The client_python default buckets are <code>.005, .01, .025, .05, .075, .1, .25, .5, .75, 1.0, 2.5, 5.0, 7.5, 10.0, +Inf</code> (seconds), designed for typical web latencies. For <code>/work?ms=50</code> nearly every request lands between 0.05 and 0.075, so p50/p95/p99 are all interpolated inside one 25 ms-wide bucket and tell you little. Two rules:</p>
+    <ul>
+      <li><strong>Put boundaries around your SLO threshold.</strong> If your test SLO says “95 % of <code>/work</code> requests under 100 ms”, have a bucket with <code>le=0.1</code> so the “good” count is <em>exact</em>, not estimated.</li>
+      <li><strong>Add resolution where the data lives</strong>, but remember every bucket multiplies series count (use the calculator above). Custom buckets: <code>Histogram("http_request_duration_seconds", "Request latency", ["path"], buckets=[.04, .05, .055, .06, .075, .1, .15, .25, .5, 1])</code>; <code>+Inf</code> is appended automatically.</li>
+    </ul>
+
+    <h3>Histogram vs summary vs native histogram</h3>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Classic histogram</th><th>Summary</th><th>Native histogram</th></tr>
+      <tr><td>Configured by</td><td>Fixed bucket boundaries</td><td>Pre-selected quantiles + time window</td><td>A resolution setting</td></tr>
+      <tr><td>Quantile chosen</td><td>At query time (any φ)</td><td>At instrumentation time</td><td>At query time</td></tr>
+      <tr><td>Aggregate across Pods?</td><td>Yes, if buckets match</td><td><strong>No</strong></td><td>Yes</td></tr>
+      <tr><td>Series per label set</td><td>One per bucket + <code>_sum</code> + <code>_count</code></td><td>One per quantile + <code>_sum</code> + <code>_count</code></td><td>One composite sample</td></tr>
+    </table></div>
+    <p>The Prometheus practices page now says: if you can, use native histograms and prefer them over both classic histograms and summaries. This course uses classic histograms because that is what the canonical app exposes and what every tutorial and dashboard you will meet still assumes; the PromQL in this module is for classic histograms.</p>
+
+    <details class="q"><summary>Self-check: why can you not compute the fleet-wide p95 by averaging each Pod’s summary <code>{quantile="0.95"}</code>?</summary><div class="a">Quantiles are not additive. If Pod A served 10 requests with p95 = 2 s and Pod B served 10,000 with p95 = 50 ms, the average (≈1 s) describes neither the fleet nor any Pod. With histograms you sum the bucket <em>counts</em> across Pods (which is valid) and compute the quantile once from the merged distribution.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>6. Instrumenting reliability-api</h2>
+    <p>The canonical app (used in every module) instruments itself with the official Python client, <code>prometheus_client</code>:</p>
+<pre data-title="app/main.py (canonical)"><code>import os, time, logging
+from fastapi import FastAPI, Response
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
+READY_DELAY = float(os.getenv("READY_DELAY_SECONDS", "0"))
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reliability-api")
+
+REQUESTS = Counter("http_requests_total", "Total HTTP requests", ["path", "status"])
+LATENCY = Histogram("http_request_duration_seconds", "Request latency", ["path"])
+
+app = FastAPI()
+STARTED = time.monotonic()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/ready")
+def ready(response: Response):
+    if time.monotonic() - STARTED &lt; READY_DELAY:
+        response.status_code = 503
+        return {"ready": False}
+    return {"ready": True}
+
+@app.get("/work")
+def work(ms: int = 50):
+    start = time.perf_counter()
+    while (time.perf_counter() - start) * 1000 &lt; ms:
+        pass                                   # burn CPU deliberately
+    elapsed = time.perf_counter() - start
+    LATENCY.labels("/work").observe(elapsed)
+    REQUESTS.labels("/work", "200").inc()
+    return {"worked_ms": round(elapsed * 1000, 1)}
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)</code></pre>
+
+    <h3>What /metrics returns</h3>
+    <p>The output below was produced by running the same two metric definitions with prometheus_client 0.26.0 and five observations (four ≈50 ms, one 120 ms). In a Linux container you will additionally see <code>process_*</code> series (CPU seconds, resident memory, open file descriptors) from the default process collector.</p>
+<pre data-title="Example output (yours will differ in values, timestamps and Python version)"><code><span class="o"># HELP python_info Python platform information
+# TYPE python_info gauge
+python_info{implementation="CPython",major="3",minor="14",patchlevel="6",version="3.14.6"} 1.0
+# HELP http_requests_total Total HTTP requests
+# TYPE http_requests_total counter
+http_requests_total{path="/work",status="200"} 5.0
+# HELP http_requests_created Total HTTP requests
+# TYPE http_requests_created gauge
+http_requests_created{path="/work",status="200"} 1.793265048998977e+09
+# HELP http_request_duration_seconds Request latency
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le="0.005",path="/work"} 0.0
+http_request_duration_seconds_bucket{le="0.01",path="/work"} 0.0
+http_request_duration_seconds_bucket{le="0.025",path="/work"} 0.0
+http_request_duration_seconds_bucket{le="0.05",path="/work"} 1.0
+http_request_duration_seconds_bucket{le="0.075",path="/work"} 4.0
+http_request_duration_seconds_bucket{le="0.1",path="/work"} 4.0
+http_request_duration_seconds_bucket{le="0.25",path="/work"} 5.0
+http_request_duration_seconds_bucket{le="0.5",path="/work"} 5.0
+  … (0.75 through 10.0 also 5.0)
+http_request_duration_seconds_bucket{le="+Inf",path="/work"} 5.0
+http_request_duration_seconds_count{path="/work"} 5.0
+http_request_duration_seconds_sum{path="/work"} 0.32599999999999996
+# HELP http_request_duration_seconds_created Request latency
+# TYPE http_request_duration_seconds_created gauge
+http_request_duration_seconds_created{path="/work"} 1.7932650489989362e+09</span></code></pre>
+    <p>Read it line by line: the counter is exposed with the <code>_total</code> suffix; buckets are cumulative (1 → 4 → 5); <code>+Inf</code> equals <code>_count</code>; the mean latency is <code>_sum / _count</code> = 0.326 / 5 ≈ 65 ms. The <code>_created</code> series hold a Unix timestamp of when each labelled child was created; client_python lets you disable them with <code>PROMETHEUS_DISABLE_CREATED_SERIES=True</code>.</p>
+
+    <h3>Known gaps in the canonical instrumentation</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Gap</th><th>Consequence</th><th>Mitigation</th></tr>
+      <tr><td>Only <code>/work</code> is counted, and only after success</td><td>No server-side error ratio; a request that crashes never increments anything</td><td>Measure errors at the load generator (k6 <code>http_req_failed</code>, Module 08) and/or add middleware (below)</td></tr>
+      <tr><td>Series appear lazily</td><td><code>{status="500"}</code> does not exist until the first 500 — <code>rate()</code> of a missing series returns <em>nothing</em>, not 0</td><td>Pre-initialise children (call <code>.labels(...)</code> once at start-up) or use <code>or vector(0)</code> in queries</td></tr>
+      <tr><td>No in-flight gauge</td><td>No direct saturation signal</td><td><code>Gauge.track_inprogress()</code> (below)</td></tr>
+      <tr><td>Single Uvicorn process</td><td>Metrics are per process; with multiple workers you would need client_python multiprocess mode</td><td>Keep one worker per container and scale with replicas (what this course does)</td></tr>
+    </table></div>
+
+    <details class="q"><summary>Optional extension (not the canonical code): count every request and status with middleware</summary><div class="a">
+<p>If you want a true server-side error ratio, replace the two metric lines inside <code>work()</code> with an HTTP middleware. Paths are mapped through an allow-list so unknown URLs collapse into <code>"other"</code> (bounded cardinality):</p>
+<pre data-title="app/main.py — extension sketch"><code>from fastapi import Request
+from prometheus_client import Gauge
+
+IN_FLIGHT = Gauge("http_requests_in_flight", "Requests currently being served")
+KNOWN_PATHS = {"/health", "/ready", "/work", "/metrics"}
+
+@app.middleware("http")
+async def record_metrics(request: Request, call_next):
+    path = request.url.path if request.url.path in KNOWN_PATHS else "other"
+    status = "500"                      # assume failure until a response exists
+    start = time.perf_counter()
+    IN_FLIGHT.inc()
+    try:
+        response = await call_next(request)
+        status = str(response.status_code)
+        return response
+    finally:
+        IN_FLIGHT.dec()
+        REQUESTS.labels(path, status).inc()
+        LATENCY.labels(path).observe(time.perf_counter() - start)</code></pre>
+<p>Trade-off: you now also measure <code>/metrics</code> and probe traffic, which inflates request rate. Filter with <code>path="/work"</code> in queries. Write a unit test that requests <code>/ready</code> during the warm-up window and asserts the <code>status="503"</code> counter increments.</p>
+    </div></details>
+
+    <section class="lab"><header>Lab 1 — Instrument, scrape by hand, and predict the numbers</header><div class="body">
+      <p>Goal: prove you can predict the exact change in <code>/metrics</code> for a known request volume before Prometheus is involved.</p>
+      <ol class="steps">
+        <li>Run the app locally (from <code>kubernetes-reliability-lab/</code>):
+<pre><code>python3.12 -m venv .venv &amp;&amp; . .venv/bin/activate
+pip install fastapi uvicorn prometheus-client
+uvicorn app.main:app --host 0.0.0.0 --port 8000</code></pre></li>
+        <li>In a second terminal, record the baseline, send exactly 20 requests, and compare:
+<pre><code>curl -s localhost:8000/metrics | grep -E '^http_request(s_total|_duration_seconds_count)'
+for i in $(seq 1 20); do curl -s "localhost:8000/work?ms=50" &gt; /dev/null; done
+curl -s localhost:8000/metrics | grep -E '^http_request(s_total|_duration_seconds_(count|sum))'</code></pre>
+<pre data-title="Example output (yours will differ in the _sum value)"><code><span class="o">http_requests_total{path="/work",status="200"} 20.0
+http_request_duration_seconds_count{path="/work"} 20.0
+http_request_duration_seconds_sum{path="/work"} 1.0034…</span></code></pre>
+          The first command prints nothing on a fresh process — the labelled series do not exist until the first <code>/work</code> request.</li>
+        <li>Predict before you run: with <code>?ms=200</code>, which bucket will the next 10 requests land in under the default layout? (Answer: <code>le="0.25"</code> and above; <code>le="0.1"</code> stays unchanged.) Verify with <code>curl -s localhost:8000/metrics | grep 'le="0.1"\|le="0.25"'</code>.</li>
+        <li>Repeat against the cluster through the Service:
+<pre><code>kubectl -n reliability-lab port-forward svc/reliability-api 8080:80
+curl -s localhost:8080/metrics | grep http_requests_total</code></pre>
+          Run the curl several times. Notice the counter can jump between values: each request may reach a different Pod, and each Pod has its own counter. This is why PromQL aggregates with <code>sum</code>.</li>
+      </ol>
+      <p><strong>Evidence to keep:</strong> the before/after lines and one sentence explaining why the per-Pod counters differ.</p>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>7. PromQL: asking questions of time series</h2>
+    <p><strong>PromQL</strong> is Prometheus’s functional query language. Every expression evaluates to one of four types: an <strong>instant vector</strong> (one sample per series, all at the same timestamp), a <strong>range vector</strong> (a window of samples per series), a <strong>scalar</strong> (a single number) or a string (currently unused). Most mistakes come from feeding the wrong type to a function.</p>
+
+    <h3>Instant vs range vectors</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 240" role="img" aria-label="Samples every 30 seconds on a timeline; an instant selector picks the latest sample within the 5 minute lookback; a range selector of 2 minutes returns all samples inside the window">
+        <defs><marker id="m07d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box4" x="538" y="70" width="260" height="70" rx="6"/>
+        <text x="668" y="62" text-anchor="middle" class="t-mono">http_requests_total[2m]</text>
+        <line class="line" x1="40" y1="120" x2="830" y2="120"/>
+        <circle class="dot-accent" cx="40" cy="120" r="4"/><circle class="dot-accent" cx="105" cy="120" r="4"/><circle class="dot-accent" cx="170" cy="120" r="4"/><circle class="dot-accent" cx="235" cy="120" r="4"/><circle class="dot-accent" cx="300" cy="120" r="4"/><circle class="dot-accent" cx="365" cy="120" r="4"/><circle class="dot-accent" cx="430" cy="120" r="4"/><circle class="dot-accent" cx="495" cy="120" r="4"/>
+        <circle class="dot-ok" cx="560" cy="120" r="6"/><circle class="dot-ok" cx="625" cy="120" r="6"/><circle class="dot-ok" cx="690" cy="120" r="6"/><circle class="dot-ok" cx="755" cy="120" r="6"/>
+        <line class="line bad" x1="798" y1="84" x2="798" y2="160"/>
+        <text x="798" y="178" text-anchor="middle" class="t-bold">eval time t</text>
+        <text x="40" y="144" class="t-muted">10:00</text><text x="300" y="144" class="t-muted">10:02</text><text x="560" y="144" class="t-muted">10:04</text>
+        <path class="line accent" d="M790,100 C780,90 765,92 758,110" marker-end="url(#m07d)"/>
+        <text x="40" y="40" class="t-bold">instant selector <tspan class="t-mono">http_requests_total</tspan></text>
+        <text x="40" y="58" class="t-muted">→ newest sample at or before t (within the 5-minute lookback)</text>
+        <text x="40" y="206" class="t-bold">range selector <tspan class="t-mono">[2m]</tspan> → every sample in (t − 2m, t] → 4 samples here</text>
+        <text x="40" y="226" class="t-muted">a range vector cannot be graphed directly; a function such as rate() turns it back into an instant vector</text>
+      </svg>
+      <figcaption>Figure 6 — Scrapes every 30 s. The instant selector returns one value per series; the range selector returns the four green samples.</figcaption>
+    </figure>
+    <ul>
+      <li><strong>Matchers:</strong> <code>=</code>, <code>!=</code>, <code>=~</code> (regex), <code>!~</code>. Regexes are fully anchored: <code>status=~"5.."</code> matches 500–599 but <code>status=~"5"</code> matches only <code>"5"</code>.</li>
+      <li><strong>Durations:</strong> <code>ms s m h d w y</code>, combinable in descending order: <code>1h30m</code>.</li>
+      <li><strong>Lookback:</strong> an instant selector looks back at most 5 minutes by default. When a target disappears, its series are marked stale and vanish from results.</li>
+      <li><strong>Modifiers:</strong> <code>offset 1h</code> shifts a selector back in time (“compare with an hour ago”); <code>@ &lt;unix-time&gt;</code> pins evaluation to a fixed timestamp.</li>
+    </ul>
+
+    <h3>rate(), irate() and increase()</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 260" role="img" aria-label="A counter rises steadily, drops to zero when the Pod restarts, then rises again; rate adjusts for the reset; irate uses only the last two samples">
+        <line class="line" x1="60" y1="210" x2="830" y2="210"/><line class="line" x1="60" y1="30" x2="60" y2="210"/>
+        <text x="54" y="46" text-anchor="end" class="t-muted">120</text><text x="54" y="214" text-anchor="end" class="t-muted">0</text>
+        <polyline class="line accent" points="60,210 128,182 196,154 264,126 332,98 400,70 468,42"/>
+        <line class="line bad dash" x1="468" y1="42" x2="536" y2="210"/>
+        <polyline class="line accent" points="536,210 604,182 672,154 740,126 808,98"/>
+        <circle class="dot-accent" cx="60" cy="210" r="3.5"/><circle class="dot-accent" cx="128" cy="182" r="3.5"/><circle class="dot-accent" cx="196" cy="154" r="3.5"/><circle class="dot-accent" cx="264" cy="126" r="3.5"/><circle class="dot-accent" cx="332" cy="98" r="3.5"/><circle class="dot-accent" cx="400" cy="70" r="3.5"/><circle class="dot-accent" cx="468" cy="42" r="3.5"/>
+        <circle class="dot-bad" cx="536" cy="210" r="5"/>
+        <circle class="dot-accent" cx="604" cy="182" r="3.5"/><circle class="dot-accent" cx="672" cy="154" r="3.5"/><circle class="dot-accent" cx="740" cy="126" r="3.5"/><circle class="dot-accent" cx="808" cy="98" r="3.5"/>
+        <text x="548" y="234" class="t-bold">Pod restarted → counter reset</text>
+        <rect class="zone" x="725" y="80" width="100" height="62" rx="6"/>
+        <text x="775" y="74" text-anchor="middle" class="t-muted">irate: last 2</text>
+        <text x="80" y="40" class="t-bold">http_requests_total for one Pod (scraped every 30 s)</text>
+        <text x="80" y="60" class="t-muted">rate() sees the drop, assumes a reset, and keeps</text>
+        <text x="80" y="76" class="t-muted">counting from 0 → still ≈ 20 requests / 30 s ≈ 0.67/s</text>
+      </svg>
+      <figcaption>Figure 7 — Counters only go up, except on restart. <code>rate()</code>, <code>irate()</code> and <code>increase()</code> all detect and compensate for resets.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <tr><th>Function</th><th>Computes</th><th>Use for</th><th>reliability-api example</th></tr>
+      <tr><td><code>rate(v[d])</code></td><td>Per-second <em>average</em> rate of increase over the whole window, reset-adjusted</td><td>Alerts, SLOs, most graphs</td><td><code>rate(http_requests_total{path="/work"}[5m])</code></td></tr>
+      <tr><td><code>irate(v[d])</code></td><td>Per-second rate from the <em>last two</em> samples in the window</td><td>Zoomed-in graphs of volatile, fast-moving counters — not alerts</td><td><code>irate(http_requests_total[1m])</code> during a spike</td></tr>
+      <tr><td><code>increase(v[d])</code></td><td><code>rate</code> × seconds in the window (may be non-integer due to extrapolation)</td><td>“How many in this window?”</td><td><code>increase(http_requests_total[1h])</code></td></tr>
+    </table></div>
+    <div class="callout tip"><span class="label">Window length</span>The range must contain at least two samples, and in practice several. With a 30 s scrape interval, <code>[1m]</code> holds only two samples and one missed scrape breaks the graph. Grafana’s <code>$__rate_interval</code> is designed for this: it is <code>max($__interval + scrape interval, 4 × scrape interval)</code>, guaranteeing at least four samples. Use it in dashboards; use fixed windows such as <code>[5m]</code> in alert rules.</div>
+
+    <h3>Aggregation: sum by, without</h3>
+    <p>Aggregation operators (<code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>, <code>count</code>, <code>topk</code>, <code>bottomk</code>, <code>quantile</code>, <code>stddev</code>, <code>stdvar</code>, <code>count_values</code>) collapse many series into fewer. <code>by (labels)</code> keeps only the listed labels; <code>without (labels)</code> drops the listed ones and keeps the rest.</p>
+<pre><code><span class="c"># total /work throughput across all Pods</span>
+sum(rate(http_requests_total{path="/work"}[5m]))
+<span class="c"># per-Pod throughput — is the Service balancing evenly?</span>
+sum by (pod) (rate(http_requests_total{path="/work"}[5m]))
+<span class="c"># top 3 busiest Pods</span>
+topk(3, sum by (pod) (rate(http_requests_total[5m])))</code></pre>
+    <div class="callout danger"><span class="label">rate, then sum — never sum, then rate</span>The functions docs say to apply <code>rate()</code> first and aggregate afterwards. If you sum raw counters across Pods first, one Pod’s restart looks like a huge drop of the <em>sum</em>; <code>rate()</code> then misreads it as a reset and produces a spike. Per-series <code>rate()</code> handles each Pod’s reset correctly.</div>
+
+    <h3>Latency percentiles with histogram_quantile()</h3>
+<pre><code><span class="c"># p95 latency of /work across all Pods</span>
+histogram_quantile(0.95,
+  sum by (le) (rate(http_request_duration_seconds_bucket{path="/work"}[5m])))
+
+<span class="c"># p95 per Pod — keep le AND pod</span>
+histogram_quantile(0.95,
+  sum by (pod, le) (rate(http_request_duration_seconds_bucket{path="/work"}[5m])))
+
+<span class="c"># mean latency (not a percentile!)</span>
+sum(rate(http_request_duration_seconds_sum{path="/work"}[5m]))
+/
+sum(rate(http_request_duration_seconds_count{path="/work"}[5m]))</code></pre>
+    <p>Three rules: (1) <code>rate()</code> the <code>_bucket</code> series first (buckets are counters); (2) always keep <code>le</code> in the <code>by</code> clause or the function has no buckets to work with; (3) remember the answer is an <em>estimate</em> bounded by bucket width (Figure 5). With very little traffic in the window, the estimate is noisy — report sample counts alongside percentiles.</p>
+
+    <h3>Error ratio</h3>
+<pre><code><span class="c"># fraction of /work requests that were 5xx over 5 minutes (0 … 1)</span>
+sum(rate(http_requests_total{path="/work", status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total{path="/work"}[5m]))
+
+<span class="c"># if no 5xx series exists yet the numerator is empty → the whole result is empty.</span>
+<span class="c"># "or vector(0)" turns "no data" into an explicit 0 for dashboards:</span>
+(sum(rate(http_requests_total{path="/work", status=~"5.."}[5m])) or vector(0))
+/
+sum(rate(http_requests_total{path="/work"}[5m]))</code></pre>
+
+    <h3>Binary operators and comparisons</h3>
+    <p>Arithmetic between two instant vectors matches series with identical label sets; use <code>on(labels)</code> or <code>ignoring(labels)</code> to control matching and <code>group_left</code>/<code>group_right</code> for many-to-one joins. Comparisons (<code>&gt;</code>, <code>==</code>, …) <em>filter</em> by default — <code>up == 0</code> returns only the down targets, which is exactly what an alert needs. Add <code>bool</code> to get 0/1 instead.</p>
+<pre><code><span class="c"># CPU usage as a fraction of the CPU request, per Pod (the same ratio HPA uses)</span>
+sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="reliability-lab", container="reliability-api"}[5m]))
+/
+sum by (pod) (kube_pod_container_resource_requests{namespace="reliability-lab", container="reliability-api", resource="cpu"})</code></pre>
+    <p>This assumes the container in the Deployment is named <code>reliability-api</code>; adjust the <code>container</code> matcher to your manifest.</p>
+
+    <h3>Recording rules</h3>
+    <p>Expensive expressions that dashboards and alerts reuse should be pre-computed by <strong>recording rules</strong>, which store the result as a new series. Name them <code>level:metric:operations</code>:</p>
+<pre data-title="recording rules for reliability-api"><code>groups:
+  - name: reliability-api.recording
+    rules:
+      - record: path:http_requests:rate5m
+        expr: sum by (path) (rate(http_requests_total[5m]))
+      - record: path:http_requests_errors:ratio_rate5m
+        expr: |
+          sum by (path) (rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum by (path) (rate(http_requests_total[5m]))
+      - record: path_le:http_request_duration_seconds_bucket:rate5m
+        expr: sum by (path, le) (rate(http_request_duration_seconds_bucket[5m]))</code></pre>
+
+    <h3>Query cookbook for reliability-api</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Question</th><th>PromQL</th></tr>
+      <tr><td>Is every Pod being scraped?</td><td><code>up{namespace="reliability-lab"}</code></td></tr>
+      <tr><td>How many Pods are being scraped?</td><td><code>count(up{namespace="reliability-lab"} == 1)</code></td></tr>
+      <tr><td>Requests/s right now</td><td><code>sum(rate(http_requests_total{path="/work"}[5m]))</code></td></tr>
+      <tr><td>Requests in the last hour</td><td><code>sum(increase(http_requests_total{path="/work"}[1h]))</code></td></tr>
+      <tr><td>Throughput vs one hour ago</td><td><code>sum(rate(http_requests_total[5m])) / sum(rate(http_requests_total[5m] offset 1h))</code></td></tr>
+      <tr><td>Fraction of /work under 100 ms (needs an <code>le="0.1"</code> bucket)</td><td><code>sum(rate(http_request_duration_seconds_bucket{path="/work",le="0.1"}[5m])) / sum(rate(http_request_duration_seconds_count{path="/work"}[5m]))</code></td></tr>
+      <tr><td>Memory working set per Pod</td><td><code>sum by (pod) (container_memory_working_set_bytes{namespace="reliability-lab", container="reliability-api"})</code></td></tr>
+      <tr><td>CPU throttling ratio</td><td><code>sum by (pod) (rate(container_cpu_cfs_throttled_periods_total{namespace="reliability-lab"}[5m])) / sum by (pod) (rate(container_cpu_cfs_periods_total{namespace="reliability-lab"}[5m]))</code></td></tr>
+      <tr><td>Is the series missing entirely?</td><td><code>absent(up{namespace="reliability-lab", job=~".*reliability-api.*"})</code></td></tr>
+    </table></div>
+
+    <h3>Common PromQL mistakes</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr>
+      <tr><td>Graphing a raw counter</td><td>A line that only goes up; restarts look like crashes</td><td>Wrap in <code>rate()</code></td></tr>
+      <tr><td><code>rate()</code> on a gauge</td><td>Nonsense (and negative “resets”)</td><td>Use <code>deriv()</code> or <code>*_over_time()</code> for gauges</td></tr>
+      <tr><td>Dropping <code>le</code> before <code>histogram_quantile</code></td><td>Empty result or NaN</td><td><code>sum by (le)</code> (plus any labels you want to keep)</td></tr>
+      <tr><td>Window shorter than ~4 scrapes</td><td>Gaps, jagged lines</td><td><code>$__rate_interval</code> or ≥ 4× scrape interval</td></tr>
+      <tr><td>Averaging percentiles across Pods</td><td>Plausible-looking but meaningless number</td><td>Aggregate buckets, then compute the quantile</td></tr>
+      <tr><td>Expecting 0 where no series exists</td><td>Panel shows “No data”</td><td><code>or vector(0)</code>, or pre-initialise labels in code</td></tr>
+    </table></div>
+
+    <details class="q"><summary>Self-check: <code>rate(http_requests_total[5m])</code> returns 4 series but <code>sum(rate(http_requests_total[5m]))</code> returns 1. You have 2 Pods. Where do 4 series come from?</summary><div class="a">Each Pod exposes one series per <code>(path, status)</code> combination. With 2 Pods and two status values seen so far (e.g. 200 and 503, if you added the middleware) you get 2 × 2 = 4 series. <code>sum</code> without <code>by</code> drops every label and adds them into one.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>8. Scrape configuration and relabeling basics</h2>
+    <p>Behind every target is a <strong>scrape config</strong>. With the Prometheus Operator you rarely write it by hand (a ServiceMonitor generates it), but you must understand it to debug. Defaults worth memorising: <code>scrape_interval</code> 1m, <code>scrape_timeout</code> 10s, <code>evaluation_interval</code> 1m, <code>metrics_path</code> <code>/metrics</code>, <code>scheme</code> <code>http</code>.</p>
+<pre data-title="prometheus.yml — hand-written equivalent for reliability-api (illustrative)"><code>global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: reliability-api
+    kubernetes_sd_configs:
+      - role: pod                       # also: node, service, endpoints, endpointslice, ingress
+        namespaces:
+          names: [reliability-lab]
+    relabel_configs:
+      <span class="c"># keep only Pods labelled app.kubernetes.io/name=reliability-api</span>
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        regex: reliability-api
+        action: keep
+      <span class="c"># keep only the container port named "http"</span>
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: http
+        action: keep
+      <span class="c"># copy useful metadata into real labels</span>
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+    metric_relabel_configs:
+      <span class="c"># drop the _created gauges after scraping (saves series)</span>
+      - source_labels: [__name__]
+        regex: '.*_created'
+        action: drop</code></pre>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 270" role="img" aria-label="Relabeling pipeline: discovered targets with meta labels pass through relabel_configs, become targets with final labels, are scraped, then metric_relabel_configs filters samples before the TSDB">
+        <defs><marker id="m07e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box3" x="20" y="30" width="240" height="80" rx="8"/>
+        <text x="140" y="54" text-anchor="middle" class="t-bold">1. Discovered target</text>
+        <text x="140" y="74" text-anchor="middle" class="t-muted">__address__=10.244.1.7:8000</text>
+        <text x="140" y="92" text-anchor="middle" class="t-muted">__meta_kubernetes_pod_* labels</text>
+        <rect class="box2" x="310" y="30" width="240" height="80" rx="8"/>
+        <text x="430" y="54" text-anchor="middle" class="t-bold">2. relabel_configs</text>
+        <text x="430" y="74" text-anchor="middle" class="t-muted">keep / drop targets</text>
+        <text x="430" y="92" text-anchor="middle" class="t-muted">copy __meta_* → namespace, pod</text>
+        <rect class="box" x="600" y="30" width="240" height="80" rx="8"/>
+        <text x="720" y="54" text-anchor="middle" class="t-bold">3. Final target labels</text>
+        <text x="720" y="74" text-anchor="middle" class="t-muted">job, instance, namespace, pod</text>
+        <text x="720" y="92" text-anchor="middle" class="t-muted">__* labels are discarded</text>
+        <rect class="box" x="600" y="160" width="240" height="80" rx="8"/>
+        <text x="720" y="184" text-anchor="middle" class="t-bold">4. Scrape GET /metrics</text>
+        <text x="720" y="204" text-anchor="middle" class="t-muted">target labels attached</text>
+        <text x="720" y="222" text-anchor="middle" class="t-muted">to every sample</text>
+        <rect class="box2" x="310" y="160" width="240" height="80" rx="8"/>
+        <text x="430" y="184" text-anchor="middle" class="t-bold">5. metric_relabel_configs</text>
+        <text x="430" y="204" text-anchor="middle" class="t-muted">drop noisy metrics/labels</text>
+        <text x="430" y="222" text-anchor="middle" class="t-muted">(after scrape, per sample)</text>
+        <rect class="box4" x="20" y="160" width="240" height="80" rx="8"/>
+        <text x="140" y="190" text-anchor="middle" class="t-bold">6. TSDB</text>
+        <text x="140" y="210" text-anchor="middle" class="t-muted">only surviving series stored</text>
+        <line class="line" x1="260" y1="70" x2="308" y2="70" marker-end="url(#m07e)"/>
+        <line class="line" x1="550" y1="70" x2="598" y2="70" marker-end="url(#m07e)"/>
+        <line class="line" x1="720" y1="110" x2="720" y2="158" marker-end="url(#m07e)"/>
+        <line class="line" x1="600" y1="200" x2="552" y2="200" marker-end="url(#m07e)"/>
+        <line class="line" x1="310" y1="200" x2="262" y2="200" marker-end="url(#m07e)"/>
+      </svg>
+      <figcaption>Figure 8 — <code>relabel_configs</code> act on <em>targets</em> before scraping; <code>metric_relabel_configs</code> act on <em>scraped samples</em> before storage.</figcaption>
+    </figure>
+    <p>Relabel actions include <code>replace</code> (the default), <code>keep</code>, <code>drop</code>, <code>labelmap</code>, <code>labeldrop</code>, <code>labelkeep</code>, <code>hashmod</code> and <code>lowercase</code>; the default regex is <code>(.*)</code>. A <code>keep</code> rule that never matches silently removes every target — the first suspect when a job shows zero targets.</p>
+    <details class="q"><summary>Self-check: you want to stop storing <code>python_gc_*</code> series. relabel_configs or metric_relabel_configs?</summary><div class="a"><code>metric_relabel_configs</code>, with <code>source_labels: [__name__]</code>, <code>regex: 'python_gc_.*'</code>, <code>action: drop</code>. <code>relabel_configs</code> only see target metadata; they cannot see individual metric names because the scrape has not happened yet.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>9. kube-prometheus-stack and the ServiceMonitor</h2>
+    <p>Writing <code>prometheus.yml</code> by hand for a cluster is tedious and fragile. The <strong>kube-prometheus-stack</strong> Helm chart installs a complete monitoring stack: the <strong>Prometheus Operator</strong>, Prometheus, Alertmanager, Grafana, node-exporter and kube-state-metrics, plus default dashboards and alert rules for Kubernetes itself. The <strong>Prometheus Operator</strong> adds custom resources so that monitoring configuration becomes ordinary Kubernetes YAML that lives next to your app:</p>
+    <div class="table-wrap"><table>
+      <tr><th>CRD (monitoring.coreos.com)</th><th>Purpose</th><th>Used in this course</th></tr>
+      <tr><td><code>Prometheus</code></td><td>Declares a Prometheus deployment (replicas, retention, which monitors/rules to select)</td><td>Created by the chart</td></tr>
+      <tr><td><code>Alertmanager</code></td><td>Declares an Alertmanager deployment</td><td>Created by the chart</td></tr>
+      <tr><td><code>ServiceMonitor</code></td><td>Generates scrape config from a label selector over Services</td><td><strong>Yes — for reliability-api</strong></td></tr>
+      <tr><td><code>PodMonitor</code></td><td>Like ServiceMonitor but selects Pods directly, no Service needed</td><td>Alternative</td></tr>
+      <tr><td><code>PrometheusRule</code></td><td>Recording and alerting rules</td><td><strong>Yes — section 12</strong></td></tr>
+      <tr><td><code>AlertmanagerConfig</code></td><td>Routing/receivers fragments, namespaced</td><td>Optional</td></tr>
+      <tr><td><code>Probe</code>, <code>ScrapeConfig</code>, <code>PrometheusAgent</code>, <code>ThanosRuler</code></td><td>Black-box probes, raw scrape configs, agent mode, Thanos rule evaluation</td><td>No</td></tr>
+    </table></div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 880 420" role="img" aria-label="Helm installs the Prometheus Operator, which watches Prometheus, ServiceMonitor and PrometheusRule resources and renders configuration for the Prometheus server; Prometheus scrapes reliability-api Pods, node-exporter, kube-state-metrics and kubelet cAdvisor; Grafana queries Prometheus; Prometheus sends alerts to Alertmanager">
+        <defs><marker id="m07f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box" x="20" y="20" width="200" height="50" rx="8"/>
+        <text x="120" y="42" text-anchor="middle" class="t-bold">helm install monitoring</text>
+        <text x="120" y="60" text-anchor="middle" class="t-muted">namespace: monitoring</text>
+        <rect class="box3" x="260" y="20" width="200" height="50" rx="8"/>
+        <text x="360" y="50" text-anchor="middle" class="t-bold">Prometheus Operator</text>
+        <line class="line" x1="220" y1="45" x2="258" y2="45" marker-end="url(#m07f)"/>
+        <rect class="box" x="660" y="20" width="200" height="50" rx="8"/>
+        <text x="760" y="42" text-anchor="middle" class="t-bold">Grafana</text>
+        <text x="760" y="60" text-anchor="middle" class="t-muted">dashboards (port 80 → 3000)</text>
+        <rect class="box2" x="20" y="110" width="200" height="56" rx="8"/>
+        <text x="120" y="134" text-anchor="middle" class="t-bold">Prometheus (CR)</text>
+        <text x="120" y="152" text-anchor="middle" class="t-muted">selects release=monitoring</text>
+        <rect class="box2" x="260" y="110" width="200" height="56" rx="8"/>
+        <text x="360" y="134" text-anchor="middle" class="t-bold">ServiceMonitor</text>
+        <text x="360" y="152" text-anchor="middle" class="t-muted">reliability-api</text>
+        <rect class="box2" x="500" y="110" width="200" height="56" rx="8"/>
+        <text x="600" y="134" text-anchor="middle" class="t-bold">PrometheusRule</text>
+        <text x="600" y="152" text-anchor="middle" class="t-muted">reliability-api alerts</text>
+        <line class="line dash" x1="330" y1="70" x2="140" y2="108" marker-end="url(#m07f)"/>
+        <line class="line dash" x1="360" y1="70" x2="360" y2="108" marker-end="url(#m07f)"/>
+        <line class="line dash" x1="390" y1="70" x2="580" y2="108" marker-end="url(#m07f)"/>
+        <text x="474" y="80" class="t-muted">watches</text>
+        <rect class="box4" x="260" y="210" width="200" height="56" rx="8"/>
+        <text x="360" y="234" text-anchor="middle" class="t-bold">Prometheus server</text>
+        <text x="360" y="252" text-anchor="middle" class="t-muted">StatefulSet, :9090</text>
+        <line class="line" x1="360" y1="166" x2="360" y2="208" marker-end="url(#m07f)"/>
+        <text x="352" y="194" text-anchor="end" class="t-muted">operator renders config</text>
+        <rect class="box3" x="660" y="210" width="200" height="56" rx="8"/>
+        <text x="760" y="234" text-anchor="middle" class="t-bold">Alertmanager</text>
+        <text x="760" y="252" text-anchor="middle" class="t-muted">routes notifications</text>
+        <line class="line accent" x1="460" y1="246" x2="658" y2="246" marker-end="url(#m07f)"/>
+        <text x="560" y="262" text-anchor="middle" class="t-muted">alerts</text>
+        <path class="line accent" d="M760,70 L760,190 L440,190 L440,208" marker-end="url(#m07f)"/>
+        <text x="610" y="184" text-anchor="middle" class="t-muted">PromQL queries</text>
+        <rect class="box" x="20" y="330" width="200" height="56" rx="8"/>
+        <text x="120" y="354" text-anchor="middle" class="t-bold">reliability-api Pods</text>
+        <text x="120" y="372" text-anchor="middle" class="t-muted">via Service port “http”</text>
+        <rect class="box" x="240" y="330" width="190" height="56" rx="8"/>
+        <text x="335" y="354" text-anchor="middle" class="t-bold">node-exporter</text>
+        <text x="335" y="372" text-anchor="middle" class="t-muted">DaemonSet, node metrics</text>
+        <rect class="box" x="450" y="330" width="190" height="56" rx="8"/>
+        <text x="545" y="354" text-anchor="middle" class="t-bold">kube-state-metrics</text>
+        <text x="545" y="372" text-anchor="middle" class="t-muted">object state</text>
+        <rect class="box" x="660" y="330" width="200" height="56" rx="8"/>
+        <text x="760" y="354" text-anchor="middle" class="t-bold">kubelet / cAdvisor</text>
+        <text x="760" y="372" text-anchor="middle" class="t-muted">container CPU, memory</text>
+        <line class="line" x1="330" y1="266" x2="130" y2="328" marker-end="url(#m07f)"/>
+        <line class="line" x1="350" y1="266" x2="335" y2="328" marker-end="url(#m07f)"/>
+        <line class="line" x1="380" y1="266" x2="540" y2="328" marker-end="url(#m07f)"/>
+        <line class="line" x1="420" y1="266" x2="750" y2="328" marker-end="url(#m07f)"/>
+        <text x="110" y="300" class="t-muted">scrape (pull)</text>
+        <text x="440" y="410" text-anchor="middle" class="t-muted">The ServiceMonitor needs the label release: monitoring and must reference a named Service port.</text>
+      </svg>
+      <figcaption>Figure 9 — You never edit Prometheus config directly: you create CRs, and the operator renders and reloads the config.</figcaption>
+    </figure>
+
+    <h3>The two selectors that must both match</h3>
+    <ol>
+      <li><strong>Prometheus → ServiceMonitor.</strong> The <code>Prometheus</code> CR has <code>serviceMonitorSelector</code> and <code>serviceMonitorNamespaceSelector</code>. In kube-prometheus-stack, <code>prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues</code> defaults to <code>true</code>, which renders <code>serviceMonitorSelector: {matchLabels: {release: "&lt;release name&gt;"}}</code>. With release name <code>monitoring</code>, <strong>your ServiceMonitor needs the label <code>release: monitoring</code></strong>. The namespace selector defaults to <code>{}</code> (all namespaces). Setting the NilUsesHelmValues value to <code>false</code> makes Prometheus select all ServiceMonitors. The same pattern applies to <code>PrometheusRule</code> (<code>ruleSelectorNilUsesHelmValues</code>).</li>
+      <li><strong>ServiceMonitor → Service.</strong> <code>spec.selector</code> matches the <em>Service’s own labels</em> (metadata.labels), not the Pod labels; <code>endpoints[].port</code> refers to a <strong>named Service port</strong>, not a number. Prometheus then scrapes each ready endpoint (Pod IP and target port) behind that Service.</li>
+    </ol>
+<pre data-title="deploy/kubernetes/service.yaml — the port must have a name"><code>apiVersion: v1
+kind: Service
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+  labels:
+    app.kubernetes.io/name: reliability-api     <span class="c"># ServiceMonitor selects on THIS label</span>
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: reliability-api
+  ports:
+    - name: http                                 <span class="c"># ServiceMonitor endpoints[].port refers to this name</span>
+      port: 80
+      targetPort: 8000</code></pre>
+<pre data-title="deploy/monitoring/servicemonitor.yaml"><code>apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+  labels:
+    release: monitoring                          <span class="c"># matched by the Prometheus CR's serviceMonitorSelector</span>
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reliability-api
+  namespaceSelector:
+    matchNames: [reliability-lab]
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s</code></pre>
+    <p>A shorter <code>interval</code> (15 s instead of the operator default of 30 s) gives smoother graphs during short load tests, at the cost of twice the samples. Remember to make your PromQL windows at least four intervals long.</p>
+
+    <section class="lab"><header>Lab 2 — Install kube-prometheus-stack and get reliability-api scraped</header><div class="body">
+      <p>Prerequisites: the <code>reliability-lab</code> kind cluster from Module 06 with <code>reliability-api</code> deployed in namespace <code>reliability-lab</code>. The stack runs several components; give Docker Desktop at least ~4 GB of memory.</p>
+      <ol class="steps">
+        <li>Install the chart:
+<pre><code>helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace
+kubectl -n monitoring get pods</code></pre>
+<pre data-title="Example output (yours will differ in names/IDs/timings)"><code><span class="o">NAME                                                     READY   STATUS    RESTARTS   AGE
+alertmanager-monitoring-kube-prometheus-alertmanager-0   2/2     Running   0          2m
+monitoring-grafana-6c9f7d8b5c-x2k4p                      3/3     Running   0          2m
+monitoring-kube-prometheus-operator-7d4f9c6b8d-q8wzt     1/1     Running   0          2m
+monitoring-kube-state-metrics-5f8b6d9c7f-lm2vn           1/1     Running   0          2m
+monitoring-prometheus-node-exporter-8xk2d                1/1     Running   0          2m
+prometheus-monitoring-kube-prometheus-prometheus-0       2/2     Running   0          2m</span></code></pre></li>
+        <li>Confirm the selector the chart rendered (this is the source of truth, not a blog post):
+<pre><code>kubectl -n monitoring get prometheus -o jsonpath='{.items[0].spec.serviceMonitorSelector}'; echo</code></pre>
+<pre data-title="Example output"><code><span class="o">{"matchLabels":{"release":"monitoring"}}</span></code></pre></li>
+        <li>Apply the named-port Service and the ServiceMonitor from above, then check they exist:
+<pre><code>kubectl apply -f deploy/kubernetes/service.yaml -f deploy/monitoring/servicemonitor.yaml
+kubectl -n reliability-lab get servicemonitor,svc --show-labels</code></pre></li>
+        <li>Open the Prometheus UI. List services first so you use the real name:
+<pre><code>kubectl -n monitoring get svc
+kubectl -n monitoring port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090</code></pre>
+          Browse to <code>http://localhost:9090</code> → Status → Targets. Within about a minute you should see a target group named like <code>serviceMonitor/reliability-lab/reliability-api/0</code> with two endpoints in state UP.</li>
+        <li>Query <code>up{namespace="reliability-lab"}</code> and <code>sum(rate(http_requests_total[1m]))</code>. Generate a few requests with the port-forward from Lab 1 and watch the second query move.</li>
+      </ol>
+      <p><strong>If the target never appears</strong>, work down this list:</p>
+      <div class="table-wrap"><table>
+        <tr><th>Check</th><th>Command</th><th>Typical cause</th></tr>
+        <tr><td>ServiceMonitor has <code>release: monitoring</code></td><td><code>kubectl -n reliability-lab get servicemonitor reliability-api --show-labels</code></td><td>Label missing or wrong release name</td></tr>
+        <tr><td>Service carries the label the ServiceMonitor selects</td><td><code>kubectl -n reliability-lab get svc reliability-api --show-labels</code></td><td>Label only on Pods, not on Service</td></tr>
+        <tr><td>Port is named and the name matches</td><td><code>kubectl -n reliability-lab get svc reliability-api -o yaml | grep -A3 ports</code></td><td><code>port: http</code> vs unnamed port</td></tr>
+        <tr><td>Service has ready endpoints</td><td><code>kubectl -n reliability-lab get endpointslices -l kubernetes.io/service-name=reliability-api</code></td><td>Pods not Ready; selector mismatch</td></tr>
+        <tr><td>Operator accepted the config</td><td><code>kubectl -n monitoring logs deploy/monitoring-kube-prometheus-operator | tail</code></td><td>Invalid field, RBAC, namespace selector</td></tr>
+        <tr><td>Target appears but DOWN</td><td>Prometheus UI → Targets → error text</td><td>Wrong path, app not listening on 0.0.0.0, NetworkPolicy</td></tr>
+      </table></div>
+      <p><strong>Cleanup note:</strong> <code>helm uninstall monitoring -n monitoring</code> does not remove the CRDs the chart created; the chart README says to delete them manually with <code>kubectl delete crd …</code> if you want a clean cluster.</p>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>10. Where Kubernetes metrics come from</h2>
+    <p>Beginners expect “Kubernetes metrics” to be one thing. They come from at least four different producers, each answering different questions. Mixing them up is the root of many wrong dashboards.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Source</th><th>What it measures</th><th>How it gets them</th><th>Example series</th><th>Answers</th></tr>
+      <tr><td><strong>kube-state-metrics</strong></td><td><em>State</em> of API objects (desired vs actual)</td><td>Listens to the API server; generates metrics from a snapshot of object state</td><td><code>kube_deployment_spec_replicas</code>, <code>kube_deployment_status_replicas_available</code>, <code>kube_pod_container_status_restarts_total</code>, <code>kube_pod_status_ready</code>, <code>kube_horizontalpodautoscaler_status_desired_replicas</code></td><td>How many replicas are wanted/ready? Is a rollout stuck? How often do containers restart?</td></tr>
+      <tr><td><strong>kubelet cAdvisor endpoint</strong> (<code>/metrics/cadvisor</code>)</td><td>Actual container resource <em>usage</em></td><td>Built into the kubelet on every node</td><td><code>container_cpu_usage_seconds_total</code>, <code>container_memory_working_set_bytes</code>, <code>container_cpu_cfs_throttled_periods_total</code></td><td>How much CPU/memory does each Pod use? Is it throttled?</td></tr>
+      <tr><td><strong>node-exporter</strong></td><td>Host OS and hardware</td><td>DaemonSet reading kernel stats, port 9100</td><td><code>node_cpu_seconds_total</code>, <code>node_filesystem_avail_bytes</code>, <code>node_network_receive_bytes_total</code></td><td>Is the node itself saturated or out of disk?</td></tr>
+      <tr><td><strong>Control-plane components</strong></td><td>API server, scheduler, controller-manager, kube-proxy, kubelet internals</td><td>Each exposes <code>/metrics</code> in Prometheus format</td><td>request latencies, queue depths</td><td>Is the cluster itself healthy?</td></tr>
+      <tr><td><strong>metrics-server</strong> (Module 08)</td><td>Latest CPU/memory per Pod/node only</td><td>Scrapes kubelets; serves the <code>metrics.k8s.io</code> API</td><td>— (not Prometheus)</td><td>Feeds HPA, VPA and <code>kubectl top</code>. Its README says it is meant only for autoscaling, not monitoring</td></tr>
+    </table></div>
+    <div class="callout note"><span class="label">Rule of thumb</span>Desired/ready/restarts → kube-state-metrics. Usage → cAdvisor. Node health → node-exporter. HPA input → metrics-server. Your own request metrics → your app’s <code>/metrics</code>.</div>
+
+    <!-- ============================================================ -->
+    <h2>11. Grafana: dashboards that answer questions</h2>
+    <p><strong>Grafana</strong> visualises data from data sources such as Prometheus. It stores no metrics itself: each panel runs a query against a data source when you view it. kube-prometheus-stack provisions the Prometheus data source and a set of Kubernetes dashboards for you. For your own setups, a data source can be provisioned from a YAML file (version-controlled, reproducible):</p>
+<pre data-title="provisioning/datasources/prometheus.yaml (for a standalone Grafana)"><code>apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://localhost:9090</code></pre>
+    <h3>Panel anatomy</h3>
+    <ul>
+      <li><strong>Query editor:</strong> <em>Builder</em> mode (visual) or <em>Code</em> mode (raw PromQL with autocomplete).</li>
+      <li><strong>Legend:</strong> Auto, Verbose, or Custom using label templates such as <code>{{pod}}</code>.</li>
+      <li><strong>Format:</strong> Time series (default), Table or Heatmap. <strong>Type:</strong> Range (a line over time), Instant (one current value — for stat/gauge panels) or Both.</li>
+      <li><strong>Visualization:</strong> Time series (default), Stat, Gauge, Bar gauge, Table, Heatmap, State timeline, and more.</li>
+      <li><strong>Unit:</strong> set it (requests/sec, seconds, bytes, percent 0.0–1.0). A dashboard without units invites misreading by 1000×.</li>
+    </ul>
+
+    <h3>The eight panels for reliability-api</h3>
+    <div class="table-wrap"><table>
+      <tr><th>#</th><th>Panel (question)</th><th>PromQL</th><th>Viz / unit</th></tr>
+      <tr><td>1</td><td>Request rate — how much traffic is served?</td><td><code>sum(rate(http_requests_total{namespace="reliability-lab", path="/work"}[$__rate_interval]))</code><br>per Pod: <code>sum by (pod) (…)</code>, legend <code>{{pod}}</code></td><td>Time series, req/s</td></tr>
+      <tr><td>2</td><td>Error rate — what fraction fails (and how many)?</td><td>ratio: <code>(sum(rate(http_requests_total{path="/work",status=~"5.."}[$__rate_interval])) or vector(0)) / sum(rate(http_requests_total{path="/work"}[$__rate_interval]))</code><br>count/s: <code>sum(rate(http_requests_total{status=~"5.."}[$__rate_interval]))</code></td><td>Time series, percent (0–1) + req/s</td></tr>
+      <tr><td>3</td><td>Latency p50 / p95 / p99</td><td><code>histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{path="/work"}[$__rate_interval])))</code> — three queries with 0.5, 0.95, 0.99</td><td>Time series, seconds</td></tr>
+      <tr><td>4</td><td>CPU and memory per replica</td><td>CPU: <code>sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="reliability-lab", container="reliability-api"}[$__rate_interval]))</code><br>Memory: <code>sum by (pod) (container_memory_working_set_bytes{namespace="reliability-lab", container="reliability-api"})</code></td><td>Time series, cores / bytes; add a threshold line at the 0.1-core request and 256 Mi limit</td></tr>
+      <tr><td>5</td><td>Desired, ready, available replicas</td><td><code>kube_deployment_spec_replicas{namespace="reliability-lab", deployment="reliability-api"}</code><br><code>kube_deployment_status_replicas_ready{…}</code><br><code>kube_deployment_status_replicas_available{…}</code><br><code>kube_horizontalpodautoscaler_status_desired_replicas{namespace="reliability-lab"}</code></td><td>Time series (stepped), count</td></tr>
+      <tr><td>6</td><td>Restarts and rollout state</td><td><code>sum by (pod) (increase(kube_pod_container_status_restarts_total{namespace="reliability-lab"}[1h]))</code><br><code>kube_deployment_status_replicas_updated{deployment="reliability-api"}</code> vs <code>kube_deployment_spec_replicas{…}</code></td><td>Table or bar gauge; stat</td></tr>
+      <tr><td>7</td><td>Load-generator concurrency / offered rate</td><td>From k6 via remote write (Module 08): <code>k6_vus</code>, <code>sum(rate(k6_http_reqs_total[$__rate_interval]))</code></td><td>Time series, VUs / req/s</td></tr>
+      <tr><td>8</td><td>Experiment markers</td><td>Annotations created via the Grafana HTTP API or Ctrl/Cmd-click on a panel</td><td>Vertical markers on time series panels</td></tr>
+    </table></div>
+    <div class="callout warn"><span class="label">Served is not offered</span>Panel 1 counts requests the app <em>completed</em>. If Pods are saturated, requests queue or time out and never increment the counter — panel 1 flattens while the load generator is trying to send more. Panel 7 (what the load generator attempted) next to panel 1 (what was served) makes saturation visible. That is why the guide lists both.</div>
+
+    <h3>Experiment annotations</h3>
+    <p>Grafana annotations put a vertical marker (or a region) on time series panels. Add them by Ctrl/Cmd-clicking a panel (the dashboard must be saved), via an annotation query against a data source, or via the HTTP API — the scriptable option for experiments:</p>
+<pre><code><span class="c"># run while port-forwarding Grafana to localhost:3000</span>
+GRAFANA_PW=$(kubectl -n monitoring get secret monitoring-grafana -o jsonpath="{.data.admin-password}" | base64 -d)
+NOW_MS=$(( $(date +%s) * 1000 ))
+curl -s -u "admin:${GRAFANA_PW}" -H 'Content-Type: application/json' \
+  -X POST http://localhost:3000/api/annotations \
+  -d "{\"dashboardUID\":\"&lt;your-dashboard-uid&gt;\",\"time\":${NOW_MS},\"tags\":[\"experiment\",\"load-start\"],\"text\":\"k6 baseline 10 VUs start\"}"</code></pre>
+    <p><code>time</code> and the optional <code>timeEnd</code> (for a region) are epoch milliseconds. Find the dashboard UID in the dashboard URL (<code>/d/&lt;uid&gt;/…</code>).</p>
+
+    <section class="lab"><header>Lab 3 — Build the dashboard, generate a known load, explain each panel</header><div class="body">
+      <ol class="steps">
+        <li>Port-forward Grafana and log in as <code>admin</code> with the password from the secret:
+<pre><code>kubectl -n monitoring port-forward svc/monitoring-grafana 3000:80
+kubectl -n monitoring get secret monitoring-grafana -o jsonpath="{.data.admin-password}" | base64 -d; echo</code></pre></li>
+        <li>Create a dashboard “reliability-api” with panels 1, 3, 4 and 5 from the table. Set units. Save it.</li>
+        <li>Predict before you generate load. One closed-loop client calling <code>/work?ms=50</code> back-to-back can complete at most about 1 / 0.05 s = 20 requests/s, minus network overhead. CPU used ≈ requests/s × 0.05 s ≈ up to ~1 core <em>in total</em> across the Pods that serve it. Write those predictions down.</li>
+        <li>Generate the load from inside the cluster for five minutes:
+<pre><code>kubectl -n reliability-lab run load --rm -it --image=busybox --restart=Never -- \
+  /bin/sh -c "while true; do wget -q -O- 'http://reliability-api/work?ms=50' &gt; /dev/null; done"</code></pre>
+          Add an annotation when you start and when you press Ctrl+C.</li>
+        <li>Compare: request rate (panel 1) against your prediction; per-Pod split (does the Service balance?); p95 latency (between 0.05 and 0.075 s with default buckets — why can it not be more precise?); per-Pod CPU against the 100m request (likely several hundred percent of request — you will meet this number again as HPA utilization in Module 08).</li>
+      </ol>
+      <p><strong>Evidence to keep:</strong> exported dashboard JSON (Dashboard settings → JSON Model) and a short paragraph per panel: what it showed, the predicted value, and any difference you cannot yet explain (mark it as unexplained, not guessed).</p>
+    </div></section>
+
+    <details class="q"><summary>Self-check: panel 3 shows p99 = exactly 10 s for a few minutes, then drops. What does this tell you?</summary><div class="a">With the default buckets the largest finite bound is 10 s. If the 99th-percentile rank falls in the <code>+Inf</code> bucket, <code>histogram_quantile</code> returns the upper bound of the second-highest bucket — 10 s. So the true p99 was <em>at least</em> 10 s (requests slower than the largest bucket), not exactly 10 s. Check for timeouts or a stall, and consider whether your buckets cover the range you care about.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>12. Alerting: rules and Alertmanager</h2>
+    <p>An <strong>alerting rule</strong> is a PromQL expression that Prometheus evaluates on every rule evaluation; every series the expression returns becomes an active alert. Prometheus then forwards active alerts to <strong>Alertmanager</strong>, which decides who gets notified, how alerts are bundled, and what is suppressed. Prometheus itself never sends a notification.</p>
+
+    <h3>Alert lifecycle and the <code>for</code> clause</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 240" role="img" aria-label="Timeline: a short spike above the threshold only reaches pending and returns to inactive; a sustained breach stays pending for the for duration, then fires, then resolves when the condition clears">
+        <line class="line" x1="60" y1="100" x2="820" y2="100"/>
+        <line class="line bad dash" x1="60" y1="58" x2="820" y2="58"/>
+        <text x="816" y="52" text-anchor="end" class="t-muted">threshold</text>
+        <polyline class="line accent" points="60,88 212,88 212,40 288,40 288,88 402,88 402,36 706,36 706,88 820,88"/>
+        <text x="60" y="28" class="t-bold">expr value (e.g. error ratio)</text>
+        <rect class="box" x="60" y="130" width="152" height="34"/><text x="136" y="152" text-anchor="middle" class="t-muted">inactive</text>
+        <rect class="box3" x="212" y="130" width="76" height="34"/><text x="250" y="152" text-anchor="middle" class="t-muted">pending</text>
+        <rect class="box" x="288" y="130" width="114" height="34"/><text x="345" y="152" text-anchor="middle" class="t-muted">inactive</text>
+        <rect class="box3" x="402" y="130" width="190" height="34"/><text x="497" y="152" text-anchor="middle">pending</text>
+        <rect class="box2" x="592" y="130" width="114" height="34"/><text x="649" y="152" text-anchor="middle" class="t-bold">FIRING</text>
+        <circle class="dot-bad" cx="602" cy="147" r="4"/>
+        <rect class="box" x="706" y="130" width="114" height="34"/><text x="763" y="152" text-anchor="middle" class="t-muted">resolved</text>
+        <line class="line" x1="402" y1="182" x2="592" y2="182"/><line class="line" x1="402" y1="176" x2="402" y2="188"/><line class="line" x1="592" y1="176" x2="592" y2="188"/>
+        <text x="497" y="202" text-anchor="middle" class="t-bold">for: 5m</text>
+        <text x="250" y="186" text-anchor="middle" class="t-muted">2-min blip:</text>
+        <text x="250" y="202" text-anchor="middle" class="t-muted">never fires</text>
+        <text x="60" y="230" class="t-muted">0 min</text><text x="420" y="230" class="t-muted">10 min</text><text x="790" y="230" class="t-muted">20 min</text>
+      </svg>
+      <figcaption>Figure 10 — <code>for</code> trades detection speed for fewer false alarms. <code>keep_firing_for</code> (optional) keeps an alert firing for a while after the condition clears, to prevent flapping.</figcaption>
+    </figure>
+    <ul>
+      <li><strong>Pending:</strong> the expression returned this series, but not yet continuously for the <code>for</code> duration.</li>
+      <li><strong>Firing:</strong> it has been true for at least <code>for</code>; sent to Alertmanager. Prometheus also exposes a synthetic <code>ALERTS</code> series (value 1) for pending and firing alerts, which you can graph.</li>
+      <li><strong>Labels</strong> identify and route the alert (e.g. <code>severity</code>); <strong>annotations</strong> carry human text (summary, description, runbook link). Both can use templates: <code>{{ $labels.pod }}</code> and <code>{{ $value }}</code>.</li>
+    </ul>
+
+    <h3>Alert rules for reliability-api</h3>
+<pre data-title="deploy/monitoring/prometheusrule.yaml"><code>apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+  labels:
+    release: monitoring                       <span class="c"># selected by the chart's ruleSelector</span>
+spec:
+  groups:
+    - name: reliability-api.alerts
+      rules:
+        - alert: ReliabilityApiNoHealthyTargets
+          expr: absent(up{namespace="reliability-lab"} == 1)
+          for: 2m
+          labels:
+            severity: page
+          annotations:
+            summary: "No reliability-api target has been scrapable for 2 minutes"
+            runbook_url: "https://github.com/&lt;you&gt;/kubernetes-reliability-lab/blob/main/docs/runbook.md#no-targets"
+
+        - alert: ReliabilityApiHighErrorRatio
+          expr: |
+            sum(rate(http_requests_total{namespace="reliability-lab", path="/work", status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{namespace="reliability-lab", path="/work"}[5m]))
+            &gt; 0.05
+          for: 5m
+          labels:
+            severity: page
+          annotations:
+            summary: "reliability-api /work error ratio above 5%"
+            description: "Current error ratio is {{ $value }} (0-1 scale)."
+
+        - alert: ReliabilityApiSlowP95
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (rate(http_request_duration_seconds_bucket{namespace="reliability-lab", path="/work"}[5m])))
+            &gt; 0.25
+          for: 10m
+          labels:
+            severity: ticket
+          annotations:
+            summary: "reliability-api /work p95 latency above 250 ms for 10 minutes"
+
+        - alert: ReliabilityApiContainerRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="reliability-lab"}[15m]) &gt; 2
+          labels:
+            severity: ticket
+          annotations:
+            summary: "Pod {{ $labels.pod }} restarted more than twice in 15 minutes"</code></pre>
+    <p>Note which alerts page and which do not. A restarting container is a <em>cause</em>; if users are unaffected (the Service routed around it), it is a ticket. A high error ratio is a <em>symptom</em> users feel; it pages. The Prometheus alerting guide summarises: keep alerting simple, alert on symptoms, have good dashboards to pinpoint causes, and avoid pages where there is nothing to do. For online-serving systems, alert on high latency and error rates as high up in the stack as possible.</p>
+
+    <h3>Alertmanager: routing, grouping, inhibition, silences</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Alertmanager routing tree: root route groups by alertname and namespace; child routes send severity page to the pager and severity ticket to chat; an inhibition rule mutes ticket alerts while the no-targets alert fires">
+        <defs><marker id="m07g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="280" y="16" width="300" height="74" rx="8"/>
+        <text x="430" y="38" text-anchor="middle" class="t-bold">route (root)</text>
+        <text x="430" y="58" text-anchor="middle" class="t-mono" style="font-size:11px">group_by: [alertname, namespace]</text>
+        <text x="430" y="78" text-anchor="middle" class="t-muted">default receiver: team-chat</text>
+        <rect class="box3" x="60" y="140" width="300" height="74" rx="8"/>
+        <text x="210" y="162" text-anchor="middle" class="t-bold">child route</text>
+        <text x="210" y="182" text-anchor="middle" class="t-mono" style="font-size:11px">matchers: severity="page"</text>
+        <text x="210" y="202" text-anchor="middle" class="t-muted">receiver: oncall-pager</text>
+        <rect class="box" x="500" y="140" width="300" height="74" rx="8"/>
+        <text x="650" y="162" text-anchor="middle" class="t-bold">child route</text>
+        <text x="650" y="182" text-anchor="middle" class="t-mono" style="font-size:11px">matchers: severity="ticket"</text>
+        <text x="650" y="202" text-anchor="middle" class="t-muted">receiver: team-chat</text>
+        <line class="line" x1="380" y1="90" x2="230" y2="138" marker-end="url(#m07g)"/>
+        <line class="line" x1="480" y1="90" x2="630" y2="138" marker-end="url(#m07g)"/>
+        <rect class="zone" x="60" y="240" width="740" height="46" rx="8"/>
+        <text x="430" y="260" text-anchor="middle" class="t-bold">inhibit_rule: while ReliabilityApiNoHealthyTargets fires,</text>
+        <text x="430" y="278" text-anchor="middle" class="t-muted">mute severity="ticket" ReliabilityApi* alerts with an equal namespace label</text>
+        <path class="line bad dash" d="M300,214 C320,232 560,232 600,216" marker-end="url(#m07g)"/>
+      </svg>
+      <figcaption>Figure 11 — Alerts enter at the root, descend to the first matching child (unless <code>continue: true</code>), and are grouped before notification.</figcaption>
+    </figure>
+<pre data-title="alertmanager.yaml (via chart value alertmanager.config or an AlertmanagerConfig CR)"><code>route:
+  receiver: team-chat
+  group_by: [alertname, namespace]
+  group_wait: 30s          <span class="c"># default 30s: wait to batch the first notification of a new group</span>
+  group_interval: 5m       <span class="c"># default 5m: wait before notifying about new alerts in an existing group</span>
+  repeat_interval: 4h      <span class="c"># default 4h: re-send if still firing</span>
+  routes:
+    - matchers:
+        - severity="page"
+      receiver: oncall-pager
+    - matchers:
+        - severity="ticket"
+      receiver: team-chat
+inhibit_rules:
+  - source_matchers:
+      - alertname="ReliabilityApiNoHealthyTargets"
+    target_matchers:
+      - severity="ticket"
+    equal: [namespace]
+receivers:
+  - name: team-chat        <span class="c"># add webhook_configs / email_configs etc. here</span>
+  - name: oncall-pager</code></pre>
+    <div class="table-wrap"><table>
+      <tr><th>Concept</th><th>What it does</th><th>reliability-api example</th></tr>
+      <tr><td><strong>Grouping</strong></td><td>Bundles alerts of similar nature into one notification</td><td>Six Pods all restarting → one message, not six</td></tr>
+      <tr><td><strong>Inhibition</strong></td><td>Suppresses notifications for some alerts while certain other alerts fire</td><td>When no target is up, do not also send “slow p95” tickets</td></tr>
+      <tr><td><strong>Silences</strong></td><td>Mute matching alerts for a time window (UI or API)</td><td>Silence <code>namespace="reliability-lab"</code> during a planned failure experiment</td></tr>
+      <tr><td><strong>High availability</strong></td><td>Alertmanager instances can form a cluster; point Prometheus at <em>all</em> instances, do not load-balance between them</td><td>Not needed in kind</td></tr>
+    </table></div>
+    <details class="q"><summary>Self-check: your failure experiment deletes a Pod and you get paged for “ContainerRestarting”. What two changes would you make?</summary><div class="a">(1) Before planned experiments, create a silence for the lab namespace with an expiry, so expected alerts do not notify. (2) Re-evaluate whether the alert should page at all: a single replacement Pod is a cause, not a symptom; demote it to a ticket and rely on the error-ratio alert to page only if users are affected.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>13. SLIs, SLOs, SLAs and error budgets</h2>
+    <div class="grid">
+      <div class="card"><h4>SLI — indicator</h4><p>A carefully defined quantitative measure of some aspect of the service. Best expressed as <strong>good events ÷ valid events</strong>, giving 0–100 %.</p></div>
+      <div class="card"><h4>SLO — objective</h4><p>A target value or range for an SLI, over a window: “≥ 99 % of <code>/work</code> requests succeed during the 30-min test.”</p></div>
+      <div class="card"><h4>SLA — agreement</h4><p>An explicit or implicit contract with consequences for missing the SLOs it contains. No consequence? It is almost certainly an SLO.</p></div>
+    </div>
+    <div class="callout warn"><span class="label">Portfolio honesty</span>Your lab has no customers and no contract. Call your targets <strong>test SLOs</strong>. Never call them an SLA.</div>
+
+    <h3>Specification vs implementation</h3>
+    <p>The SRE workbook distinguishes the <strong>SLI specification</strong> (what matters to users, independent of tooling: “<code>/work</code> requests complete successfully within 100 ms”) from the <strong>SLI implementation</strong> (how you actually measure it — server metrics, load-balancer logs, client-side measurements — each with different coverage). For <code>reliability-api</code>:</p>
+    <div class="table-wrap"><table>
+      <tr><th>SLI spec</th><th>Implementation A (server, Prometheus)</th><th>Implementation B (client, k6)</th><th>Blind spot</th></tr>
+      <tr><td>Availability: proportion of valid <code>/work</code> requests that succeed</td><td><code>1 − error ratio</code> from <code>http_requests_total</code> (needs the middleware extension to see 5xx)</td><td><code>1 − http_req_failed</code></td><td>Server side misses requests that never reached a Pod (no ready endpoint, connection refused)</td></tr>
+      <tr><td>Latency: proportion of <code>/work</code> requests served within 100 ms</td><td><code>bucket{le="0.1"} / _count</code> (exact if the bucket exists)</td><td><code>http_req_duration</code> threshold <code>p(95)&lt;100</code></td><td>Server timer excludes network and queueing before the handler runs</td></tr>
+    </table></div>
+
+    <h3>Error budget</h3>
+    <p>The <strong>error budget</strong> is 100 % − SLO: the amount of unreliability you are allowed in the window. The workbook’s example: a 99.9 % SLO over four weeks with 3 million requests allows about 3,000 errors; one incident with 1,500 errors spends 50 % of the budget. An <strong>error budget policy</strong> is the documented agreement on what happens when it runs out (e.g. pause feature releases and prioritise reliability work).</p>
+
+    <div class="widget" id="eb-widget">
+      <div class="w-title">Error budget and burn-rate calculator</div>
+      <div class="w-sub">Change the SLO, window and traffic; enter an observed error ratio to see the burn rate and time to exhaustion.</div>
+      <div class="grid2">
+        <label>SLO (%) <input type="number" id="eb-slo" value="99.9" step="0.01" min="50" max="99.999"></label>
+        <label>Window (days) <input type="number" id="eb-days" value="30" min="1" max="365"></label>
+        <label>Requests per day <input type="number" id="eb-rpd" value="100000" min="1"></label>
+        <label>Observed error ratio (%) <input type="number" id="eb-err" value="0.6" step="0.01" min="0" max="100"></label>
+      </div>
+      <div class="kv" id="eb-kv"></div>
+      <div class="out" id="eb-text"></div>
+    </div>
+
+    <h3>Burn rate and multi-window alerts</h3>
+    <p><strong>Burn rate</strong> is how fast, relative to the SLO, the service consumes its error budget. Burn rate 1 means a constant error ratio exactly equal to the budget (1 − SLO): the budget runs out exactly at the end of the window. The alert threshold for a given burn rate is <code>burn rate × (1 − SLO)</code>.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 270" role="img" aria-label="Remaining error budget over a 30 day window for burn rates of 1, 6 and 14.4: burn rate 1 reaches zero at day 30, 6 at day 5, 14.4 at about day 2">
+        <line class="line" x1="60" y1="220" x2="820" y2="220"/><line class="line" x1="60" y1="40" x2="60" y2="220"/>
+        <text x="54" y="44" text-anchor="end" class="t-muted">100%</text><text x="54" y="224" text-anchor="end" class="t-muted">0%</text>
+        <text x="60" y="240" class="t-muted">day 0</text><text x="790" y="240" class="t-muted">day 30</text>
+        <text x="174" y="240" class="t-muted">day 5</text>
+        <line class="line" x1="60" y1="40" x2="820" y2="220"/>
+        <line class="line accent" x1="60" y1="40" x2="186.7" y2="220"/>
+        <line class="line bad" x1="60" y1="40" x2="112.8" y2="220"/>
+        <text x="520" y="120" class="t-bold">burn 1 → exhausted at day 30</text>
+        <text x="200" y="180" class="t-bold">burn 6 → day 5</text>
+        <text x="120" y="110" class="t-bold">burn 14.4 → ≈ 2.1 days</text>
+        <text x="60" y="262" class="t-muted">remaining budget, 30-day window; the steeper the line, the sooner someone must act</text>
+      </svg>
+      <figcaption>Figure 12 — The same error budget consumed at different burn rates.</figcaption>
+    </figure>
+    <p>The workbook recommends <strong>multiwindow, multi-burn-rate</strong> alerts: alert only when both a long window and a short window (1/12 of the long one) exceed the burn-rate threshold. The long window proves the burn is significant; the short window proves it is still happening, so the alert resets quickly after a fix.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Severity</th><th>Long window</th><th>Short window</th><th>Burn rate</th><th>Budget consumed when it fires (30-day SLO)</th></tr>
+      <tr><td>Page</td><td>1 h</td><td>5 min</td><td>14.4</td><td>2 %</td></tr>
+      <tr><td>Page</td><td>6 h</td><td>30 min</td><td>6</td><td>5 %</td></tr>
+      <tr><td>Ticket</td><td>3 days</td><td>6 h</td><td>1</td><td>10 %</td></tr>
+    </table></div>
+<pre data-title="fast-burn page for a 99.9% availability SLO on /work"><code>(
+  sum(rate(http_requests_total{path="/work", status=~"5.."}[1h]))
+  / sum(rate(http_requests_total{path="/work"}[1h]))
+  &gt; (14.4 * 0.001)
+)
+and
+(
+  sum(rate(http_requests_total{path="/work", status=~"5.."}[5m]))
+  / sum(rate(http_requests_total{path="/work"}[5m]))
+  &gt; (14.4 * 0.001)
+)</code></pre>
+    <div class="callout note"><span class="label">Scale to your lab</span>Burn-rate alerting assumes a service running for weeks. For a 30-minute load test, simply compute the SLI over the test window at the end and compare it to the test SLO (Module 08’s report template does this). Learn burn rates because interviewers and production teams use them, not because your kind cluster needs them.</div>
+
+    <details class="q"><summary>Self-check: a 99.5 % SLO over 28 days. What error ratio corresponds to burn rate 6, and how long until the budget is gone at that rate?</summary><div class="a">Budget = 0.5 % = 0.005. Threshold = 6 × 0.005 = 3 % errors. Time to exhaustion = 28 days ÷ 6 ≈ 4.7 days. Check it in the calculator above.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>14. Logs and traces: the other two pillars</h2>
+    <h3>Structured logs</h3>
+    <p>Kubernetes expects containers to write logs to <strong>stdout/stderr</strong>. The container runtime captures them; the kubelet rotates them (defaults: <code>containerLogMaxSize</code> 10Mi, <code>containerLogMaxFiles</code> 5), and <code>kubectl logs</code> returns only the latest file. When a Pod is evicted or a node dies, its node-level logs are gone — durable logs need a cluster-level architecture (a node logging agent, a sidecar, or the app shipping directly to a backend).</p>
+    <p>The canonical app logs plain text (<code>%(asctime)s %(levelname)s %(message)s</code>). Plain text is fine for humans, but a log backend can only filter and aggregate fields it can parse. <strong>Structured</strong> (JSON) logs make every field queryable:</p>
+<pre data-title="optional: JSON formatter using only the standard library"><code>import json, logging
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        payload = {
+            "ts": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        payload.update(getattr(record, "fields", {}))   <span class="c"># structured extras</span>
+        return json.dumps(payload)
+
+handler = logging.StreamHandler()                        <span class="c"># stdout/stderr → kubelet</span>
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=LOG_LEVEL, handlers=[handler])
+
+log.info("work done", extra={"fields": {"path": "/work", "worked_ms": 50.3}})</code></pre>
+<pre data-title="Example output"><code><span class="o">{"ts": "2026-10-29 14:02:11,512", "level": "INFO", "logger": "reliability-api", "msg": "work done", "path": "/work", "worked_ms": 50.3}</span></code></pre>
+    <p>Do not log every <code>/work</code> request at INFO during load tests — at 100 requests/s that is 8.6 million lines a day per Pod. Log errors, state changes (ready/not ready, shutdown) and samples. Never log secrets or full request bodies.</p>
+<pre data-title="kubectl logs you will use constantly"><code>kubectl -n reliability-lab logs deploy/reliability-api               <span class="c"># one Pod of the Deployment</span>
+kubectl -n reliability-lab logs -l app.kubernetes.io/name=reliability-api --prefix --tail=20
+kubectl -n reliability-lab logs &lt;pod&gt; --previous                     <span class="c"># the crashed container before restart</span>
+kubectl -n reliability-lab logs &lt;pod&gt; --since=10m -f                <span class="c"># follow recent logs</span></code></pre>
+
+    <h3>Traces and OpenTelemetry</h3>
+    <p>A <strong>trace</strong> is the path of a request through your application. It is built from <strong>spans</strong>: units of work with a start time, end time, attributes (key/value metadata), events (timestamped log-like annotations), a status (Unset, Ok, Error) and a kind (Server, Client, Internal, Producer, Consumer). Every span carries a <strong>span context</strong> with the trace ID it belongs to and its own span ID; child spans reference a parent span, and the root span has no parent. <strong>Context propagation</strong> carries the trace context across process boundaries (in HTTP headers) so spans from different services join into one trace.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 230" role="img" aria-label="Trace waterfall for one GET /work request: client span 0 to 56 ms, server span 2 to 54 ms, busy loop span 3 to 53 ms, metrics observe span at the end">
+        <line class="line dash" x1="250" y1="30" x2="250" y2="200"/><line class="line dash" x1="830" y1="30" x2="830" y2="200"/>
+        <text x="250" y="22" text-anchor="middle" class="t-muted">0 ms</text><text x="830" y="22" text-anchor="middle" class="t-muted">56 ms</text>
+        <text x="20" y="62" class="t-mono">k6 GET /work</text>
+        <rect class="box3" x="250" y="44" width="580" height="26" rx="4"/>
+        <text x="540" y="62" text-anchor="middle" class="t-muted">client span · trace_id 4bf9…  (root)</text>
+        <text x="32" y="102" class="t-mono">FastAPI GET /work</text>
+        <rect class="box2" x="271" y="84" width="538" height="26" rx="4"/>
+        <text x="540" y="102" text-anchor="middle" class="t-muted">server span · http.route=/work · status Ok</text>
+        <text x="44" y="142" class="t-mono">busy loop</text>
+        <rect class="box4" x="281" y="124" width="518" height="26" rx="4"/>
+        <text x="540" y="142" text-anchor="middle" class="t-muted">internal span · ms=50</text>
+        <text x="44" y="182" class="t-mono">observe metrics</text>
+        <rect class="box" x="799" y="164" width="10" height="26" rx="2"/>
+        <text x="790" y="182" text-anchor="end" class="t-muted">≈ 0.1 ms</text>
+      </svg>
+      <figcaption>Figure 13 — A waterfall shows where the 56 ms went. The gap between client and server spans is network + queueing — invisible to server-side metrics.</figcaption>
+    </figure>
+    <p>For a single service like <code>reliability-api</code>, traces add little beyond the histogram. They become essential when the API calls a model server or database (Module 12). The low-effort start is OpenTelemetry’s Python zero-code instrumentation:</p>
+<pre><code>pip install opentelemetry-distro opentelemetry-exporter-otlp
+opentelemetry-bootstrap -a install           <span class="c"># installs instrumentations for detected libraries</span>
+OTEL_SERVICE_NAME=reliability-api \
+OTEL_TRACES_EXPORTER=console \
+opentelemetry-instrument uvicorn app.main:app --host 0.0.0.0 --port 8000</code></pre>
+    <p>With the console exporter, finished spans are printed to stdout so you can inspect them without a tracing backend; switch to <code>otlp</code> and set <code>OTEL_EXPORTER_OTLP_TRACES_ENDPOINT</code> when you run a collector. Treat this as an experiment: verify the spans appear before relying on it.</p>
+    <details class="q"><summary>Self-check: what can a trace show that the latency histogram cannot?</summary><div class="a">The breakdown of a single slow request across components and over time: how much was network/queueing before the handler, how much was the handler, and which child operation (e.g. a downstream call) dominated. The histogram only tells you the distribution of total handler durations, aggregated, with no per-request causality.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>Troubleshooting observability</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Likely cause</th><th>First check</th></tr>
+      <tr><td>Grafana panel “No data”</td><td>Target not scraped; wrong labels in query; series never created</td><td>Run the query in the Prometheus UI; then <code>up{namespace="reliability-lab"}</code></td></tr>
+      <tr><td>Target missing from Status → Targets</td><td>ServiceMonitor not selected (release label), Service label/port-name mismatch</td><td>Section 9 checklist</td></tr>
+      <tr><td>Target DOWN</td><td>Wrong port/path, app bound to 127.0.0.1, NetworkPolicy, Pod not ready</td><td>Error text on the Targets page; <code>curl</code> the Pod via port-forward</td></tr>
+      <tr><td>Request rate drops to 0 during a rollout then spikes</td><td>Summing counters before <code>rate()</code></td><td>Rewrite as <code>sum(rate(...))</code></td></tr>
+      <tr><td>p99 flat at 10 s</td><td>Rank in <code>+Inf</code> bucket</td><td>Check request timeouts; extend buckets</td></tr>
+      <tr><td>Prometheus memory climbing</td><td>Cardinality explosion</td><td><code>scrape_series_added</code>, <code>scrape_samples_scraped</code> per target; look for unbounded labels</td></tr>
+      <tr><td>Alert never fires although the graph crosses the line</td><td><code>for</code> longer than the breach; rule not loaded (missing <code>release</code> label)</td><td>Prometheus UI → Alerts / Rules pages</td></tr>
+      <tr><td>Alert fired but nobody was notified</td><td>Route does not match, inhibited, silenced, receiver misconfigured</td><td>Alertmanager UI (port-forward the Alertmanager service, port 9093)</td></tr>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Task</th><th>Command / expression</th></tr>
+      <tr><td>Install stack</td><td><code>helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring --create-namespace</code></td></tr>
+      <tr><td>Prometheus UI</td><td><code>kubectl -n monitoring port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090</code></td></tr>
+      <tr><td>Grafana UI</td><td><code>kubectl -n monitoring port-forward svc/monitoring-grafana 3000:80</code></td></tr>
+      <tr><td>See raw metrics</td><td><code>curl -s localhost:8080/metrics | grep http_</code></td></tr>
+      <tr><td>Rate</td><td><code>sum(rate(http_requests_total{path="/work"}[5m]))</code></td></tr>
+      <tr><td>Error ratio</td><td><code>sum(rate(…{status=~"5.."}[5m])) / sum(rate(…[5m]))</code></td></tr>
+      <tr><td>p95</td><td><code>histogram_quantile(0.95, sum by (le) (rate(…_bucket[5m])))</code></td></tr>
+      <tr><td>Mean latency</td><td><code>rate(…_sum[5m]) / rate(…_count[5m])</code></td></tr>
+      <tr><td>CPU per Pod</td><td><code>sum by (pod) (rate(container_cpu_usage_seconds_total{…}[5m]))</code></td></tr>
+      <tr><td>Replicas</td><td><code>kube_deployment_status_replicas_available{deployment="reliability-api"}</code></td></tr>
+      <tr><td>Restarts</td><td><code>increase(kube_pod_container_status_restarts_total[1h])</code></td></tr>
+      <tr><td>Missing series alert</td><td><code>absent(up{namespace="reliability-lab"} == 1)</code></td></tr>
+      <tr><td>Burn-rate threshold</td><td><code>burn × (1 − SLO)</code>, e.g. 14.4 × 0.001</td></tr>
+      <tr><td>Recording rule name</td><td><code>level:metric:operations</code></td></tr>
+    </table></div>
+
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>Target / instance</dt><dd>An endpoint Prometheus scrapes, usually one process.</dd>
+      <dt>Job</dt><dd>A set of instances with the same purpose.</dd>
+      <dt>Series</dt><dd>A metric name plus one unique label set; a stream of samples.</dd>
+      <dt>Sample</dt><dd>A float64 (or native histogram) value with a millisecond timestamp.</dd>
+      <dt>Cardinality</dt><dd>Number of distinct series a metric (or label) creates.</dd>
+      <dt>Exporter</dt><dd>A process that translates another system’s metrics into Prometheus format.</dd>
+      <dt>Instant / range vector</dt><dd>One sample per series at a time / a window of samples per series.</dd>
+      <dt>Recording rule</dt><dd>A rule that stores a query’s result as a new series.</dd>
+      <dt>Alerting rule</dt><dd>A PromQL condition that produces pending/firing alerts.</dd>
+      <dt>ServiceMonitor</dt><dd>Prometheus Operator CRD that turns a Service label selector into scrape config.</dd>
+      <dt>kube-state-metrics</dt><dd>Exporter of Kubernetes object state (desired, ready, restarts…).</dd>
+      <dt>cAdvisor</dt><dd>Container resource-usage collector built into the kubelet.</dd>
+      <dt>SLI / SLO / SLA</dt><dd>Indicator / objective / agreement with consequences.</dd>
+      <dt>Error budget</dt><dd>1 − SLO: the allowed unreliability in a window.</dd>
+      <dt>Burn rate</dt><dd>Speed of budget consumption relative to the SLO; 1 = exactly on budget.</dd>
+      <dt>Span / trace</dt><dd>A timed unit of work / the tree of spans for one request.</dd>
+    </dl>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. Why does Prometheus prefer pull, and what do you lose with the Pushgateway?</summary><div class="a">Pull lets Prometheus control timing, makes target health observable (<code>up</code>) and lets you curl what Prometheus sees. Through a Pushgateway you lose the per-instance <code>up</code> signal, add a single point of failure, and pushed series persist until deleted — so it is only for service-level batch jobs.</div></details>
+    <details class="q"><summary>2. Write the PromQL for “p99 latency of /work per Pod”.</summary><div class="a"><code>histogram_quantile(0.99, sum by (pod, le) (rate(http_request_duration_seconds_bucket{path="/work"}[5m])))</code></div></details>
+    <details class="q"><summary>3. Why is <code>increase(http_requests_total[1h])</code> sometimes not an integer?</summary><div class="a"><code>increase</code> is <code>rate</code> multiplied by the window length; samples rarely align exactly with the window edges, so Prometheus extrapolates. Treat it as an estimate.</div></details>
+    <details class="q"><summary>4. You need to know “how many replicas does the Deployment want vs how many are ready”. Which component exposes this?</summary><div class="a">kube-state-metrics: <code>kube_deployment_spec_replicas</code> vs <code>kube_deployment_status_replicas_ready</code>/<code>_available</code>.</div></details>
+    <details class="q"><summary>5. A teammate adds a <code>request_id</code> label to <code>http_requests_total</code>. What happens and what should they do instead?</summary><div class="a">Every request creates a new series that receives exactly one increment: unbounded cardinality, memory growth, slow queries, and useless data. Put request IDs in logs or trace attributes, not metric labels.</div></details>
+    <details class="q"><summary>6. When is <code>irate()</code> appropriate, and why not in alerts?</summary><div class="a">For graphs of volatile, fast-moving counters where you want to see short spikes. It only uses the last two samples, so it is noisy; alerts built on it flap. Use <code>rate()</code> for alerts.</div></details>
+    <details class="q"><summary>7. Your ServiceMonitor is applied but Prometheus has no target. Name three label/port mismatches that cause this.</summary><div class="a">(a) ServiceMonitor lacks <code>release: monitoring</code> so the Prometheus CR ignores it; (b) <code>spec.selector</code> matches labels that exist on Pods but not on the Service; (c) <code>endpoints[].port: http</code> but the Service port is unnamed or named differently. Also possible: namespaceSelector excludes the namespace.</div></details>
+    <details class="q"><summary>8. Define an SLI for “fast enough” that does not depend on histogram interpolation.</summary><div class="a">“Proportion of valid <code>/work</code> requests completed in ≤ 100 ms”, implemented as <code>rate(…_bucket{le="0.1"}[w]) / rate(…_count[w])</code>. Because a bucket boundary sits exactly at the threshold, the good-event count is exact.</div></details>
+    <details class="q"><summary>9. What does <code>for: 5m</code> do and what is the trade-off?</summary><div class="a">The alert must be continuously true for 5 minutes (pending) before firing. It suppresses blips (fewer false pages) but delays detection by up to 5 minutes plus scrape and evaluation intervals.</div></details>
+    <details class="q"><summary>10. Why can’t metrics-server replace Prometheus for dashboards?</summary><div class="a">It stores only the latest CPU/memory values, has no history, no application metrics and no query language; its own README says it is meant only for autoscaling purposes.</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://prometheus.io/docs/introduction/overview/">Prometheus overview (architecture, when it does not fit) — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/concepts/data_model/">Data model — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/concepts/metric_types/">Metric types — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/concepts/jobs_instances/">Jobs and instances — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/instrumenting/exposition_formats/">Exposition formats — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/practices/naming/">Metric and label naming — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/practices/instrumentation/">Instrumentation (cardinality, online-serving systems) — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/practices/histograms/">Histograms and summaries — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/practices/pushing/">When to use the Pushgateway — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/practices/rules/">Recording rules naming — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/practices/alerting/">Alerting practices — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/prometheus/latest/querying/basics/">Querying basics — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/prometheus/latest/querying/functions/">Query functions — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/prometheus/latest/querying/operators/">Query operators — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/prometheus/latest/querying/examples/">Query examples — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/prometheus/latest/configuration/configuration/">Configuration (scrape defaults, relabeling, kubernetes_sd) — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/">Alerting rules — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/prometheus/latest/storage/">Storage — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/alerting/latest/alertmanager/">Alertmanager concepts — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/alerting/latest/configuration/">Alertmanager configuration — prometheus.io</a></li>
+      <li><a href="https://prometheus.io/docs/guides/node-exporter/">Monitoring Linux host metrics with node exporter — prometheus.io</a></li>
+      <li><a href="https://prometheus.github.io/client_python/instrumenting/histogram/">client_python: Histogram (default buckets) — prometheus.github.io</a></li>
+      <li><a href="https://prometheus.github.io/client_python/instrumenting/">client_python: Instrumenting (_created series) — prometheus.github.io</a></li>
+      <li><a href="https://prometheus.github.io/client_python/instrumenting/gauge/">client_python: Gauge (track_inprogress) — prometheus.github.io</a></li>
+      <li><a href="https://prometheus.github.io/client_python/collector/">client_python: default collectors — prometheus.github.io</a></li>
+      <li><a href="https://prometheus-operator.dev/docs/getting-started/introduction/">Prometheus Operator introduction (CRDs) — prometheus-operator.dev</a></li>
+      <li><a href="https://prometheus-operator.dev/docs/developer/getting-started/">Prometheus Operator: ServiceMonitor getting started — prometheus-operator.dev</a></li>
+      <li><a href="https://prometheus-operator.dev/docs/api-reference/api/">Prometheus Operator API reference — prometheus-operator.dev</a></li>
+      <li><a href="https://github.com/prometheus-community/helm-charts/blob/main/charts/kube-prometheus-stack/README.md">kube-prometheus-stack chart README — github.com/prometheus-community</a> and its <a href="https://github.com/prometheus-community/helm-charts/blob/main/charts/kube-prometheus-stack/values.yaml">values.yaml</a></li>
+      <li><a href="https://github.com/kubernetes/kube-state-metrics/blob/main/README.md">kube-state-metrics README</a>, <a href="https://github.com/kubernetes/kube-state-metrics/blob/main/docs/metrics/workload/deployment-metrics.md">deployment metrics</a>, <a href="https://github.com/kubernetes/kube-state-metrics/blob/main/docs/metrics/workload/pod-metrics.md">pod metrics</a>, <a href="https://github.com/kubernetes/kube-state-metrics/blob/main/docs/metrics/workload/horizontalpodautoscaler-metrics.md">HPA metrics</a></li>
+      <li><a href="https://github.com/google/cadvisor/blob/master/docs/storage/prometheus.md">cAdvisor Prometheus metrics — github.com/google/cadvisor</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/cluster-administration/system-metrics/">Metrics for Kubernetes system components — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/cluster-administration/logging/">Logging architecture — kubernetes.io</a></li>
+      <li><a href="https://grafana.com/docs/grafana/latest/datasources/prometheus/query-editor/">Prometheus query editor — grafana.com/docs</a></li>
+      <li><a href="https://grafana.com/docs/grafana/latest/datasources/prometheus/template-variables/">Prometheus template variables ($__rate_interval) — grafana.com/docs</a></li>
+      <li><a href="https://grafana.com/docs/grafana/latest/administration/provisioning/">Provisioning — grafana.com/docs</a></li>
+      <li><a href="https://grafana.com/docs/grafana/latest/dashboards/build-dashboards/annotate-visualizations/">Annotate visualizations — grafana.com/docs</a></li>
+      <li><a href="https://grafana.com/docs/grafana/latest/developers/http_api/annotations/">Annotations HTTP API — grafana.com/docs</a></li>
+      <li><a href="https://grafana.com/docs/grafana/latest/visualizations/panels-visualizations/visualizations/">Visualizations — grafana.com/docs</a></li>
+      <li><a href="https://grafana.com/blog/the-red-method-how-to-instrument-your-services/">The RED method — grafana.com</a> · <a href="https://www.brendangregg.com/usemethod.html">The USE method — brendangregg.com</a></li>
+      <li><a href="https://sre.google/sre-book/monitoring-distributed-systems/">Monitoring distributed systems (four golden signals) — sre.google</a></li>
+      <li><a href="https://sre.google/sre-book/service-level-objectives/">Service level objectives — sre.google</a></li>
+      <li><a href="https://sre.google/workbook/implementing-slos/">Implementing SLOs — sre.google workbook</a></li>
+      <li><a href="https://sre.google/workbook/alerting-on-slos/">Alerting on SLOs (burn rate) — sre.google workbook</a></li>
+      <li><a href="https://opentelemetry.io/docs/concepts/signals/">Signals — opentelemetry.io</a> · <a href="https://opentelemetry.io/docs/concepts/signals/traces/">Traces — opentelemetry.io</a> · <a href="https://opentelemetry.io/docs/zero-code/python/">Python zero-code instrumentation — opentelemetry.io</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="06-kind-helm.html"><small>◀ Previous</small>Module 06 · Local Clusters with kind &amp; Packaging with Helm</a>
+      <a class="next" href="08-scaling-load-failure.html"><small>Next ▶</small>Module 08 · Autoscaling, Load Testing &amp; Failure Testing</a>
+    </nav>
+  </article></main>
+</div>
+<script>
+(function () {
+  function $(id) { return document.getElementById(id); }
+  function fmt(n) { return Math.round(n).toLocaleString("en-US"); }
+  function num(id, d) { var v = parseFloat($(id).value); return isFinite(v) ? v : d; }
+
+  /* ---------- cardinality calculator ---------- */
+  function card() {
+    var paths = Math.max(1, num("cd-paths", 1)), st = Math.max(1, num("cd-status", 1));
+    var pods = Math.max(1, num("cd-pods", 2)), b = Math.max(1, num("cd-buckets", 15));
+    var created = $("cd-created").checked ? 1 : 0;
+    var users = $("cd-user").checked ? Math.max(1, num("cd-users", 10000)) : 1;
+    var counterSets = paths * st * pods * users;
+    var counter = counterSets * (1 + created);
+    var histSets = paths * pods * users;               /* LATENCY has only the path label */
+    var hist = histSets * (b + 2 + created);
+    var total = counter + hist;
+    var cls = total > 100000 ? "bad" : total > 1000 ? "warn" : "ok";
+    $("cd-out").innerHTML =
+      '<div>Counter label sets<b>' + fmt(counterSets) + '</b></div>' +
+      '<div>Counter series<b>' + fmt(counter) + '</b></div>' +
+      '<div>Histogram series<b>' + fmt(hist) + '</b></div>' +
+      '<div>Total series<b class="' + cls + '">' + fmt(total) + '</b></div>';
+    var msg = "http_requests_total: " + paths + " path × " + st + " status × " + pods + " pods" +
+      (users > 1 ? " × " + fmt(users) + " users" : "") + (created ? " × 2 (_total + _created)" : "") + "\n" +
+      "http_request_duration_seconds: " + paths + " path × " + pods + " pods" + (users > 1 ? " × " + fmt(users) + " users" : "") +
+      " × (" + b + " buckets + _sum + _count" + (created ? " + _created" : "") + ")\n";
+    if (users > 1) msg += "\nA user_id label multiplies everything by the number of users and keeps growing: this is the unbounded-cardinality anti-pattern. Put IDs in logs or traces instead.";
+    else if (total > 1000) msg += "\nThousands of series from one small app: check whether every label is needed and bounded.";
+    else msg += "\nBounded and small. Note that HPA scaling from 2 to 6 Pods triples this.";
+    $("cd-text").textContent = msg;
+  }
+  ["cd-paths", "cd-status", "cd-pods", "cd-buckets", "cd-created", "cd-user", "cd-users"].forEach(function (id) {
+    $(id).addEventListener("input", card); $(id).addEventListener("change", card);
+  });
+  card();
+
+  /* ---------- histogram bucket visualizer ---------- */
+  var BUCKETS = {
+    "default": [0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0],
+    "coarse": [0.1, 0.5, 1],
+    "tuned": [0.04, 0.05, 0.055, 0.06, 0.075, 0.1, 0.15, 0.25, 0.5, 1]
+  };
+  function rng(seed) { return function () { seed |= 0; seed = seed + 0x6D2B79F5 | 0; var t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  function sample(shape, n) {
+    var r = rng(42), out = [];
+    function normal() { var u = 1 - r(), v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+    for (var i = 0; i < n; i++) {
+      var x;
+      if (shape === "work") x = 0.0502 + Math.abs(normal()) * 0.0012 + (r() < 0.01 ? 0.008 * r() : 0);
+      else if (shape === "tail") x = 0.051 + -Math.log(1 - r()) * 0.02;
+      else if (shape === "bimodal") x = r() < 0.9 ? 0.052 + normal() * 0.002 : 0.4 + normal() * 0.05;
+      else x = r();
+      out.push(Math.max(0.0001, x));
+    }
+    return out;
+  }
+  function estimate(q, bounds, cum) {
+    /* Prometheus classic-histogram interpolation; bounds excludes +Inf, cum has bounds.length+1 entries */
+    var total = cum[cum.length - 1];
+    if (total === 0) return { v: NaN, idx: -1 };
+    var rank = q * total, i = 0;
+    while (i < cum.length - 1 && cum[i] < rank) i++;
+    if (i === cum.length - 1) return { v: bounds[bounds.length - 1], idx: i, inf: true };
+    var start = i === 0 ? 0 : bounds[i - 1], end = bounds[i];
+    var prev = i === 0 ? 0 : cum[i - 1], inBucket = cum[i] - prev;
+    var v = inBucket > 0 ? start + (end - start) * ((rank - prev) / inBucket) : end;
+    return { v: v, idx: i };
+  }
+  function ms(x) { return isFinite(x) ? (x * 1000).toFixed(1) + " ms" : "n/a"; }
+  function hist() {
+    var shape = $("hw-shape").value, bounds = BUCKETS[$("hw-buckets").value];
+    var n = parseInt($("hw-n").value, 10), q = parseFloat($("hw-q").value);
+    $("hw-nv").textContent = n.toLocaleString("en-US");
+    var xs = sample(shape, n).sort(function (a, b) { return a - b; });
+    var cum = bounds.map(function (b) { var c = 0; for (var i = 0; i < xs.length && xs[i] <= b; i++) c++; return c; });
+    cum.push(n);
+    var trueQ = xs[Math.max(0, Math.ceil(q * n) - 1)];
+    var est = estimate(q, bounds, cum);
+    var html = "";
+    for (var i = 0; i < cum.length; i++) {
+      var le = i < bounds.length ? String(bounds[i]) : "+Inf";
+      var prev = i === 0 ? 0 : cum[i - 1];
+      var w = (cum[i] / n) * 100, wi = ((cum[i] - prev) / n) * 100;
+      html += '<div class="bar-row"><span>le=' + le + '</span><span class="bar-track">' +
+        '<span class="bar-fill' + (i === est.idx ? " hot" : "") + '" style="width:' + w.toFixed(2) + '%"></span>' +
+        '<span class="bar-fill inc" style="left:' + ((prev / n) * 100).toFixed(2) + '%;width:' + wi.toFixed(2) + '%"></span></span><span>' + cum[i] + '</span></div>';
+    }
+    $("hw-bars").innerHTML = html;
+    var err = est.v - trueQ;
+    $("hw-kv").innerHTML =
+      '<div>True p' + Math.round(q * 100) + ' (from raw samples)<b>' + ms(trueQ) + '</b></div>' +
+      '<div>histogram_quantile estimate<b>' + ms(est.v) + '</b></div>' +
+      '<div>Estimation error<b class="' + (Math.abs(err) > 0.02 ? "bad" : Math.abs(err) > 0.005 ? "warn" : "ok") + '">' + (err >= 0 ? "+" : "") + (err * 1000).toFixed(1) + ' ms</b></div>' +
+      '<div>Samples beyond p' + Math.round(q * 100) + '<b>' + Math.floor(n * (1 - q)) + '</b></div>';
+    var lines = "# rank = " + q + " × " + n + " = " + (q * n).toFixed(1) +
+      (est.inf ? "  → falls in +Inf bucket: Prometheus returns the largest finite bound (" + bounds[bounds.length - 1] + ")" :
+        "  → bucket le=" + bounds[est.idx] + " (orange)") + "\n";
+    for (var j = 0; j < cum.length; j++) lines += 'http_request_duration_seconds_bucket{le="' + (j < bounds.length ? bounds[j] : "+Inf") + '",path="/work"} ' + cum[j] + "\n";
+    lines += 'http_request_duration_seconds_count{path="/work"} ' + n;
+    $("hw-text").textContent = lines;
+  }
+  ["hw-shape", "hw-buckets", "hw-n", "hw-q"].forEach(function (id) { $(id).addEventListener("input", hist); $(id).addEventListener("change", hist); });
+  hist();
+
+  /* ---------- error budget calculator ---------- */
+  function eb() {
+    var slo = Math.min(99.9999, Math.max(1, num("eb-slo", 99.9))) / 100, days = Math.max(1, num("eb-days", 30));
+    var rpd = Math.max(1, num("eb-rpd", 100000)), err = Math.max(0, num("eb-err", 0)) / 100;
+    var budget = 1 - slo, total = rpd * days, allowed = total * budget, minutes = days * 1440 * budget;
+    var burn = err / budget, exhaust = burn > 0 ? days / burn : Infinity;
+    var cls = burn >= 14.4 ? "bad" : burn >= 1 ? "warn" : "ok";
+    $("eb-kv").innerHTML =
+      '<div>Error budget<b>' + (budget * 100).toPrecision(3) + ' %</b></div>' +
+      '<div>Allowed failed requests<b>' + fmt(allowed) + '</b></div>' +
+      '<div>≈ full-outage minutes<b>' + minutes.toFixed(1) + '</b></div>' +
+      '<div>Current burn rate<b class="' + cls + '">' + burn.toFixed(2) + '×</b></div>' +
+      '<div>Budget gone in<b class="' + cls + '">' + (isFinite(exhaust) ? (exhaust < 1 ? (exhaust * 24).toFixed(1) + " h" : exhaust.toFixed(1) + " days") : "never") + '</b></div>';
+    var rows = [[14.4, 1, "page (short window 5m)"], [6, 6, "page (short window 30m)"], [1, 72, "ticket (short window 6h)"]];
+    var t = "Window: " + days + " days, " + fmt(total) + " requests in total.\nMultiwindow thresholds (error ratio = burn × (1 − SLO)):\n";
+    rows.forEach(function (r) {
+      t += "  burn " + r[0] + " over " + r[1] + "h → alert when error ratio > " + (r[0] * budget * 100).toPrecision(3) +
+        " %  — consumes " + ((r[0] * r[1]) / (days * 24) * 100).toPrecision(3) + " % of the budget in that window · " + r[2] + "\n";
+    });
+    $("eb-text").textContent = t;
+  }
+  ["eb-slo", "eb-days", "eb-rpd", "eb-err"].forEach(function (id) { $(id).addEventListener("input", eb); });
+  eb();
+})();
+</script>
+</body>
+</html>

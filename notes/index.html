@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DevOps Notes — Syllabus</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/notes.js"></script>
+<style>
+  .overall { height: 10px; background: var(--surface-2); border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
+  .overall > div { height: 100%; background: var(--accent); width: 0; transition: width .3s; }
+  .module-list .card h4 { margin: 4px 0 6px; }
+  .module-list .card ul { margin: 6px 0 0; padding-left: 18px; font-size: 13.5px; color: var(--muted); }
+  .module-list .card .foot { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .phase-tag { font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+  svg a text { cursor: pointer; }
+  svg a:hover rect { stroke: var(--accent); stroke-width: 2; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Syllabus · Docker → Kubernetes → Observability → CI/CD → Cloud → AI Inference</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <section class="hero">
+      <h1>DevOps, Kubernetes & Observability: Course Notes</h1>
+      <p class="lede">Thirteen modules that take you from Linux processes to running AI inference on Kubernetes. Every module uses <strong>one running example</strong>: the <code>reliability-api</code> service you will build, containerize, deploy, observe, scale, break and automate. Every concept is checked against official documentation, and each page lists its sources.</p>
+      <div class="meta"><span class="pill accent">13 modules</span><span class="pill">Local-first: Docker + kind</span><span class="pill">Interactive diagrams & simulators</span><span class="verified">✓ Official docs only · Oct 2026</span></div>
+      <div class="overall" aria-label="overall progress"><div id="overall-bar"></div></div>
+      <p style="font-size:14px;color:var(--muted);margin-top:6px" id="overall-text"></p>
+    </section>
+
+    <h2>How to use these notes</h2>
+    <div class="grid">
+      <div class="card"><h4>1 · Read</h4><p>Work through each concept section: definition, the problem it solves, a diagram, how it works, and how it applies to <code>reliability-api</code>.</p></div>
+      <div class="card"><h4>2 · Play</h4><p>Use the widgets (simulators, step-throughs, calculators) to build intuition before you touch a terminal.</p></div>
+      <div class="card"><h4>3 · Lab</h4><p>Do the 🧪 labs on your machine. Sample outputs are labelled as examples. Yours will differ, so record what <em>you</em> observe.</p></div>
+      <div class="card"><h4>4 · Check</h4><p>Answer the self-check questions without peeking, then tick <strong>Done</strong> in the module's top bar. Progress is saved in this browser.</p></div>
+    </div>
+    <div class="callout note"><span class="label">The study cycle (from your guide, §27)</span>
+      <p><strong>Read</strong> official docs → <strong>Explain</strong> it in your own words → <strong>Draw</strong> it → <strong>Try</strong> the smallest lab → <strong>Break</strong> it on purpose → <strong>Diagnose</strong> → <strong>Record</strong> → <strong>Integrate</strong> into the repo → <strong>Review</strong> what you have and have not verified.</p>
+    </div>
+
+    <h2>Roadmap: how the modules depend on each other</h2>
+    <p>Click a box to open the module. Arrows mean "learn this first". The dashed modules are the optional cloud and AI phases. Do them only once the local workflow is reliable.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 880 470" role="img" aria-label="Module dependency roadmap">
+        <defs><marker id="ra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="20" y="22" class="t-muted">FOUNDATIONS</text>
+        <text x="250" y="22" class="t-muted">KUBERNETES CORE</text>
+        <text x="500" y="22" class="t-muted">OPERATE &amp; MEASURE</text>
+        <text x="720" y="22" class="t-muted">AUTOMATE / EXTEND</text>
+
+        <a href="01-linux-networking.html"><rect class="box3" x="20" y="60" width="180" height="54" rx="8"/><text x="110" y="84" text-anchor="middle" class="t-bold">01 Linux &amp; Network</text><text x="110" y="102" text-anchor="middle" class="t-muted">process · port · DNS</text></a>
+        <a href="02-docker.html"><rect class="box3" x="20" y="170" width="180" height="54" rx="8"/><text x="110" y="194" text-anchor="middle" class="t-bold">02 Docker</text><text x="110" y="212" text-anchor="middle" class="t-muted">image · container</text></a>
+
+        <a href="03-kubernetes-architecture.html"><rect class="box2" x="250" y="60" width="200" height="54" rx="8"/><text x="350" y="84" text-anchor="middle" class="t-bold">03 K8s Architecture</text><text x="350" y="102" text-anchor="middle" class="t-muted">Pod · Deployment</text></a>
+        <a href="04-kubernetes-workloads.html"><rect class="box2" x="250" y="150" width="200" height="54" rx="8"/><text x="350" y="174" text-anchor="middle" class="t-bold">04 Workloads</text><text x="350" y="192" text-anchor="middle" class="t-muted">probes · resources · rollout</text></a>
+        <a href="05-kubernetes-networking-config.html"><rect class="box2" x="250" y="240" width="200" height="54" rx="8"/><text x="350" y="264" text-anchor="middle" class="t-bold">05 Network &amp; Config</text><text x="350" y="282" text-anchor="middle" class="t-muted">Service · Secret · RBAC</text></a>
+        <a href="06-kind-helm.html"><rect class="box2" x="250" y="330" width="200" height="54" rx="8"/><text x="350" y="354" text-anchor="middle" class="t-bold">06 kind &amp; Helm</text><text x="350" y="372" text-anchor="middle" class="t-muted">local cluster · charts</text></a>
+
+        <a href="07-observability.html"><rect class="box4" x="500" y="100" width="180" height="54" rx="8"/><text x="590" y="124" text-anchor="middle" class="t-bold">07 Observability</text><text x="590" y="142" text-anchor="middle" class="t-muted">Prometheus · Grafana</text></a>
+        <a href="08-scaling-load-failure.html"><rect class="box4" x="500" y="210" width="180" height="54" rx="8"/><text x="590" y="234" text-anchor="middle" class="t-bold">08 Scale · Load · Fail</text><text x="590" y="252" text-anchor="middle" class="t-muted">HPA · k6 · recovery</text></a>
+        <a href="13-troubleshooting-capstone.html"><rect class="box4" x="500" y="330" width="180" height="54" rx="8"/><text x="590" y="354" text-anchor="middle" class="t-bold">13 Troubleshoot</text><text x="590" y="372" text-anchor="middle" class="t-muted">playbook · capstone</text></a>
+
+        <a href="09-cicd-github-actions.html"><rect class="box" x="720" y="60" width="150" height="54" rx="8"/><text x="795" y="84" text-anchor="middle" class="t-bold">09 CI/CD</text><text x="795" y="102" text-anchor="middle" class="t-muted">GitHub Actions</text></a>
+        <a href="10-terraform.html"><rect class="box" x="720" y="160" width="150" height="54" rx="8" style="stroke-dasharray:5 4"/><text x="795" y="184" text-anchor="middle" class="t-bold">10 Terraform</text><text x="795" y="202" text-anchor="middle" class="t-muted">IaC · state</text></a>
+        <a href="11-gke-cloud.html"><rect class="box" x="720" y="260" width="150" height="54" rx="8" style="stroke-dasharray:5 4"/><text x="795" y="284" text-anchor="middle" class="t-bold">11 GKE</text><text x="795" y="302" text-anchor="middle" class="t-muted">cloud · cost</text></a>
+        <a href="12-ai-inference.html"><rect class="box" x="720" y="360" width="150" height="54" rx="8" style="stroke-dasharray:5 4"/><text x="795" y="384" text-anchor="middle" class="t-bold">12 AI Inference</text><text x="795" y="402" text-anchor="middle" class="t-muted">vLLM · KServe</text></a>
+
+        <path class="line" d="M110 114 V168" marker-end="url(#ra)"/>
+        <path class="line" d="M200 197 C 225 197, 225 87, 248 87" marker-end="url(#ra)"/>
+        <path class="line" d="M350 114 V148" marker-end="url(#ra)"/>
+        <path class="line" d="M350 204 V238" marker-end="url(#ra)"/>
+        <path class="line" d="M350 294 V328" marker-end="url(#ra)"/>
+        <path class="line" d="M450 357 C 475 357, 475 127, 498 127" marker-end="url(#ra)"/>
+        <path class="line" d="M590 154 V208" marker-end="url(#ra)"/>
+        <path class="line" d="M590 264 V328" marker-end="url(#ra)"/>
+        <path class="line" d="M450 375 H 495 V 425 H 704 V 87 H 718" marker-end="url(#ra)"/>
+        <path class="line dash" d="M795 114 V158" marker-end="url(#ra)"/>
+        <path class="line dash" d="M795 214 V258" marker-end="url(#ra)"/>
+        <path class="line dash" d="M795 314 V358" marker-end="url(#ra)"/>
+        <path class="line dash" d="M680 237 C 700 237, 700 387, 718 387" marker-end="url(#ra)"/>
+        <text x="20" y="450" class="t-muted">Solid = core path · dashed = optional cloud / AI phases (start only after local labs are reproducible)</text>
+      </svg>
+      <figcaption>Dependency-driven order, following the guide's milestones 0–8 and its "what to do first" list (§28).</figcaption>
+    </figure>
+
+    <h2>Syllabus</h2>
+    <div class="module-list" id="modules"></div>
+
+    <h2>The running example: reliability-api</h2>
+    <p>Learning infrastructure is easier when the application is not another unknown. The example app is deliberately tiny: four endpoints, with a <code>/work</code> endpoint that burns CPU so that load testing and autoscaling produce visible effects.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 250" role="img" aria-label="reliability-api endpoints and which module uses them">
+        <rect class="box4" x="20" y="40" width="250" height="170" rx="10"/>
+        <text x="145" y="66" text-anchor="middle" class="t-bold">reliability-api</text>
+        <text x="145" y="86" text-anchor="middle" class="t-muted">FastAPI · Uvicorn · 0.0.0.0:8000</text>
+        <text x="40" y="118" class="t-mono">GET /health</text>
+        <text x="40" y="142" class="t-mono">GET /ready</text>
+        <text x="40" y="166" class="t-mono">GET /work?ms=50</text>
+        <text x="40" y="190" class="t-mono">GET /metrics</text>
+        <path class="line dash" d="M170 114 H330"/><path class="line dash" d="M170 138 H330"/><path class="line dash" d="M190 162 H330"/><path class="line dash" d="M170 186 H330"/>
+        <text x="340" y="118">liveness probe: "is the process alive?"</text><text x="660" y="118" class="t-muted">Modules 04, 13</text>
+        <text x="340" y="142">readiness probe: 503 during warm-up</text><text x="660" y="142" class="t-muted">Modules 04, 05, 08</text>
+        <text x="340" y="166">CPU-bound work for load &amp; HPA tests</text><text x="660" y="166" class="t-muted">Modules 08, 12</text>
+        <text x="340" y="190">Prometheus counters &amp; histograms</text><text x="660" y="190" class="t-muted">Module 07</text>
+        <text x="340" y="232" class="t-muted">Env: APP_MODE · LOG_LEVEL · READY_DELAY_SECONDS</text>
+      </svg>
+      <figcaption>One app, many lenses. Each module looks at the same service from a different layer.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <tr><th>Thing</th><th>Name used in every module</th></tr>
+      <tr><td>Image</td><td><code>reliability-api:0.1.0</code> locally · <code>ghcr.io/&lt;you&gt;/reliability-api:&lt;git-sha&gt;</code> in CI</td></tr>
+      <tr><td>Local cluster / namespace</td><td><code>kind</code> cluster <code>reliability-lab</code> · namespace <code>reliability-lab</code></td></tr>
+      <tr><td>Deployment</td><td><code>reliability-api</code>, 2 replicas, label <code>app.kubernetes.io/name: reliability-api</code></td></tr>
+      <tr><td>Service</td><td><code>reliability-api</code>, ClusterIP, port 80 → targetPort 8000</td></tr>
+      <tr><td>Resources</td><td>requests <code>cpu 100m / memory 128Mi</code> · limit <code>memory 256Mi</code></td></tr>
+      <tr><td>Autoscaling</td><td>HPA min 2, max 6, target CPU 60%</td></tr>
+      <tr><td>Helm</td><td>chart <code>charts/reliability-api</code> · release <code>reliability-api</code></td></tr>
+      <tr><td>Monitoring</td><td><code>kube-prometheus-stack</code> release <code>monitoring</code> in namespace <code>monitoring</code></td></tr>
+    </table></div>
+    <details class="q"><summary>Show the canonical app code (app/main.py)</summary><div class="a">
+<pre data-title="app/main.py"><code>import os, time, logging
+from fastapi import FastAPI, Response
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
+READY_DELAY = float(os.getenv("READY_DELAY_SECONDS", "0"))
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reliability-api")
+
+REQUESTS = Counter("http_requests_total", "Total HTTP requests", ["path", "status"])
+LATENCY = Histogram("http_request_duration_seconds", "Request latency", ["path"])
+
+app = FastAPI()
+STARTED = time.monotonic()
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/ready")
+def ready(response: Response):
+    if time.monotonic() - STARTED &lt; READY_DELAY:
+        response.status_code = 503
+        return {"ready": False}
+    return {"ready": True}
+
+@app.get("/work")
+def work(ms: int = 50):
+    start = time.perf_counter()
+    while (time.perf_counter() - start) * 1000 &lt; ms:
+        pass                                   # burn CPU deliberately
+    elapsed = time.perf_counter() - start
+    LATENCY.labels("/work").observe(elapsed)
+    REQUESTS.labels("/work", "200").inc()
+    return {"worked_ms": round(elapsed * 1000, 1)}
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)</code></pre>
+    </div></details>
+
+    <h2>Suggested pacing</h2>
+    <p>Pace yourself by the exit criteria, not the calendar. As a rough guide for about 8–10 hours a week:</p>
+    <div class="table-wrap"><table>
+      <tr><th>Weeks</th><th>Modules</th><th>Capstone milestone reached</th></tr>
+      <tr><td>1–2</td><td>01 Linux & Networking · 02 Docker</td><td>M0–M1: image builds and runs from a clean checkout</td></tr>
+      <tr><td>3–5</td><td>03 Architecture · 04 Workloads · 05 Networking & Config</td><td>M2–M3: 2 replicas on kind, probes and resources justified</td></tr>
+      <tr><td>6</td><td>06 kind & Helm</td><td>Reproducible cluster + chart</td></tr>
+      <tr><td>7–8</td><td>07 Observability</td><td>M4: dashboard explains a known load change</td></tr>
+      <tr><td>9–10</td><td>08 Scaling, Load & Failure · 13 (Part A)</td><td>M5: baseline vs HPA report, recovery report</td></tr>
+      <tr><td>11</td><td>09 CI/CD</td><td>M6: PRs gated by tests, build, kind integration</td></tr>
+      <tr><td>12+</td><td>10 Terraform · 11 GKE · 12 AI Inference (optional)</td><td>M7–M8</td></tr>
+    </table></div>
+
+    <h2>About verification</h2>
+    <p>Facts on each page were checked against official sources: kubernetes.io, docs.docker.com, kind.sigs.k8s.io, helm.sh, prometheus.io, grafana.com, docs.github.com, developer.hashicorp.com, cloud.google.com, kserve.github.io, docs.vllm.ai, and the Google SRE books. Each module ends with the exact pages used. Tools change quickly. When a lab command or default behaves differently on your machine, trust the current official docs and your own observed output, and note the difference in your study notes.</p>
+    <p>Source study guide: <code>../devops_kubernetes_study_and_build_guide.md</code></p>
+  </article></main>
+</div>
+<script>
+(function () {
+  const MODS = [
+    ["01", "01-linux-networking.html", "Linux & Networking Foundations", "Foundations", ["Processes, signals, exit codes", "Users, permissions, env vars", "TCP/IP, ports, 0.0.0.0 vs 127.0.0.1", "DNS, HTTP, diagnostic commands", "Namespaces & cgroups → containers"]],
+    ["02", "02-docker.html", "Docker & Containers", "Foundations", ["Images, layers, build cache", "Multi-stage, non-root Dockerfile", "Ports, volumes, networks", "Tags vs digests, registries", "PID 1 & signals, HEALTHCHECK"]],
+    ["03", "03-kubernetes-architecture.html", "Kubernetes Architecture & Core Objects", "Kubernetes core", ["Control plane & node components", "Declarative model & reconciliation", "Pods, ReplicaSets, Deployments", "Labels, selectors, namespaces", "kubectl essentials"]],
+    ["04", "04-kubernetes-workloads.html", "Workloads: Probes, Resources, Scheduling & Rollouts", "Kubernetes core", ["Liveness / readiness / startup probes", "Requests, limits, QoS, OOMKill", "Scheduling, taints, affinity", "Rolling updates & rollback", "Graceful termination, PDB, Jobs"]],
+    ["05", "05-kubernetes-networking-config.html", "Networking, Configuration, Storage & Access Control", "Kubernetes core", ["Services & EndpointSlices", "Cluster DNS, Ingress, Gateway API", "NetworkPolicy", "ConfigMaps, Secrets, PV/PVC", "ServiceAccounts & RBAC"]],
+    ["06", "06-kind-helm.html", "Local Clusters with kind & Packaging with Helm", "Kubernetes core", ["kind clusters & config", "Loading local images", "Helm charts, values, templates", "Install, upgrade, rollback", "Chart for reliability-api"]],
+    ["07", "07-observability.html", "Observability: Prometheus, Grafana, SLOs", "Operate & measure", ["Metrics, logs, traces", "Prometheus data model & PromQL", "Instrumenting the app", "Dashboards & alerting", "SLI / SLO / error budgets"]],
+    ["08", "08-scaling-load-failure.html", "Autoscaling, Load Testing & Failure Testing", "Operate & measure", ["metrics-server & HPA algorithm", "VPA & cluster autoscaling", "Load-test design, k6", "Failure experiments", "Measuring recovery"]],
+    ["09", "09-cicd-github-actions.html", "CI/CD with GitHub Actions", "Automate", ["Workflows, jobs, runners", "Secrets & least-privilege tokens", "Build & push to GHCR", "Image scanning", "kind integration tests in CI"]],
+    ["10", "10-terraform.html", "Terraform & Infrastructure as Code", "Automate (optional)", ["HCL, providers, resources", "State, backends, locking", "Plan / apply / destroy", "Modules, for_each, lifecycle", "Terraform vs Helm boundary"]],
+    ["11", "11-gke-cloud.html", "Google Cloud & GKE", "Cloud (optional)", ["Projects, IAM, VPC", "GKE Autopilot vs Standard", "Artifact Registry", "Workload Identity Federation", "Cost controls & cleanup"]],
+    ["12", "12-ai-inference.html", "AI Inference on Kubernetes", "AI (optional)", ["TTFT, ITL, throughput", "Batching & concurrency", "GPUs on Kubernetes", "vLLM & KServe", "Benchmarking with AIPerf"]],
+    ["13", "13-troubleshooting-capstone.html", "Troubleshooting Playbook & Capstone", "Integrate", ["Layered debugging method", "Diagnosis tree & break-it labs", "kubectl debug", "Capstone milestones & evidence", "Interview preparation"]],
+  ];
+  const store = { get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } } };
+  const wrap = document.getElementById("modules");
+  MODS.forEach(m => {
+    const a = document.createElement("a");
+    a.className = "card"; a.href = m[1];
+    const done = store.get("notes-done-" + m[0]) === "1";
+    a.innerHTML = '<span class="num">MODULE ' + m[0] + '</span> <span class="phase-tag" style="color:var(--muted)">· ' + m[3] + '</span>' +
+      '<h4></h4><ul>' + m[4].map(() => '<li></li>').join("") + '</ul>' +
+      '<div class="foot"><span>' + (done ? '✅ Done' : 'Not started / in progress') + '</span><span>Open →</span></div>';
+    a.querySelector("h4").textContent = m[2];
+    a.querySelectorAll("li").forEach((li, i) => li.textContent = m[4][i]);
+    wrap.appendChild(a);
+  });
+  const n = MODS.filter(m => store.get("notes-done-" + m[0]) === "1").length;
+  document.getElementById("overall-bar").style.width = (n / MODS.length * 100) + "%";
+  document.getElementById("overall-text").textContent = n + " of " + MODS.length + " modules marked done (saved in this browser)";
+})();
+</script>
+</body>
+</html>

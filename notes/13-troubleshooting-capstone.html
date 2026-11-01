@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 13 · Troubleshooting & Capstone — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 13 · Troubleshooting Playbook & Capstone Project</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="13"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 13 · Troubleshooting Playbook & Capstone Project</h1>
+    <p class="lede">This module turns the previous twelve into one working habit. The first half is a systematic debugging method for <code>reliability-api</code>: a layered model, a decision tree, the exact commands to use, and practice scenarios where you break things on purpose. The second half is the capstone, the Kubernetes Reliability Lab. It lists every milestone, the evidence each one must produce, a production-readiness checklist, an experiment report template, and interview preparation.</p>
+    <div class="meta"><span class="pill accent">Prereq: Modules 01–12 (or at least 01–08)</span><span class="pill">≈ 4 h study + capstone (multi-week)</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Apply a repeatable <strong>triage → isolate → hypothesise → test → fix → record</strong> loop instead of guessing.</li>
+      <li>Locate a failure in the right <strong>layer</strong> (app, container, Pod, scheduling, Service/network, cluster, pipeline, cloud).</li>
+      <li>Read Pod phases, container states and Events, and map each common status (<code>Pending</code>, <code>ImagePullBackOff</code>, <code>CrashLoopBackOff</code>, <code>OOMKilled</code>, unready) to its first diagnostic command.</li>
+      <li>Use <code>kubectl debug</code> ephemeral containers and Pod copies when <code>kubectl exec</code> is not enough.</li>
+      <li>Plan, execute and document the capstone so that every claim in the README is backed by evidence.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>Part A — A method, not a bag of commands</h2>
+    <p>Beginners debug by trying random commands until something changes. Experienced engineers follow a loop. The official Kubernetes guide starts the same way: <em>"The first step in troubleshooting is triage. What is the problem? Is it your Pods, your Replication Controller or your Service?"</em></p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 300" role="img" aria-label="Troubleshooting loop: observe, triage, hypothesise, test, fix, verify, record">
+        <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box2" x="20" y="30" width="150" height="60" rx="8"/><text x="95" y="56" text-anchor="middle" class="t-bold">1 · Observe</text><text x="95" y="76" text-anchor="middle" class="t-muted">symptom + when it began</text>
+        <rect class="box2" x="230" y="30" width="150" height="60" rx="8"/><text x="305" y="56" text-anchor="middle" class="t-bold">2 · Triage</text><text x="305" y="76" text-anchor="middle" class="t-muted">which layer? blast radius?</text>
+        <rect class="box2" x="440" y="30" width="150" height="60" rx="8"/><text x="515" y="56" text-anchor="middle" class="t-bold">3 · Hypothesise</text><text x="515" y="76" text-anchor="middle" class="t-muted">one testable cause</text>
+        <rect class="box2" x="650" y="30" width="150" height="60" rx="8"/><text x="725" y="56" text-anchor="middle" class="t-bold">4 · Test</text><text x="725" y="76" text-anchor="middle" class="t-muted">command / metric / log</text>
+        <rect class="box4" x="650" y="200" width="150" height="60" rx="8"/><text x="725" y="226" text-anchor="middle" class="t-bold">5 · Fix</text><text x="725" y="246" text-anchor="middle" class="t-muted">smallest safe change</text>
+        <rect class="box4" x="440" y="200" width="150" height="60" rx="8"/><text x="515" y="226" text-anchor="middle" class="t-bold">6 · Verify</text><text x="515" y="246" text-anchor="middle" class="t-muted">symptom gone? SLO met?</text>
+        <rect class="box3" x="230" y="200" width="150" height="60" rx="8"/><text x="305" y="226" text-anchor="middle" class="t-bold">7 · Record</text><text x="305" y="246" text-anchor="middle" class="t-muted">runbook / postmortem</text>
+        <rect class="box3" x="20" y="200" width="150" height="60" rx="8"/><text x="95" y="226" text-anchor="middle" class="t-bold">8 · Prevent</text><text x="95" y="246" text-anchor="middle" class="t-muted">test, alert, guardrail</text>
+        <path class="line" d="M170 60 H228" marker-end="url(#ah)"/>
+        <path class="line" d="M380 60 H438" marker-end="url(#ah)"/>
+        <path class="line" d="M590 60 H648" marker-end="url(#ah)"/>
+        <path class="line" d="M725 90 V198" marker-end="url(#ah)"/>
+        <path class="line" d="M650 230 H592" marker-end="url(#ah)"/>
+        <path class="line" d="M440 230 H382" marker-end="url(#ah)"/>
+        <path class="line" d="M230 230 H172" marker-end="url(#ah)"/>
+        <path class="line dash bad" d="M690 90 C 640 150, 560 150, 530 92" marker-end="url(#ah)"/>
+        <text x="610" y="150" class="t-muted" text-anchor="middle">disproved → new hypothesis</text>
+        <path class="line dash" d="M95 200 V92" marker-end="url(#ah)"/>
+      </svg>
+      <figcaption>The troubleshooting loop. Change one thing at a time; a test that disproves a hypothesis is progress, not failure.</figcaption>
+    </figure>
+
+    <h3>Rules that prevent wasted hours</h3>
+    <ol>
+      <li><strong>Write down the symptom precisely.</strong> "API is broken" is not a symptom. "<code>curl</code> through the Service returns <code>connection refused</code> since 14:02; Pods show <code>0/1 READY</code>" is.</li>
+      <li><strong>Ask "what changed?"</strong> Most incidents follow a change: a new image, a manifest edit, a config change, a dependency, or a traffic increase. <code>kubectl rollout history</code>, <code>git log</code> and CI runs are evidence.</li>
+      <li><strong>Work from the outside in, then the inside out.</strong> Confirm the symptom where the user sees it, then walk inward one layer at a time.</li>
+      <li><strong>Change one variable at a time.</strong> If you change the probe, the image and the resource limits together, you will not know which change fixed it.</li>
+      <li><strong>Distinguish facts from inferences.</strong> "The Pod restarted 4 times" is a fact (from <code>kubectl get pods</code>). "It ran out of memory" is an inference until <code>lastState.terminated.reason</code> says <code>OOMKilled</code>.</li>
+      <li><strong>Missing evidence is not success.</strong> If a dashboard is blank, the test is <em>inconclusive</em>, not passing.</li>
+    </ol>
+
+    <!-- ============================================================ -->
+    <h2>The layer model for reliability-api</h2>
+    <p>Each layer depends on the ones below it. When a symptom appears at the top, find the <em>lowest</em> layer that is broken. A broken layer makes every layer above it look broken too.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 430" role="img" aria-label="Layer stack from cloud and node up to client, with the first command for each layer">
+        <g font-size="13">
+          <rect class="box2" x="20" y="10"  width="420" height="44" rx="6"/><text x="36" y="37" class="t-bold">8 · Client / load generator</text>
+          <rect class="box2" x="20" y="60"  width="420" height="44" rx="6"/><text x="36" y="87" class="t-bold">7 · Ingress / Gateway / port-forward</text>
+          <rect class="box2" x="20" y="110" width="420" height="44" rx="6"/><text x="36" y="137" class="t-bold">6 · Service → EndpointSlices (ready Pods)</text>
+          <rect class="box4" x="20" y="160" width="420" height="44" rx="6"/><text x="36" y="187" class="t-bold">5 · Pod readiness / probes</text>
+          <rect class="box4" x="20" y="210" width="420" height="44" rx="6"/><text x="36" y="237" class="t-bold">4 · Container process (app, config, env)</text>
+          <rect class="box4" x="20" y="260" width="420" height="44" rx="6"/><text x="36" y="287" class="t-bold">3 · Image (name, tag, pull, entrypoint)</text>
+          <rect class="box3" x="20" y="310" width="420" height="44" rx="6"/><text x="36" y="337" class="t-bold">2 · Scheduling (requests, taints, nodes)</text>
+          <rect class="box3" x="20" y="360" width="420" height="44" rx="6"/><text x="36" y="387" class="t-bold">1 · Node / cluster / cloud (kind, GKE)</text>
+        </g>
+        <g class="t-mono">
+          <text x="460" y="37">curl -v http://localhost:8080/ready</text>
+          <text x="460" y="87">kubectl port-forward svc/reliability-api 8080:80</text>
+          <text x="460" y="137">kubectl get endpointslices -l kubernetes.io/service-name=…</text>
+          <text x="460" y="187">kubectl describe pod … (Readiness probe failed)</text>
+          <text x="460" y="237">kubectl logs … --previous</text>
+          <text x="460" y="287">kubectl describe pod … (Events: Failed to pull)</text>
+          <text x="460" y="337">kubectl describe pod … (FailedScheduling)</text>
+          <text x="460" y="387">kubectl get nodes ; kubectl top nodes</text>
+        </g>
+      </svg>
+      <figcaption>Debug bottom-up once you know the symptom. Each layer has one "first command" that usually tells you whether it is healthy.</figcaption>
+    </figure>
+
+    <div class="callout tip"><span class="label">Fast triage in three commands</span>
+      <pre><code>kubectl -n reliability-lab get deploy,rs,pods,svc,endpointslices -o wide
+kubectl -n reliability-lab get events --sort-by=.metadata.creationTimestamp | tail -20
+kubectl -n reliability-lab describe pod -l app.kubernetes.io/name=reliability-api | sed -n '/Conditions/,$p'</code></pre>
+      <p>These three commands show desired vs actual state, the recent timeline, and the per-Pod conditions and Events. That is usually enough to know which layer to investigate.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Reading Pod phases and container states</h2>
+    <p>A Pod has a single high-level <strong>phase</strong>. Each container inside it has its own <strong>state</strong> (<code>Waiting</code>, <code>Running</code>, <code>Terminated</code>) with a <em>reason</em>. The <code>STATUS</code> column in <code>kubectl get pods</code> is a summary that often shows the container reason (for example <code>CrashLoopBackOff</code>), not the phase.</p>
+
+    <div class="table-wrap"><table>
+      <tr><th>Phase</th><th>Official meaning (kubernetes.io, Pod Lifecycle)</th><th>What it usually means for reliability-api</th></tr>
+      <tr><td><code>Pending</code></td><td>Accepted by the cluster, but one or more containers have not been set up and made ready to run. Includes time waiting to be scheduled and downloading images.</td><td>Not scheduled yet (resources/taints) <em>or</em> the image is still pulling or failing to pull.</td></tr>
+      <tr><td><code>Running</code></td><td>Bound to a node and all containers created; at least one is running, starting or restarting.</td><td>"Running" does <strong>not</strong> mean ready or healthy. Check the READY column and restarts.</td></tr>
+      <tr><td><code>Succeeded</code></td><td>All containers terminated in success and will not be restarted.</td><td>Normal for Jobs (e.g. a load-test Job), never expected for the API Deployment.</td></tr>
+      <tr><td><code>Failed</code></td><td>All containers terminated, at least one in failure, and not set for automatic restart.</td><td>Seen in Jobs with <code>restartPolicy: Never</code>.</td></tr>
+      <tr><td><code>Unknown</code></td><td>State could not be obtained, typically a communication problem with the node.</td><td>Node trouble. Check <code>kubectl get nodes</code>.</td></tr>
+    </table></div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="Map from kubectl STATUS values to layers and causes">
+        <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="20" y="24" class="t-bold">STATUS you see</text><text x="330" y="24" class="t-bold">Layer</text><text x="560" y="24" class="t-bold">Typical cause → first check</text>
+        <rect class="box3" x="20" y="40" width="230" height="36" rx="6"/><text x="34" y="63" class="t-mono">Pending</text>
+        <rect class="box3" x="20" y="88" width="230" height="36" rx="6"/><text x="34" y="111" class="t-mono">ErrImagePull / ImagePullBackOff</text>
+        <rect class="box4" x="20" y="136" width="230" height="36" rx="6"/><text x="34" y="159" class="t-mono">CrashLoopBackOff</text>
+        <rect class="box4" x="20" y="184" width="230" height="36" rx="6"/><text x="34" y="207" class="t-mono">OOMKilled (in lastState)</text>
+        <rect class="box4" x="20" y="232" width="230" height="36" rx="6"/><text x="34" y="255" class="t-mono">Running, READY 0/1</text>
+        <rect class="box2" x="20" y="280" width="230" height="36" rx="6"/><text x="34" y="303" class="t-mono">Running 1/1, curl fails</text>
+        <g>
+          <text x="330" y="63">Scheduling</text>
+          <text x="330" y="111">Image</text>
+          <text x="330" y="159">Container process</text>
+          <text x="330" y="207">Resources (memory)</text>
+          <text x="330" y="255">Readiness probe</text>
+          <text x="330" y="303">Service / network</text>
+        </g>
+        <g class="t-muted" font-size="12">
+          <text x="560" y="63">insufficient cpu/memory, taints → Events: FailedScheduling</text>
+          <text x="560" y="111">wrong name/tag, not loaded into kind, auth → Events</text>
+          <text x="560" y="159">app exits on start → logs --previous, exit code</text>
+          <text x="560" y="207">usage &gt; memory limit → raise limit or fix leak</text>
+          <text x="560" y="255">/ready returns 503 or wrong port/path → describe</text>
+          <text x="560" y="303">selector ≠ labels, targetPort wrong → endpointslices</text>
+        </g>
+        <g class="line dash">
+          <path class="line dash" d="M250 58 H322" marker-end="url(#ah2)"/><path class="line dash" d="M250 106 H322" marker-end="url(#ah2)"/>
+          <path class="line dash" d="M250 154 H322" marker-end="url(#ah2)"/><path class="line dash" d="M250 202 H322" marker-end="url(#ah2)"/>
+          <path class="line dash" d="M250 250 H322" marker-end="url(#ah2)"/><path class="line dash" d="M250 298 H322" marker-end="url(#ah2)"/>
+        </g>
+      </svg>
+      <figcaption>The status string tells you which layer to inspect first.</figcaption>
+    </figure>
+
+    <h3>Restart back-off: why CrashLoopBackOff "waits"</h3>
+    <p>When a container keeps failing, the kubelet restarts it with an <strong>exponential back-off delay</strong>. The official Pod Lifecycle page gives the numbers: it starts at 10 seconds, doubles each time, is capped at 5 minutes, and resets after the container has run successfully for 10 minutes. <code>CrashLoopBackOff</code> means the kubelet is waiting out that delay; it is not an error type on its own. Image pulls back off in a similar way, also capped at 5 minutes (Images concept page).</p>
+
+    <div class="widget" id="backoff">
+      <div class="w-title">Back-off timeline explorer</div>
+      <div class="w-sub">Model: 10 s initial delay, doubling, 300 s cap, as documented. Assume each crash happens a few seconds after start. Real timings vary slightly.</div>
+      <label>Seconds the app runs before crashing: <strong id="bo-run">3</strong> s</label>
+      <input type="range" id="bo-run-in" min="1" max="60" value="3">
+      <label>Number of crashes to show: <strong id="bo-n">8</strong></label>
+      <input type="range" id="bo-n-in" min="2" max="12" value="8">
+      <svg id="bo-svg" viewBox="0 0 820 120" role="img" aria-label="Back-off timeline"></svg>
+      <div class="out" id="bo-out"></div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Interactive diagnosis tree</h2>
+    <p>Answer the questions the same way you would at a terminal. Each answer narrows the layer and gives you the next command. Your answers are illustrative; always confirm them with the real output.</p>
+    <div class="widget" id="tree">
+      <div class="w-title">"reliability-api is not responding": guided triage</div>
+      <div class="w-sub">Click an answer. Use Restart to begin again.</div>
+      <div id="tree-q" style="font-weight:600;margin:6px 0"></div>
+      <div id="tree-cmd"></div>
+      <div class="row" id="tree-opts" style="margin-top:10px"></div>
+      <div class="row" style="margin-top:12px"><button class="btn" id="tree-reset">↺ Restart</button><span class="count" id="tree-path" style="font-size:13px;color:var(--muted)"></span></div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>The symptom playbook (expanded)</h2>
+    <p>This is the guide's troubleshooting table, expanded. Each row gives the first command, what to look for in its output, and the usual fixes for <code>reliability-api</code>.</p>
+
+    <h3>1. Pod stuck in <code>Pending</code></h3>
+    <p>The official guide names two classic causes: you have run out of CPU or memory (<em>"delete Pods, adjust resource requests, or add new nodes"</em>), or the Pod uses a <code>hostPort</code>, which limits where it can be placed. Taints, node selectors, affinity and unbound PersistentVolumeClaims are the other usual suspects.</p>
+    <pre data-title="diagnose"><code>kubectl -n reliability-lab describe pod &lt;pod&gt; | sed -n '/Events/,$p'
+kubectl describe nodes | grep -A6 "Allocated resources"</code></pre>
+    <pre data-title="Example output (yours will differ)"><code><span class="o">Events:
+  Type     Reason            From               Message
+  ----     ------            ----               -------
+  Warning  FailedScheduling  default-scheduler  0/1 nodes are available: 1 Insufficient cpu. ...</span></code></pre>
+    <p><strong>Fixes:</strong> lower an unrealistic <code>requests.cpu</code> (for example, someone typed <code>100</code> where they meant <code>100m</code>), lower <code>replicas</code>/<code>maxReplicas</code>, add a kind worker node, or remove a selector or toleration mismatch.</p>
+
+    <h3>2. <code>ErrImagePull</code> / <code>ImagePullBackOff</code></h3>
+    <p>The guide's three checks: the image name is correct, the image was pushed to the registry, and you can pull it manually. kind adds a fourth: a locally built image must be loaded into the cluster nodes with <code>kind load docker-image</code>. Also check the default pull policy. If the tag is <code>:latest</code> or omitted, <code>imagePullPolicy</code> defaults to <code>Always</code>, so the kubelet tries a remote registry even when you loaded the image locally.</p>
+    <pre data-title="diagnose"><code>kubectl -n reliability-lab get pod &lt;pod&gt; -o jsonpath='{.spec.containers[*].image}{"\n"}{.spec.containers[*].imagePullPolicy}{"\n"}'
+docker exec -it reliability-lab-control-plane crictl images | grep reliability-api
+kind load docker-image reliability-api:0.1.0 --name reliability-lab</code></pre>
+
+    <h3>3. <code>CrashLoopBackOff</code></h3>
+    <p>The process keeps exiting. The logs of the <em>current</em> container may be empty because it has only just restarted, so read the <em>previous</em> one. Then read the exit code (see Module 01: <code>137</code> = 128 + 9 = SIGKILL, usually OOM; <code>1</code> = application error).</p>
+    <pre data-title="diagnose"><code>kubectl -n reliability-lab logs &lt;pod&gt; --previous
+kubectl -n reliability-lab get pod &lt;pod&gt; \
+  -o jsonpath='{.status.containerStatuses[0].lastState.terminated}{"\n"}'</code></pre>
+    <pre data-title="Example output (yours will differ)"><code><span class="o">{"exitCode":1,"reason":"Error","startedAt":"...","finishedAt":"..."}</span></code></pre>
+    <p>Common causes for this app: a typo in the command or module path (<code>uvicorn app.mian:app</code>), a missing Python dependency in the image, a bad <code>LOG_LEVEL</code> value that makes <code>logging.basicConfig</code> raise, or a liveness probe that kills a slow-starting container. <strong>Termination messages:</strong> set <code>terminationMessagePolicy: FallbackToLogsOnError</code>. If the termination-message file is empty and the container exited with an error, Kubernetes then uses the last chunk of log output, limited to 2048 bytes or 80 lines, whichever is smaller.</p>
+
+    <h3>4. <code>OOMKilled</code></h3>
+    <pre data-title="diagnose"><code>kubectl -n reliability-lab describe pod &lt;pod&gt; | grep -A4 "Last State"
+kubectl -n reliability-lab top pod</code></pre>
+    <p>Memory usage went above <code>limits.memory</code> (256Mi in our example). Measure real usage under load before you raise the limit, and look for unbounded caches or very large request payloads. A raised limit without measurement is only a guess.</p>
+
+    <h3>5. Running but <code>READY 0/1</code></h3>
+    <p>The readiness probe is failing, so the Pod is removed from the Service endpoints. That is the probe working as designed. Find out <em>why</em> <code>/ready</code> fails: the warm-up from <code>READY_DELAY_SECONDS</code> is longer than expected, the probe uses the wrong port or path, or <code>timeoutSeconds</code> is too short while the CPU is saturated.</p>
+    <pre data-title="diagnose"><code>kubectl -n reliability-lab describe pod &lt;pod&gt; | grep -i -A2 readiness
+kubectl -n reliability-lab exec &lt;pod&gt; -- python -c "import urllib.request as u; print(u.urlopen('http://127.0.0.1:8000/ready').read())"</code></pre>
+
+    <h3>6. Service has no endpoints / requests fail</h3>
+    <p>This follows the official "Debug Services" sequence. Does the Service exist? Does DNS resolve? Does it work by IP? Is it defined correctly? Does it have EndpointSlices? Are the Pods working? Is kube-proxy working?</p>
+    <pre data-title="diagnose"><code>kubectl -n reliability-lab get svc reliability-api -o yaml | grep -A3 -E "selector|ports"
+kubectl -n reliability-lab get pods --show-labels
+kubectl -n reliability-lab get endpointslices -l kubernetes.io/service-name=reliability-api
+kubectl -n reliability-lab run tmp --rm -it --image=busybox --restart=Never -- \
+  sh -c 'nslookup reliability-api; wget -qO- reliability-api/ready'</code></pre>
+    <p>The classic bug is a selector/label mismatch. For example, the Service selects <code>app: reliability-api</code> but the Pods carry <code>app.kubernetes.io/name: reliability-api</code>. The second classic bug is a <code>targetPort</code> that does not match the container port (8000).</p>
+
+    <h3>7. HPA shows <code>&lt;unknown&gt;</code> or does not scale</h3>
+    <pre data-title="diagnose"><code>kubectl -n reliability-lab describe hpa reliability-api
+kubectl get apiservices | grep metrics
+kubectl -n kube-system get pods | grep metrics-server</code></pre>
+    <p>Usual causes: metrics-server is missing (on kind it often needs the <code>--kubelet-insecure-tls</code> flag; see Module 08), CPU <code>requests</code> are missing (CPU utilization is calculated relative to requests), the load is too low, <code>maxReplicas</code> has been reached, or the stabilization window is delaying scale-down.</p>
+
+    <h3>8. More replicas but latency does not improve</h3>
+    <p>Check the bottleneck hypotheses in order. The load generator is saturated (check its own CPU). The node is CPU-saturated, so new replicas share the same cores (<code>kubectl top nodes</code>). There is a CPU limit causing throttling. There is a downstream dependency. Errors are hiding as fast failures. Module 08 covers how to tell these apart.</p>
+
+    <h3>9. Grafana panel is blank</h3>
+    <p>Work backwards. Run the PromQL query in the Prometheus UI first. If it returns nothing, open <strong>Status → Targets</strong>: is <code>reliability-api</code> listed and <code>UP</code>? If it is not listed, the ServiceMonitor selector or labels do not match the Prometheus selector. If the target is DOWN, check the port name or path, or a NetworkPolicy.</p>
+
+    <h3>10. CI pipeline fails</h3>
+    <p>Read the first failing step, not the last. Reproduce it locally with the same command (<code>pytest</code>, <code>docker build</code>). For kind-in-CI failures, print <code>kubectl get events</code> and <code>describe</code> in an <code>if: failure()</code> step so the log contains the evidence.</p>
+
+    <h3>11. Cloud bill continues after the lab</h3>
+    <p>Deleting the cluster does not delete everything. Check load balancers and forwarding rules, reserved static IPs, persistent disks left by PVCs, Artifact Registry images, and log storage. Module 11 has a full cleanup checklist.</p>
+
+    <!-- ============================================================ -->
+    <h2>Debugging inside Pods: exec vs debug</h2>
+    <p>The <code>reliability-api</code> image is built small (Module 02), so it may have no <code>curl</code>, <code>ps</code> or shell tools. Official docs: <em>"Ephemeral containers are useful for interactive troubleshooting when <code>kubectl exec</code> is insufficient because a container has crashed or a container image doesn't include debugging utilities."</em></p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 820 260" role="img" aria-label="Three debugging approaches: exec, ephemeral container, pod copy">
+        <rect class="zone" x="20" y="20" width="240" height="220" rx="10"/><text x="140" y="44" text-anchor="middle" class="t-bold">kubectl exec</text>
+        <rect class="box4" x="50" y="70" width="180" height="70" rx="8"/><text x="140" y="100" text-anchor="middle">app container</text><text x="140" y="120" text-anchor="middle" class="t-muted">needs tools in image</text>
+        <text x="140" y="180" text-anchor="middle" class="t-muted">runs a command in the</text><text x="140" y="196" text-anchor="middle" class="t-muted">existing container</text>
+
+        <rect class="zone" x="290" y="20" width="240" height="220" rx="10"/><text x="410" y="44" text-anchor="middle" class="t-bold">kubectl debug (ephemeral)</text>
+        <rect class="box4" x="310" y="70" width="95" height="70" rx="8"/><text x="357" y="110" text-anchor="middle">app</text>
+        <rect class="box2" x="415" y="70" width="95" height="70" rx="8"/><text x="462" y="102" text-anchor="middle">busybox</text><text x="462" y="120" text-anchor="middle" class="t-muted">--target=app</text>
+        <text x="410" y="180" text-anchor="middle" class="t-muted">added to the SAME live Pod;</text><text x="410" y="196" text-anchor="middle" class="t-muted">cannot be removed afterwards</text>
+
+        <rect class="zone" x="560" y="20" width="240" height="220" rx="10"/><text x="680" y="44" text-anchor="middle" class="t-bold">kubectl debug --copy-to</text>
+        <rect class="box3" x="580" y="70" width="200" height="70" rx="8"/><text x="680" y="100" text-anchor="middle">copy of Pod</text><text x="680" y="120" text-anchor="middle" class="t-muted">+ debug container / new cmd</text>
+        <text x="680" y="180" text-anchor="middle" class="t-muted">original untouched; good for</text><text x="680" y="196" text-anchor="middle" class="t-muted">CrashLoop (change command)</text>
+      </svg>
+      <figcaption>Choose the least intrusive tool that gives you the evidence you need.</figcaption>
+    </figure>
+
+    <pre data-title="commands (from the kubectl debug reference)"><code><span class="c"># ephemeral container sharing the app container's process namespace</span>
+kubectl -n reliability-lab debug -it &lt;pod&gt; --image=busybox --target=reliability-api
+
+<span class="c"># copy the Pod and override the crashing container's command with a shell</span>
+kubectl -n reliability-lab debug &lt;pod&gt; -it --copy-to=api-debug --container=reliability-api -- sh
+
+<span class="c"># debug a node: runs in host namespaces, host filesystem mounted at /host</span>
+kubectl debug node/reliability-lab-control-plane -it --image=busybox
+
+<span class="c"># clean up the copy afterwards</span>
+kubectl -n reliability-lab delete pod api-debug</code></pre>
+    <div class="callout warn"><span class="label">Know the limits</span>
+      <p>The official docs say ephemeral containers <em>"lack guarantees for resources or execution, and they will never be automatically restarted"</em>. They also say <em>"you may not change or remove an ephemeral container after you have added it to a Pod."</em> Ports, probes and <code>resources</code> are not allowed on them. Use them on a test cluster freely, and on a shared cluster only with permission.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Practice: break-it scenarios</h2>
+    <p>Run each scenario on the kind cluster in a scratch namespace. Write down your <em>hypothesis before</em> you reveal the answer. These drills build troubleshooting skill fastest.</p>
+
+    <section class="lab"><header>Lab 13.1 — Set up a break-it namespace</header><div class="body">
+      <ol class="steps">
+        <li>Create a scratch copy of your working manifests:
+<pre><code>kubectl create namespace breakit
+kubectl -n breakit apply -f deploy/kubernetes/   <span class="c"># Deployment + Service + ConfigMap from Module 03–05</span>
+kubectl -n breakit rollout status deploy/reliability-api</code></pre></li>
+        <li>For each scenario below, apply the <em>break</em>, observe it with the fast-triage commands, write your hypothesis, then reveal the answer.</li>
+        <li>Restore after each one: <code>kubectl -n breakit apply -f deploy/kubernetes/</code></li>
+        <li>When finished: <code>kubectl delete namespace breakit</code></li>
+      </ol>
+    </div></section>
+
+    <details class="q"><summary>Scenario A — <code>kubectl -n breakit set image deploy/reliability-api reliability-api=reliability-api:0.9.9</code></summary><div class="a">
+      <p><strong>Symptom:</strong> a new Pod shows <code>ErrImagePull</code> → <code>ImagePullBackOff</code>. The old Pods <em>keep serving</em>, because the rolling update does not remove old replicas until new ones are available. This is why rolling updates protect you.</p>
+      <p><strong>Evidence:</strong> <code>describe pod</code> Events show the failed pull. <code>kubectl rollout status</code> does not complete.</p>
+      <p><strong>Fix:</strong> <code>kubectl -n breakit rollout undo deploy/reliability-api</code>.</p></div></details>
+
+    <details class="q"><summary>Scenario B — patch the readiness probe path to <code>/readyz</code></summary><div class="a">
+      <pre><code>kubectl -n breakit patch deploy reliability-api --type=json -p \
+ '[{"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/readyz"}]'</code></pre>
+      <p><strong>Symptom:</strong> new Pods are <code>Running</code> but <code>0/1</code> READY. The rollout stalls and old Pods stay. Events show <code>Readiness probe failed: HTTP probe failed with statuscode: 404</code>.</p>
+      <p><strong>Lesson:</strong> readiness failures never restart a container. They only remove it from endpoints.</p></div></details>
+
+    <details class="q"><summary>Scenario C — set the liveness probe <code>initialDelaySeconds: 0</code>, <code>failureThreshold: 1</code>, and <code>READY_DELAY_SECONDS=30</code> with liveness pointing at <code>/ready</code></summary><div class="a">
+      <p><strong>Symptom:</strong> restarts climb and the Pod ends in <code>CrashLoopBackOff</code>. The app is healthy but is killed while it is still warming up, because liveness checks a readiness-style endpoint.</p>
+      <p><strong>Lesson:</strong> liveness should check "is the process stuck?" (<code>/health</code>). Use a <code>startupProbe</code> for slow starts. A wrong liveness probe makes an incident worse.</p></div></details>
+
+    <details class="q"><summary>Scenario D — change the Service selector to <code>app: reliability-api</code></summary><div class="a">
+      <p><strong>Symptom:</strong> Pods are 1/1 Ready, but requests through the Service fail and <code>endpointslices</code> lists no endpoints.</p>
+      <p><strong>Evidence:</strong> <code>kubectl get pods --show-labels</code> vs <code>kubectl get svc -o yaml</code>.</p>
+      <p><strong>Lesson:</strong> the Service ↔ Pod link is only a label query.</p></div></details>
+
+    <details class="q"><summary>Scenario E — set <code>resources.requests.cpu: "8"</code> and replicas 3 on a single-node kind cluster</summary><div class="a">
+      <p><strong>Symptom:</strong> new Pods stay <code>Pending</code>. Events show <code>FailedScheduling … Insufficient cpu</code>.</p>
+      <p><strong>Lesson:</strong> the scheduler uses <em>requests</em>, not actual usage. An idle Pod with a big request still blocks the node.</p></div></details>
+
+    <details class="q"><summary>Scenario F — set <code>limits.memory: 20Mi</code></summary><div class="a">
+      <p><strong>Symptom:</strong> the container is killed at start or under load. <code>lastState.terminated.reason: OOMKilled</code>, exit code <code>137</code>.</p>
+      <p><strong>Lesson:</strong> memory limits are enforced by killing the process. CPU limits are enforced by throttling it.</p></div></details>
+
+    <details class="q"><summary>Scenario G — change the container's command to <code>uvicorn app.mian:app</code></summary><div class="a">
+      <p><strong>Symptom:</strong> <code>CrashLoopBackOff</code>. <code>logs --previous</code> shows a Python import error and the exit code is non-zero.</p>
+      <p><strong>Lesson:</strong> always read <code>--previous</code>. The current container may not have logged anything yet.</p></div></details>
+
+    <details class="q"><summary>Scenario H — apply a default-deny NetworkPolicy in the namespace</summary><div class="a">
+      <p><strong>Symptom:</strong> this depends on your network plugin. If it enforces NetworkPolicy, in-cluster <code>wget</code> calls to the Service time out. If it does not, you see <em>no change at all</em>. That is the lesson: kubernetes.io states that a NetworkPolicy has no effect unless the network plugin implements it. kind ships its own simple CNI (kindnetd). Whether yours enforces policies depends on the kind version, so check the kind release notes. You can also set <code>disableDefaultCNI: true</code> and install a CNI that enforces policies (kind Configuration docs).</p>
+      <p><strong>Diagnose:</strong> <code>kubectl -n breakit get networkpolicy</code>, then test from a busybox Pod. The policy's Pod selector and namespace decide which traffic is blocked.</p></div></details>
+
+    <!-- ============================================================ -->
+    <h2>Part B — The capstone: Kubernetes Reliability Lab</h2>
+    <p>The capstone puts Modules 01–12 into one repository. Your claim is not "I used Kubernetes". It is the claim from the study guide:</p>
+    <div class="callout example"><span class="label">The portfolio statement you are earning</span>
+      <p>"I built a reproducible service deployment, defined measurable reliability targets, generated controlled load, observed scaling and failure behavior, diagnosed problems with real metrics, automated the test/deploy path, and documented the limits of what I proved."</p>
+      <p>Each phrase in that statement must point to a file, a dashboard, a CI run or an experiment record in the repo.</p>
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 420" role="img" aria-label="Capstone architecture: GitHub Actions builds image, kind cluster runs reliability-api with HPA, Prometheus and Grafana, k6 load and failure experiments produce reports">
+        <defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect class="box3" x="20" y="20" width="180" height="56" rx="8"/><text x="110" y="44" text-anchor="middle" class="t-bold">GitHub repo</text><text x="110" y="62" text-anchor="middle" class="t-muted">app · deploy · experiments</text>
+        <rect class="box3" x="20" y="110" width="180" height="70" rx="8"/><text x="110" y="134" text-anchor="middle" class="t-bold">GitHub Actions</text><text x="110" y="152" text-anchor="middle" class="t-muted">test → build → scan</text><text x="110" y="168" text-anchor="middle" class="t-muted">→ kind integration</text>
+        <rect class="box3" x="20" y="214" width="180" height="50" rx="8"/><text x="110" y="244" text-anchor="middle">GHCR image :sha</text>
+        <path class="line" d="M110 76 V108" marker-end="url(#ah3)"/><path class="line" d="M110 180 V212" marker-end="url(#ah3)"/>
+
+        <rect class="zone" x="240" y="20" width="440" height="380" rx="12"/><text x="260" y="42" class="t-bold">kind cluster: reliability-lab</text>
+        <rect class="zone" x="260" y="56" width="400" height="190" rx="10"/><text x="275" y="76" class="t-muted">namespace reliability-lab (Helm release reliability-api)</text>
+        <rect class="box2" x="280" y="90" width="120" height="44" rx="6"/><text x="340" y="117" text-anchor="middle">Service :80</text>
+        <rect class="box4" x="440" y="86" width="90" height="40" rx="6"/><text x="485" y="111" text-anchor="middle">Pod</text>
+        <rect class="box4" x="545" y="86" width="90" height="40" rx="6"/><text x="590" y="111" text-anchor="middle">Pod</text>
+        <rect class="box4" x="440" y="136" width="90" height="40" rx="6" style="opacity:.55"/><text x="485" y="161" text-anchor="middle" class="t-muted">Pod (HPA)</text>
+        <rect class="box2" x="280" y="190" width="160" height="44" rx="6"/><text x="360" y="217" text-anchor="middle">HPA 2–6 @ 60% CPU</text>
+        <rect class="box2" x="470" y="190" width="170" height="44" rx="6"/><text x="555" y="217" text-anchor="middle">metrics-server</text>
+        <path class="line" d="M400 112 H438" marker-end="url(#ah3)"/>
+        <path class="line dash" d="M360 190 V140 H438" marker-end="url(#ah3)"/>
+
+        <rect class="zone" x="260" y="260" width="400" height="120" rx="10"/><text x="275" y="280" class="t-muted">namespace monitoring (kube-prometheus-stack)</text>
+        <rect class="box" x="280" y="300" width="140" height="56" rx="6"/><text x="350" y="324" text-anchor="middle">Prometheus</text><text x="350" y="342" text-anchor="middle" class="t-muted">ServiceMonitor</text>
+        <rect class="box" x="450" y="300" width="90" height="56" rx="6"/><text x="495" y="332" text-anchor="middle">Grafana</text>
+        <rect class="box" x="560" y="300" width="90" height="56" rx="6"/><text x="605" y="324" text-anchor="middle">Alert-</text><text x="605" y="342" text-anchor="middle">manager</text>
+        <path class="line dash" d="M350 300 V180 H438" marker-end="url(#ah3)"/>
+        <path class="line" d="M420 328 H448" marker-end="url(#ah3)"/>
+
+        <rect class="box3" x="710" y="80" width="130" height="56" rx="8"/><text x="775" y="104" text-anchor="middle" class="t-bold">k6 load</text><text x="775" y="122" text-anchor="middle" class="t-muted">profiles + thresholds</text>
+        <rect class="box3" x="710" y="170" width="130" height="56" rx="8"/><text x="775" y="194" text-anchor="middle" class="t-bold">Failure runs</text><text x="775" y="212" text-anchor="middle" class="t-muted">delete pod, bad image</text>
+        <rect class="box4" x="710" y="300" width="130" height="70" rx="8"/><text x="775" y="326" text-anchor="middle" class="t-bold">Reports</text><text x="775" y="344" text-anchor="middle" class="t-muted">JSON + Markdown</text><text x="775" y="360" text-anchor="middle" class="t-muted">+ dashboard JSON</text>
+        <path class="line" d="M710 108 H660 V112 H402" marker-end="url(#ah3)"/>
+        <path class="line dash" d="M710 198 H640" marker-end="url(#ah3)"/>
+        <path class="line" d="M775 136 V168" /><path class="line" d="M775 226 V298" marker-end="url(#ah3)"/>
+        <path class="line dash" d="M540 328 C 620 390, 680 380, 708 340" marker-end="url(#ah3)"/>
+        <path class="line" d="M200 240 H230 V100 H278" marker-end="url(#ah3)"/>
+      </svg>
+      <figcaption>Capstone architecture (local-first). The GKE and AI-inference phases reuse this exact shape: only the cluster and the workload change.</figcaption>
+    </figure>
+
+    <h3>Milestones, evidence and exit criteria</h3>
+    <p>Each milestone maps to the modules that teach it. Tick a milestone only when its <em>evidence</em> exists in the repository. Ticks are saved in this browser.</p>
+    <div class="widget" id="ms">
+      <div class="w-title">Capstone progress</div>
+      <div class="w-sub" id="ms-sum"></div>
+      <div class="table-wrap"><table id="ms-table">
+        <tr><th style="width:36px"></th><th>Milestone</th><th>Modules</th><th>Evidence that must exist</th><th>Exit criterion</th></tr>
+      </table></div>
+    </div>
+
+    <h3>Repository layout (target)</h3>
+    <pre data-title="kubernetes-reliability-lab/"><code>kubernetes-reliability-lab/
+├── app/                      <span class="c"># main.py (canonical example), tests/</span>
+├── Dockerfile  .dockerignore <span class="c"># Module 02</span>
+├── charts/reliability-api/   <span class="c"># chart after raw YAML is understood (Module 06)</span>
+├── deploy/
+│   ├── kubernetes/           <span class="c"># raw manifests first (Modules 03–05)</span>
+│   └── monitoring/         <span class="c"># ServiceMonitor, alert rules, dashboard JSON (Module 07)</span>
+├── experiments/
+│   ├── load/                 <span class="c"># k6 scripts, profiles (Module 08)</span>
+│   ├── failure/              <span class="c"># procedures for delete-pod, bad-image, readiness</span>
+│   └── reports/              <span class="c"># dated JSON + Markdown reports</span>
+├── infra/terraform/          <span class="c"># optional GKE phase (Modules 10–11)</span>
+├── .github/workflows/ci.yml  <span class="c"># Module 09</span>
+├── docs/  architecture.md runbook.md troubleshooting.md experiments.md
+├── Makefile                  <span class="c"># make cluster, make deploy, make load, make clean</span>
+└── README.md</code></pre>
+    <p>Create directories only when they have contents. An empty <code>infra/</code> folder implies work that has not been done.</p>
+
+    <h3>Makefile: one command per step</h3>
+    <p>A reviewer should be able to reproduce your lab without reading every doc. A thin Makefile gives each step one obvious entry point.</p>
+    <pre data-title="Makefile (illustrative)"><code>CLUSTER ?= reliability-lab
+IMAGE   ?= reliability-api:0.1.0
+NS      ?= reliability-lab
+
+cluster:      ## create local cluster
+	kind create cluster --name $(CLUSTER)
+image:        ## build and load image into kind
+	docker build -t $(IMAGE) .
+	kind load docker-image $(IMAGE) --name $(CLUSTER)
+deploy:       ## install/upgrade the chart
+	helm upgrade --install reliability-api charts/reliability-api -n $(NS) --create-namespace --wait
+smoke:        ## verify through the Service
+	kubectl -n $(NS) run smoke --rm -i --restart=Never --image=busybox -- wget -qO- reliability-api/ready
+load:         ## baseline load test
+	k6 run experiments/load/baseline.js --summary-export experiments/reports/$$(date +%F)-baseline.json
+clean:        ## delete everything local
+	kind delete cluster --name $(CLUSTER)</code></pre>
+    <p class="c">Makefile recipes must be indented with a real tab character. Commands follow Modules 02, 06 and 08. Verify the flags against your installed tool versions.</p>
+
+    <!-- ============================================================ -->
+    <h2>Experiment record template</h2>
+    <p>The study guide separates four kinds of evidence: <strong>concept note</strong>, <strong>experiment plan</strong>, <strong>experiment record</strong> and <strong>conclusion</strong>. Write the plan, including the success criteria, <em>before</em> you run the experiment. Fill in the record only with what you observed.</p>
+    <pre data-title="experiments/reports/2026-11-05-delete-pod.md (template)"><code># Experiment: delete one of two API Pods under steady load
+
+## Plan (written before running)
+- Hypothesis: with 2 ready replicas and a readiness probe, deleting one Pod causes
+  < 1% failed requests and the Service recovers to its SLO within 60 s.
+- Success criteria (test SLO): error ratio ≤ 1% over the 5-min window; p95 ≤ 250 ms
+  outside the impact window.
+- Abort condition: error ratio > 20% for 30 s.
+
+## Environment
+- Date/time (UTC):            | kind version:        | Kubernetes version:
+- Host CPU/RAM:               | Docker resources:    | Image digest:
+- Chart version / values file:| Replicas / HPA:      | Load tool + version:
+
+## Workload
+- Model: open (constant arrival rate) | Rate: __ req/s | Duration: __ | Warm-up: __
+- Endpoint: GET /work?ms=50 | Sample size (requests): __
+
+## Procedure (exact commands)
+1. ...
+2. Fault injected at T0 = ________ (kubectl delete pod ... ; timestamp from `date -u`)
+
+## Observed results (measured, not expected)
+| Metric | Before | During impact | After |
+|---|---|---|---|
+| Throughput (req/s) | | | |
+| Error ratio | | | |
+| p50 / p95 / p99 (ms) | | | |
+| Ready replicas | | | |
+- Impact window: __ s     - Recovery time (to SLO): __ s     - Failed requests: __ / __
+
+## Evidence
+- k6 summary JSON: ...    - Grafana screenshot / dashboard JSON: ...    - kubectl events excerpt: ...
+
+## Conclusion
+- What the data supports:
+- What remains uncertain / possible biases (e.g. single run, laptop noise, load-generator CPU):
+- Next experiment:</code></pre>
+
+    <div class="callout danger"><span class="label">Integrity rule</span>
+      <p>Never put an expected number in the "Observed results" section. If a metric was not captured, write <em>"not captured — inconclusive"</em>. Reviewers trust a small, honest result far more than a large, unsupported one.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Production-readiness checklist</h2>
+    <p>This is the study guide's checklist in interactive form, saved in this browser. "Done" means you can point to the evidence.</p>
+    <div class="widget" id="prc">
+      <div class="w-title">Readiness checklist</div>
+      <div class="w-sub" id="prc-sum"></div>
+      <div id="prc-body"></div>
+      <div class="row" style="margin-top:10px"><button class="btn" id="prc-reset">Reset checklist</button></div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Runbook skeleton</h2>
+    <p>A runbook is what someone reads during an incident. Keep it short, specific to <code>reliability-api</code>, and made of commands.</p>
+    <pre data-title="docs/runbook.md (skeleton)"><code># reliability-api runbook
+
+## Service summary
+Purpose, owners, dashboards (links), SLOs, dependencies.
+
+## Alert: HighErrorRatio (error ratio > X% for 5m)
+1. Check dashboard panel "Error rate" — which path/status?
+2. kubectl -n reliability-lab get pods,endpointslices
+3. Recent change?  kubectl -n reliability-lab rollout history deploy/reliability-api ; helm history reliability-api -n reliability-lab
+4. If started after a release:  helm rollback reliability-api &lt;rev&gt; -n reliability-lab
+5. Record timeline in incident notes.
+
+## Alert: PodsNotReady
+...
+
+## Routine operations
+- Deploy, rollback, scale, rotate config, restart (kubectl rollout restart).</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>Interview preparation</h2>
+    <p>For each topic, practise a 30-second plain-language answer, then one deeper example from <em>your</em> lab. The study guide's note template ends with the same pattern.</p>
+
+    <details class="q"><summary>"A Pod is in CrashLoopBackOff. Walk me through it."</summary><div class="a">
+      <p>"CrashLoopBackOff means the container keeps exiting and the kubelet is waiting before the next restart. The delay starts at 10 seconds, doubles, and is capped at 5 minutes. First I run <code>kubectl logs --previous</code> to see why the last instance died, and I read <code>lastState.terminated</code> for the exit code and reason. 137 with OOMKilled points to memory. Exit code 1 points to an application error. Then I check whether a liveness probe is killing a slow start. In my lab, a typo in the uvicorn module path produced an import error, which I found in the previous logs."</p></div></details>
+    <details class="q"><summary>"Readiness vs liveness vs startup probes?"</summary><div class="a">
+      <p>"Readiness decides whether a Pod receives traffic. When it fails, the Pod is removed from the endpoints and is not restarted. Liveness decides whether to restart a stuck container. Startup protects slow starters by holding off the other probes until the app has started. In my lab I pointed liveness at the warm-up-dependent /ready endpoint and caused a restart loop, so liveness now checks /health and readiness checks /ready."</p></div></details>
+    <details class="q"><summary>"How does the HPA decide how many replicas to run?"</summary><div class="a">
+      <p>"Roughly desired = ceil(current × currentMetric / targetMetric), with a tolerance so it does not react to small changes and a stabilization window for scale-down. For CPU, utilization is measured against the Pod's CPU request. That is why requests have to be set and realistic. I showed in my lab that scaling stopped improving latency once the single kind node was CPU-saturated, so HPA without node capacity has a ceiling."</p></div></details>
+    <details class="q"><summary>"How did you measure recovery?"</summary><div class="a">
+      <p>"I defined the test SLO and the recovery criteria before the run. I kept the load at a constant arrival rate, recorded the fault timestamp, and measured the impact window as the time when the error ratio or p95 broke the target. Recovery time ran until the metrics returned within the SLO. I report the failed-request count, the sample size and the biases, such as a single run on a laptop."</p></div></details>
+    <details class="q"><summary>"What is the difference between Terraform and Helm?"</summary><div class="a">
+      <p>"Terraform provisions infrastructure through provider APIs, such as the VPC, the GKE cluster and IAM, and it tracks that infrastructure in state. Helm packages and releases applications <em>inside</em> a cluster as versioned releases that you can upgrade and roll back. GitHub Actions automates running both. They are different layers."</p></div></details>
+    <details class="q"><summary>"Why not use :latest?"</summary><div class="a">
+      <p>"It is mutable, so two deploys of the same tag can run different code, and rollbacks become ambiguous. In Kubernetes, <code>:latest</code> or an omitted tag also defaults <code>imagePullPolicy</code> to <code>Always</code>. I tag images with the git SHA in CI and can pin by digest."</p></div></details>
+    <details class="q"><summary>"Prometheus is installed, so why doesn't HPA use my custom metric?"</summary><div class="a">
+      <p>"The standard HPA reads CPU and memory from the resource metrics API, which is usually served by metrics-server. Custom metrics need an adapter that implements the custom or external metrics API, such as prometheus-adapter, or a tool such as KEDA. Installing Prometheus alone does not connect it to the HPA."</p></div></details>
+    <details class="q"><summary>"Tell me about a time a test was misleading."</summary><div class="a">
+      <p>Prepare a real story from your lab. Two good examples: a load generator that saturated its own CPU so latency looked flat, or a blank Grafana panel that had been read as "no errors". Explain how you detected it and what guardrail you added, such as recording load-generator CPU or marking runs with missing metrics as inconclusive.</p></div></details>
+
+    <!-- ============================================================ -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Need</th><th>Command</th></tr>
+      <tr><td>Everything at a glance</td><td><code>kubectl -n NS get deploy,rs,pods,svc,endpointslices -o wide</code></td></tr>
+      <tr><td>Timeline</td><td><code>kubectl -n NS get events --sort-by=.metadata.creationTimestamp</code></td></tr>
+      <tr><td>Why a Pod is unhappy</td><td><code>kubectl -n NS describe pod POD</code></td></tr>
+      <tr><td>Logs of the crashed instance</td><td><code>kubectl -n NS logs POD --previous</code></td></tr>
+      <tr><td>Exit code / reason</td><td><code>kubectl -n NS get pod POD -o jsonpath='{.status.containerStatuses[0].lastState}'</code></td></tr>
+      <tr><td>Service ↔ Pods link</td><td><code>kubectl -n NS get endpointslices -l kubernetes.io/service-name=SVC</code></td></tr>
+      <tr><td>In-cluster HTTP test</td><td><code>kubectl -n NS run tmp --rm -it --image=busybox --restart=Never -- wget -qO- SVC/ready</code></td></tr>
+      <tr><td>Debug distroless/crashed</td><td><code>kubectl debug -it POD --image=busybox --target=CONTAINER</code></td></tr>
+      <tr><td>Debug by copy</td><td><code>kubectl debug POD -it --copy-to=NAME --container=CONTAINER -- sh</code></td></tr>
+      <tr><td>Rollout state / undo</td><td><code>kubectl rollout status|history|undo deploy/NAME</code></td></tr>
+      <tr><td>Helm release history / rollback</td><td><code>helm history REL -n NS</code> · <code>helm rollback REL REV -n NS</code></td></tr>
+      <tr><td>HPA reasoning</td><td><code>kubectl -n NS describe hpa NAME</code></td></tr>
+      <tr><td>Resource usage</td><td><code>kubectl top pods -n NS</code> · <code>kubectl top nodes</code></td></tr>
+      <tr><td>Can I do X?</td><td><code>kubectl auth can-i VERB RESOURCE -n NS</code></td></tr>
+    </table></div>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. A Pod shows STATUS <code>Running</code>. Is it serving traffic?</summary><div class="a">Not necessarily. Running means it is bound to a node and its containers were created. Check the READY column and the EndpointSlices; only ready Pods receive Service traffic.</div></details>
+    <details class="q"><summary>2. Why can <code>kubectl logs POD</code> be empty for a CrashLoopBackOff Pod?</summary><div class="a">The current container may have just restarted, or may be waiting out its back-off. Use <code>--previous</code> to read the last terminated instance.</div></details>
+    <details class="q"><summary>3. Pending + "Insufficient cpu" on an idle cluster: how?</summary><div class="a">Scheduling uses <em>requests</em>. The sum of requests on the node can be "full" while actual usage is low.</div></details>
+    <details class="q"><summary>4. You changed the image and a probe at the same time and the rollout fails. What's wrong with your process?</summary><div class="a">Two variables changed at once. Roll back, then change one thing at a time so the cause is identifiable.</div></details>
+    <details class="q"><summary>5. When would you use <code>--copy-to</code> rather than an ephemeral container?</summary><div class="a">When you need to change the Pod, for example to override the crashing container's command with <code>sh</code> or swap images, without touching the live Pod. Ephemeral containers also cannot be removed once added.</div></details>
+    <details class="q"><summary>6. Your Grafana error-rate panel is blank during a load test. Did the test pass?</summary><div class="a">No. It is inconclusive. Check the query in Prometheus and the target health first.</div></details>
+    <details class="q"><summary>7. What resets the CrashLoopBackOff delay?</summary><div class="a">The container running successfully for 10 minutes (Pod Lifecycle docs). Deleting or replacing the Pod also starts fresh.</div></details>
+    <details class="q"><summary>8. Name the official Debug Services checks in order.</summary><div class="a">Service exists → network policy ingress rules → works by DNS name → works by IP → defined correctly → has EndpointSlices → Pods working → kube-proxy working.</div></details>
+    <details class="q"><summary>9. What makes an experiment result trustworthy in a portfolio?</summary><div class="a">A plan with success criteria written beforehand, the recorded environment and exact commands, measured values with sample size, attached raw evidence, and an honest list of limitations.</div></details>
+    <details class="q"><summary>10. Image pulled fine yesterday on kind; today ImagePullBackOff with tag <code>latest</code>. Why?</summary><div class="a">With <code>:latest</code>, <code>imagePullPolicy</code> defaults to <code>Always</code>, so the kubelet tries the remote registry even if the image was loaded locally. Use a specific tag, or set <code>IfNotPresent</code> for locally loaded images.</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://kubernetes.io/docs/tasks/debug/debug-application/">Troubleshooting Applications — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-pods/">Debug Pods — kubernetes.io</a> (triage quote, Pending causes, image-pull checks)</li>
+      <li><a href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-service/">Debug Services — kubernetes.io</a> (ordered checks)</li>
+      <li><a href="https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/">Debug Running Pods — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/kubectl/generated/kubectl_debug/">kubectl debug reference — kubernetes.io</a> (--target, --copy-to, node debugging)</li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/ephemeral-containers/">Ephemeral Containers — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/debug/debug-application/determine-reason-pod-failure/">Determine the Reason for Pod Failure — kubernetes.io</a> (termination messages)</li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/">Pod Lifecycle — kubernetes.io</a> (phases, restart back-off)</li>
+      <li><a href="https://kubernetes.io/docs/concepts/containers/images/">Images — kubernetes.io</a> (imagePullPolicy defaults, pull back-off)</li>
+      <li><a href="https://kubernetes.io/docs/concepts/services-networking/network-policies/">Network Policies — kubernetes.io</a></li>
+      <li><a href="https://kind.sigs.k8s.io/docs/user/configuration/">kind Configuration — kind.sigs.k8s.io</a> (kindnetd, disableDefaultCNI)</li>
+      <li><a href="https://sre.google/sre-book/effective-troubleshooting/">Effective Troubleshooting (Ch. 12) — Google SRE Book</a> (problem report → triage → examine → diagnose → test/treat → cure)</li>
+      <li>Course study guide: <code>devops_kubernetes_study_and_build_guide.md</code> (Parts VII–IX)</li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="12-ai-inference.html"><small>◀ Previous</small>Module 12 · AI Inference on Kubernetes</a>
+      <a class="next" href="index.html"><small>Back to ▶</small>Syllabus & progress</a>
+    </nav>
+  </article></main>
+</div>
+
+<script>
+(function () {
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  };
+  const NS = "http://www.w3.org/2000/svg";
+
+  // ---------- back-off explorer ----------
+  const runIn = document.getElementById("bo-run-in"), nIn = document.getElementById("bo-n-in");
+  function backoff() {
+    const run = +runIn.value, n = +nIn.value;
+    document.getElementById("bo-run").textContent = run;
+    document.getElementById("bo-n").textContent = n;
+    const ev = []; let t = 0, delay = 10;
+    for (let i = 0; i < n; i++) {
+      ev.push({ start: t, crash: t + run, wait: i < n - 1 ? delay : 0 });
+      t += run + (i < n - 1 ? delay : 0);
+      delay = Math.min(delay * 2, 300);
+    }
+    const total = t, svg = document.getElementById("bo-svg");
+    svg.innerHTML = "";
+    const W = 780, x0 = 20, sx = v => x0 + (v / total) * W;
+    ev.forEach((e, i) => {
+      const r = document.createElementNS(NS, "rect");
+      r.setAttribute("x", sx(e.start)); r.setAttribute("y", 30);
+      r.setAttribute("width", Math.max(2, sx(e.crash) - sx(e.start))); r.setAttribute("height", 26);
+      r.setAttribute("class", "box4"); svg.appendChild(r);
+      if (e.wait) {
+        const w = document.createElementNS(NS, "rect");
+        w.setAttribute("x", sx(e.crash)); w.setAttribute("y", 36);
+        w.setAttribute("width", Math.max(1, sx(e.crash + e.wait) - sx(e.crash))); w.setAttribute("height", 14);
+        w.setAttribute("class", "box3"); svg.appendChild(w);
+        if (sx(e.crash + e.wait) - sx(e.crash) > 34) {
+          const tx = document.createElementNS(NS, "text");
+          tx.setAttribute("x", (sx(e.crash) + sx(e.crash + e.wait)) / 2); tx.setAttribute("y", 80);
+          tx.setAttribute("text-anchor", "middle"); tx.setAttribute("class", "t-muted"); tx.textContent = e.wait + "s";
+          svg.appendChild(tx);
+        }
+      }
+      const d = document.createElementNS(NS, "circle");
+      d.setAttribute("cx", sx(e.crash)); d.setAttribute("cy", 43); d.setAttribute("r", 4); d.setAttribute("class", "dot-bad");
+      svg.appendChild(d);
+    });
+    const lab = document.createElementNS(NS, "text");
+    lab.setAttribute("x", 20); lab.setAttribute("y", 108); lab.setAttribute("class", "t-muted");
+    lab.textContent = "green = running · red dot = crash · amber = back-off wait · total ≈ " + Math.round(total) + " s (" + (total / 60).toFixed(1) + " min)";
+    svg.appendChild(lab);
+    const waits = ev.filter(e => e.wait).map(e => e.wait);
+    document.getElementById("bo-out").textContent =
+      "Waits between restarts: " + waits.join("s, ") + "s\n" +
+      "Time to observe " + n + " crashes: ~" + Math.round(total) + " s.\n" +
+      (waits.includes(300) ? "Cap reached: each further restart waits 300 s, so a fix can take up to 5 min to show unless you delete the Pod or roll out." : "Cap of 300 s not yet reached.");
+  }
+  runIn.addEventListener("input", backoff); nIn.addEventListener("input", backoff); backoff();
+
+  // ---------- diagnosis tree ----------
+  const T = {
+    start: { q: "Do the reliability-api Pods exist and what does READY show?", cmd: "kubectl -n reliability-lab get pods -l app.kubernetes.io/name=reliability-api",
+      o: [["No Pods at all", "nopods"], ["Pending", "pending"], ["ImagePullBackOff / ErrImagePull", "image"], ["CrashLoopBackOff / restarts rising", "crash"], ["Running, 0/1 READY", "unready"], ["Running, 1/1 READY", "ready"]] },
+    nopods: { q: "Does the Deployment/ReplicaSet exist and report errors?", cmd: "kubectl -n reliability-lab get deploy,rs\nkubectl -n reliability-lab describe rs -l app.kubernetes.io/name=reliability-api | sed -n '/Events/,$p'",
+      o: [["Deployment missing", "end:Not deployed (wrong namespace? helm release failed?). Check: helm list -n reliability-lab ; kubectl get deploy -A"], ["RS events: forbidden / quota exceeded", "end:Admission blocked creation (ResourceQuota, LimitRange, PodSecurity). Read the event message and adjust requests/limits or securityContext."], ["Replicas set to 0", "end:Scaled to zero. kubectl scale or check HPA minReplicas / values.yaml."]] },
+    pending: { q: "What does the FailedScheduling event say?", cmd: "kubectl -n reliability-lab describe pod <pod> | sed -n '/Events/,$p'",
+      o: [["Insufficient cpu / memory", "end:Requests exceed free allocatable capacity. Lower requests, reduce replicas/maxReplicas, or add a node (kind config with workers)."], ["untolerated taint / node selector mismatch", "end:Fix nodeSelector/affinity or add the toleration (Module 04)."], ["unbound PersistentVolumeClaim", "end:PVC not bound: check StorageClass and kubectl get pvc (Module 05)."], ["No events yet", "end:Scheduler may simply not have run yet, or the scheduler is unhealthy: kubectl get pods -n kube-system."]] },
+    image: { q: "Which image reference is the Pod using, and is it reachable?", cmd: "kubectl -n reliability-lab get pod <pod> -o jsonpath='{.spec.containers[0].image} {.spec.containers[0].imagePullPolicy}'",
+      o: [["Typo / tag doesn't exist", "end:Correct the tag in values.yaml / manifest, or rollout undo."], ["Local image on kind, policy Always (tag latest)", "end:Use a fixed tag + kind load docker-image, or set imagePullPolicy: IfNotPresent."], ["Private registry (GHCR/AR), 401/403 in events", "end:Missing imagePullSecrets or registry permissions (Modules 09, 11)."]] },
+    crash: { q: "What do the previous logs and exit code say?", cmd: "kubectl -n reliability-lab logs <pod> --previous\nkubectl -n reliability-lab get pod <pod> -o jsonpath='{.status.containerStatuses[0].lastState.terminated}'",
+      o: [["reason OOMKilled / exit 137", "end:Memory limit exceeded. Measure usage under load; fix leak or raise limits.memory with evidence."], ["Python traceback / exit 1", "end:Application/config error (bad module path, missing dependency, bad env var). Fix, rebuild with a new tag, redeploy."], ["Logs look healthy, events show 'Liveness probe failed'", "end:Liveness probe kills a healthy-but-slow app. Point liveness at /health, add startupProbe, increase thresholds."], ["exit 0 immediately", "end:Process finished instead of serving (wrong CMD, e.g. a script that exits). A Deployment expects a long-running server."]] },
+    unready: { q: "What does the readiness probe event say?", cmd: "kubectl -n reliability-lab describe pod <pod> | grep -i -A2 readiness",
+      o: [["statuscode: 503", "end:App reports not ready, e.g. still within READY_DELAY_SECONDS warm-up or dependency down. Expected during warm-up; investigate if persistent."], ["statuscode: 404", "end:Wrong probe path. Must be /ready."], ["connection refused", "end:Wrong port, or app bound to 127.0.0.1 instead of 0.0.0.0 (Module 01)."], ["context deadline exceeded / timeout", "end:App too slow to answer (CPU saturation/throttling). Check kubectl top, CPU limits, timeoutSeconds."]] },
+    ready: { q: "Pods are ready. Does the Service have endpoints?", cmd: "kubectl -n reliability-lab get endpointslices -l kubernetes.io/service-name=reliability-api",
+      o: [["No endpoints", "end:Selector ≠ Pod labels. Compare kubectl get svc -o yaml selector with kubectl get pods --show-labels."], ["Endpoints exist, in-cluster wget fails", "svcport"], ["In-cluster works, my laptop curl fails", "end:Access path problem: port-forward not running, wrong local port, or kind extraPortMappings/NodePort missing (Modules 05–06)."]] },
+    svcport: { q: "Does the Service targetPort match the containerPort (8000)?", cmd: "kubectl -n reliability-lab get svc reliability-api -o jsonpath='{.spec.ports}'",
+      o: [["targetPort is wrong", "end:Fix targetPort (or use a named port 'http' on both sides)."], ["Ports correct", "end:Check NetworkPolicy, DNS (nslookup reliability-api from a busybox Pod), and kube-proxy per the official Debug Services guide."]] },
+  };
+  let path = [];
+  const qEl = document.getElementById("tree-q"), cEl = document.getElementById("tree-cmd"), oEl = document.getElementById("tree-opts"), pEl = document.getElementById("tree-path");
+  function show(key) {
+    oEl.innerHTML = "";
+    if (key.startsWith("end:")) {
+      qEl.textContent = "Likely cause and fix";
+      cEl.innerHTML = '<div class="callout tip" style="margin:6px 0"><span class="label">Diagnosis</span></div>';
+      cEl.querySelector(".callout").appendChild(document.createTextNode(key.slice(4)));
+      pEl.textContent = path.join(" → ");
+      return;
+    }
+    const n = T[key];
+    qEl.textContent = n.q;
+    cEl.innerHTML = "";
+    const pre = document.createElement("pre"); const code = document.createElement("code");
+    code.textContent = n.cmd; pre.appendChild(code); cEl.appendChild(pre);
+    n.o.forEach(([label, next]) => {
+      const b = document.createElement("button"); b.className = "btn"; b.textContent = label;
+      b.onclick = () => { path.push(label); show(next); };
+      oEl.appendChild(b);
+    });
+    pEl.textContent = path.join(" → ");
+  }
+  document.getElementById("tree-reset").onclick = () => { path = []; show("start"); };
+  show("start");
+
+  // ---------- milestones ----------
+  const MS = [
+    ["M0 Baseline environment", "01, 02", "README setup section, API example, container logs", "Image builds & runs from clean checkout without host Python packages"],
+    ["M1 Container reliability", "01, 02", "Dockerfile (multi-stage, non-root), .dockerignore, image size noted", "Can explain why a container exited and show how you found it"],
+    ["M2 Kubernetes fundamentals", "03, 05, 06", "deploy/kubernetes/*.yaml with explanations, architecture diagram", "Deleted Pod is replaced; can explain Service vs Pod IP"],
+    ["M3 Health & resources", "04", "Probes + requests/limits with rationale, troubleshooting notes from break-it labs", "Distinguish app error vs scheduling vs image vs probe vs resource issue"],
+    ["M4 Observability", "07", "/metrics, ServiceMonitor, dashboard JSON, panel interpretations", "Known load change visible and explained on the dashboard"],
+    ["M5 Load, scaling, recovery", "08", "k6 scripts, baseline vs HPA report, delete-pod recovery report", "Can say whether scaling improved target metrics and what limited it"],
+    ["M6 CI/CD & packaging", "06, 09", ".github/workflows/ci.yml, green & red runs, Helm chart, upgrade/rollback steps", "Clean commit passes or fails for a clear reason; deployment reproducible"],
+    ["M7 IaC & cloud (optional)", "10, 11", "Terraform, plan output review, cost checklist, cleanup proof", "Can explain Terraform vs Helm; destroyed lab resources verified"],
+    ["M8 AI inference (optional)", "12", "Model server deployment, AIPerf/benchmark report baseline vs candidate", "Separates model quality, serving perf, client latency, infra health"],
+  ];
+  const tbl = document.getElementById("ms-table");
+  function msSum() {
+    const done = MS.filter((_, i) => store.get("notes-ms-" + i) === "1").length;
+    document.getElementById("ms-sum").textContent = done + " of " + MS.length + " milestones evidenced";
+  }
+  MS.forEach((m, i) => {
+    const tr = document.createElement("tr");
+    const td0 = document.createElement("td"); const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = store.get("notes-ms-" + i) === "1"; cb.setAttribute("aria-label", m[0]);
+    cb.onchange = () => { store.set("notes-ms-" + i, cb.checked ? "1" : "0"); msSum(); };
+    td0.appendChild(cb); tr.appendChild(td0);
+    m.forEach((v, j) => { const td = document.createElement("td"); td.textContent = v; if (j === 0) td.style.fontWeight = 600; tr.appendChild(td); });
+    tbl.appendChild(tr);
+  });
+  msSum();
+
+  // ---------- production checklist ----------
+  const PRC = {
+    "Application": ["Health and readiness behaviour is intentional and tested", "Configuration is environment-driven; secrets not committed", "Errors handled; logs useful and free of sensitive content", "Unit tests and a simple integration test exist"],
+    "Container": ["Image builds reproducibly from a clean checkout", "Runtime image not unnecessarily large", "Runs as non-root where practical", "Image tags versioned; dependencies controlled", ".dockerignore excludes local state, secrets, unrelated files"],
+    "Kubernetes": ["Names, labels and selectors consistent", "Readiness/liveness/startup probes not used interchangeably", "Requests/limits set and justified", "RBAC follows least privilege", "Service traffic reaches only ready endpoints", "Rollout and rollback behaviour tested", "Secrets protected appropriately"],
+    "Observability": ["Metrics instrumented and validated", "Dashboards have clear units and definitions", "Alerts correspond to actionable conditions", "Load-test output records workload and environment", "Results reproducible or limitations documented"],
+    "CI/CD & security": ["CI fails on required check failures", "Image build and scan automated", "Pipeline permissions limited", "Secrets via CI/platform mechanism, not source", "Scan results documented"],
+    "Documentation": ["Quick start works from a clean machine", "Architecture and data flow documented", "Failure modes and recovery steps included", "Experiment results distinguish measured vs example values", "Cloud resources and cleanup steps explicit"],
+  };
+  const body = document.getElementById("prc-body");
+  const all = [];
+  function prcSum() {
+    const d = all.filter(c => c.checked).length;
+    document.getElementById("prc-sum").textContent = d + " / " + all.length + " items evidenced (" + Math.round(d / all.length * 100) + "%)";
+  }
+  Object.entries(PRC).forEach(([sec, items]) => {
+    const h = document.createElement("h4"); h.textContent = sec; body.appendChild(h);
+    items.forEach((it, i) => {
+      const key = "notes-prc-" + sec + "-" + i;
+      const lab = document.createElement("label"); lab.style.display = "flex"; lab.style.gap = "8px"; lab.style.margin = "4px 0";
+      const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = store.get(key) === "1";
+      cb.onchange = () => { store.set(key, cb.checked ? "1" : "0"); prcSum(); };
+      all.push(cb);
+      lab.appendChild(cb); lab.appendChild(document.createTextNode(it)); body.appendChild(lab);
+    });
+  });
+  document.getElementById("prc-reset").onclick = () => {
+    Object.entries(PRC).forEach(([sec, items]) => items.forEach((_, i) => store.set("notes-prc-" + sec + "-" + i, "0")));
+    all.forEach(c => c.checked = false); prcSum();
+  };
+  prcSum();
+})();
+</script>
+</body>
+</html>

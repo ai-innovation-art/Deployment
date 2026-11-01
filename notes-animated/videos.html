@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Explainer Videos — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/anim.css">
+<script src="assets/notes.js"></script>
+<script src="assets/anim.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Animated edition · Explainer video gallery</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<main style="max-width:1180px;margin:0 auto;padding:28px 20px 80px">
+  <h1>Explainer videos</h1>
+  <p class="lede">Each module has a short animated explainer of its core idea. Watch it first, then read the module, then do the lab. The videos use the same running example (<code>reliability-api</code>) and the same verified facts as the notes.</p>
+  <div class="meta"><span class="pill accent">13 videos</span><span class="pill">≈ 1 min each</span><span class="pill">Manim Community (MIT)</span><span class="pill">Works offline</span></div>
+  <div class="gallery" id="gallery"></div>
+  <h2>How these were made</h2>
+  <p>The videos are rendered with <a href="https://www.manim.community/">Manim Community</a>, the open-source, MIT-licensed animation engine created for math explainers. Every scene is plain Python in <code>video-src/</code>, and <code>common.py</code> holds the shared visual style. To re-render one at 720p:</p>
+  <pre><code>cd video-src
+manim -qm m03_kubectl_apply.py M03KubectlApply</code></pre>
+  <p>The diagrams inside each module are animated in the browser by <code>assets/anim.js</code>. It uses the browser's built-in Web Animations API, with no third-party code. A diagram builds itself the first time it scrolls into view, then shows data flowing along its arrows. Use <strong>▶ Replay build</strong> and <strong>⏸ Pause flow</strong> under each diagram to control it.</p>
+</main>
+<script>
+(function () {
+  const V = [
+    ["01", "01-linux-networking.html", "Binding, ports & the TCP handshake"],
+    ["02", "02-docker.html", "Image layers & the build cache"],
+    ["03", "03-kubernetes-architecture.html", "The life of kubectl apply"],
+    ["04", "04-kubernetes-workloads.html", "Probes & rolling updates"],
+    ["05", "05-kubernetes-networking-config.html", "A request through a Service"],
+    ["06", "06-kind-helm.html", "kind clusters & Helm releases"],
+    ["07", "07-observability.html", "Prometheus, histograms & PromQL"],
+    ["08", "08-scaling-load-failure.html", "The HPA control loop & recovery"],
+    ["09", "09-cicd-github-actions.html", "A CI/CD pipeline run"],
+    ["10", "10-terraform.html", "Terraform: config, state & reality"],
+    ["11", "11-gke-cloud.html", "GKE & keyless identity"],
+    ["12", "12-ai-inference.html", "LLM inference: prefill, decode & batching"],
+    ["13", "13-troubleshooting-capstone.html", "Troubleshooting by layers"],
+  ];
+  const g = document.getElementById("gallery");
+  V.forEach(([n, page, title]) => {
+    const s = document.createElement("section");
+    s.className = "explainer";
+    s.innerHTML = '<header><span class="pill accent">Module ' + n + '</span><span></span></header>' +
+      '<video controls preload="metadata" playsinline poster="videos/m' + n + '.jpg" src="videos/m' + n + '.mp4"></video>' +
+      '<div class="ex-foot"><a href="' + page + '#explainer-video">Open the module →</a></div>';
+    s.querySelector("header span:last-child").textContent = title;
+    g.appendChild(s);
+  });
+})();
+</script>
+</body>
+</html>

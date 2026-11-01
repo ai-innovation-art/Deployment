@@ -1,0 +1,1511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 04 · Workloads: Probes, Resources, Scheduling &amp; Rollouts — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/anim.css">
+<script src="assets/notes.js"></script>
+<script src="assets/anim.js"></script>
+<style>
+  .grid-form { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px 14px; }
+  .grid-form label { margin: 4px 0 2px; font-size: 13px; }
+  .grid-form input[type="number"], .grid-form select { width: 100%; }
+  .fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px 10px; margin-top: 10px; }
+  .fieldset > legend { font-size: 13px; font-weight: 700; padding: 0 6px; }
+  .verdict { display:inline-block; font-weight:700; padding: 4px 12px; border-radius: 999px; margin-top: 10px; }
+  .verdict.g { background: var(--ok-soft); color: var(--ok); }
+  .verdict.b { background: var(--warn-soft); color: var(--warn); }
+  .verdict.e { background: var(--bad-soft); color: var(--bad); }
+  .roll-row { display:flex; gap:4px; flex-wrap:wrap; align-items:center; font-family: var(--mono); font-size: 12.5px; margin: 3px 0; }
+  .sq { display:inline-block; width:16px; height:16px; border-radius:4px; border:1px solid var(--d-stroke); }
+  .sq.old { background: var(--d-fill-2); }
+  .sq.newnr { background: var(--warn-soft); }
+  .sq.new { background: var(--ok-soft); border-color: var(--ok); }
+  .sq.term { background: var(--bad-soft); }
+  .sim-svg { width: 100%; height: auto; display:block; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 04 · Workloads: Probes, Resources, Scheduling &amp; Rollouts</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="04"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 04 · Workloads: Probes, Resources, Scheduling &amp; Rollouts</h1>
+    <p class="lede">Module 03 got two replicas of <code>reliability-api</code> running. This module is about keeping them <em>healthy</em> and <em>changing them safely</em>. You will learn how the kubelet decides a container is alive or ready, what CPU and memory requests and limits really do inside the Linux kernel, how Pods are classified for eviction, how the scheduler picks a node, how a rolling update moves traffic from v0.1.0 to v0.2.0 without dropping requests, and what exactly happens in the 30 seconds after you delete a Pod. Almost every production incident on Kubernetes involves at least one of these topics.</p>
+    <div class="meta"><span class="pill accent">Prereq: Module 03 · Kubernetes Architecture</span><span class="pill">≈ 5 h study + 4 h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+    <section class="explainer" id="explainer-video"><header>🎬 Animated explainer <span class="pill accent">Probes & rolling updates</span></header><video controls preload="metadata" playsinline poster="videos/m04.jpg" src="videos/m04.mp4"></video><div class="ex-foot"><strong>Watch first, then read.</strong> Readiness vs liveness vs startup, then a maxSurge 1 / maxUnavailable 0 rollout — and what a bad image does. Rendered with Manim Community (MIT); source: <code>video-src/</code>. Facts match this page's verified sections.</div></section>
+
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Explain the different questions liveness, readiness and startup probes answer, and the action Kubernetes takes on each failure.</li>
+      <li>Configure probes with all five timing fields and compute detection and start-up windows from them.</li>
+      <li>Explain requests vs limits for CPU and memory, the units, and the different enforcement (CFS throttling vs OOM kill).</li>
+      <li>Classify any Pod into Guaranteed / Burstable / BestEffort and explain what that means under node pressure.</li>
+      <li>Describe scheduling as filtering then scoring; use nodeSelector, affinity/anti-affinity, taints/tolerations and topology spread.</li>
+      <li>Compute <code>maxSurge</code>/<code>maxUnavailable</code> for any replica count, watch a rollout and roll it back.</li>
+      <li>Read Pod phases, container states and conditions; explain CrashLoopBackOff timing.</li>
+      <li>Walk through graceful termination (preStop, SIGTERM, endpoint removal, grace period, SIGKILL) and configure <code>reliability-api</code> to drain cleanly.</li>
+      <li>Protect availability during voluntary disruptions with a PodDisruptionBudget.</li>
+      <li>Know when to use Jobs, CronJobs, DaemonSets and StatefulSets instead of a Deployment.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>1. Health probes: liveness, readiness, startup</h2>
+    <p><strong>Definition.</strong> A probe is a diagnostic the <strong>kubelet</strong> performs periodically on a container. Each probe returns <em>Success</em>, <em>Failure</em> or <em>Unknown</em>. There are three kinds, and the difference between them is not the check — it is <strong>what Kubernetes does with the result</strong>.</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Probe</th><th>Question it answers</th><th>On failure (after <code>failureThreshold</code>)</th><th>reliability-api endpoint</th></tr></thead>
+      <tbody>
+        <tr><td><strong>startup</strong></td><td>Has the app finished starting?</td><td>Kill the container; restart per <code>restartPolicy</code>. While it has not succeeded, liveness and readiness are <em>not run</em>.</td><td><code>/health</code></td></tr>
+        <tr><td><strong>liveness</strong></td><td>Is the process stuck in a way only a restart fixes?</td><td>Kill and restart the container (same Pod, restart count +1).</td><td><code>/health</code></td></tr>
+        <tr><td><strong>readiness</strong></td><td>Should this Pod receive traffic <em>right now</em>?</td><td>Mark container not ready → Pod <code>Ready=False</code> → EndpointSlice controller removes the Pod IP from all matching Services. <strong>No restart.</strong> Probing continues for the Pod's whole life.</td><td><code>/ready</code></td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>Problem they solve.</strong> "The process exists" is not the same as "the service works". Without probes Kubernetes only knows whether PID 1 is running: a deadlocked app would stay in rotation forever, and a warming-up app would receive traffic before it can answer. Probes let the platform react to <em>application-level</em> health.</p>
+    <p>If a container does not define a probe, the kubelet treats that probe's result as Success. One subtlety from the docs: for readiness, the result is considered <em>Failure</em> before the initial delay — a new Pod is not Ready until a readiness probe has actually passed.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 330" role="img" aria-label="How the kubelet acts on probe results: startup gates the others; liveness failure restarts the container; readiness failure removes the Pod from Service endpoints">
+        <defs><marker id="b1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="20" y="130" width="150" height="60" rx="10" class="box2"/>
+        <text x="95" y="156" text-anchor="middle" class="t-bold">kubelet</text>
+        <text x="95" y="174" text-anchor="middle" class="t-muted">runs probes</text>
+        <rect x="230" y="20" width="200" height="56" rx="8" class="box3"/>
+        <text x="330" y="43" text-anchor="middle" class="t-bold">startupProbe</text>
+        <text x="330" y="61" text-anchor="middle" class="t-mono">GET /health</text>
+        <rect x="230" y="132" width="200" height="56" rx="8" class="box3"/>
+        <text x="330" y="155" text-anchor="middle" class="t-bold">livenessProbe</text>
+        <text x="330" y="173" text-anchor="middle" class="t-mono">GET /health</text>
+        <rect x="230" y="244" width="200" height="56" rx="8" class="box3"/>
+        <text x="330" y="267" text-anchor="middle" class="t-bold">readinessProbe</text>
+        <text x="330" y="285" text-anchor="middle" class="t-mono">GET /ready</text>
+        <path d="M170 150 L228 52" class="line" marker-end="url(#b1)"/>
+        <path d="M170 160 L228 160" class="line" marker-end="url(#b1)"/>
+        <path d="M170 170 L228 268" class="line" marker-end="url(#b1)"/>
+        <path d="M330 76 L330 130" class="line dash" marker-end="url(#b1)"/>
+        <text x="340" y="108" class="t-muted">gates both until success</text>
+        <rect x="510" y="20" width="330" height="56" rx="8" class="box"/>
+        <text x="675" y="43" text-anchor="middle">N failures → kill &amp; restart container</text>
+        <text x="675" y="61" text-anchor="middle" class="t-muted">window = failureThreshold × periodSeconds</text>
+        <rect x="510" y="132" width="330" height="56" rx="8" class="box"/>
+        <text x="675" y="155" text-anchor="middle">N failures → kill &amp; restart container</text>
+        <text x="675" y="173" text-anchor="middle" class="t-muted">same Pod, same IP, RESTARTS +1</text>
+        <rect x="510" y="244" width="330" height="56" rx="8" class="box4"/>
+        <text x="675" y="267" text-anchor="middle">N failures → Ready=False, out of Service</text>
+        <text x="675" y="285" text-anchor="middle" class="t-muted">M successes → back in · never restarts</text>
+        <path d="M430 48 L508 48" class="line bad" marker-end="url(#b1)"/>
+        <path d="M430 160 L508 160" class="line bad" marker-end="url(#b1)"/>
+        <path d="M430 272 L508 272" class="line ok" marker-end="url(#b1)"/>
+      </svg>
+      <figcaption>Figure 1 — Same mechanism, three different consequences. Liveness and startup failures are destructive (restart); readiness failures are reversible (traffic only).</figcaption>
+    </figure>
+
+    <h3>Check mechanisms</h3>
+    <p>Each probe must define exactly one mechanism:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Mechanism</th><th>Success when</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>httpGet</code></td><td>HTTP status ≥ 200 and &lt; 400</td><td>Sent by the kubelet to the Pod IP on <code>port</code> (number or named port) and <code>path</code>. Optional <code>httpHeaders</code> and <code>scheme: HTTPS</code>. The kubelet follows redirects only to the same host; a redirect to another host is treated as success with a <code>ProbeWarning</code> event. The natural choice for <code>reliability-api</code>.</td></tr>
+        <tr><td><code>tcpSocket</code></td><td>TCP connection opens</td><td>Only proves something is listening. Good for non-HTTP servers; weak for HTTP apps.</td></tr>
+        <tr><td><code>exec</code></td><td>Command exits with 0</td><td>Runs inside the container (the binary must exist in the image). The docs warn exec forks processes on every run, adding node CPU overhead at high Pod density.</td></tr>
+        <tr><td><code>grpc</code></td><td>Health service returns <code>SERVING</code></td><td>For gRPC apps implementing the standard gRPC health-checking protocol. Generally available.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Timing fields and their defaults</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Field</th><th>Default</th><th>Min</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>initialDelaySeconds</code></td><td>0</td><td>0</td><td>Seconds after the container starts before the probe begins. With a startup probe, liveness/readiness delays start counting only after startup succeeds.</td></tr>
+        <tr><td><code>periodSeconds</code></td><td>10</td><td>1</td><td>How often to probe. (While a container is not Ready, readiness may be run more often than this to make the Pod ready faster.)</td></tr>
+        <tr><td><code>timeoutSeconds</code></td><td>1</td><td>1</td><td>How long to wait for a response; a timeout is a failure.</td></tr>
+        <tr><td><code>successThreshold</code></td><td>1</td><td>1</td><td>Consecutive successes needed to count as passing after a failure. <strong>Must be 1</strong> for liveness and startup.</td></tr>
+        <tr><td><code>failureThreshold</code></td><td>3</td><td>1</td><td>Consecutive failures before acting (restart for liveness/startup; not-ready for readiness).</td></tr>
+        <tr><td><code>terminationGracePeriodSeconds</code> (probe-level)</td><td>inherits Pod's (30)</td><td>1</td><td>Liveness/startup only: grace period used when the probe triggers a kill, if you want it shorter than the Pod-level value.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>The arithmetic you should do for every probe</h3>
+    <ul>
+      <li><strong>Time to detect a failure</strong> ≈ <code>failureThreshold × periodSeconds</code> (plus up to <code>timeoutSeconds</code> for the last attempt). Defaults: 3 × 10 s ≈ 30 s.</li>
+      <li><strong>Maximum start-up allowance with a startup probe</strong> = <code>failureThreshold × periodSeconds</code>. The docs' example uses 30 × 10 s = up to 300 s to start, without making liveness slow afterwards.</li>
+      <li><strong>Time to become Ready</strong> ≥ app warm-up, rounded up to the next readiness probe tick (+ <code>successThreshold − 1</code> extra periods).</li>
+      <li><strong>Time to return to Ready after a blip</strong> = <code>successThreshold × periodSeconds</code>.</li>
+    </ul>
+
+    <div class="widget" id="probe-sim">
+      <div class="w-title">Probe timeline simulator — reliability-api</div>
+      <div class="w-sub">An idealised 1-second model of the kubelet. The app binds its port after the bind time, returns 503 on <code>/ready</code> until <code>READY_DELAY_SECONDS</code> after start, and (optionally) deadlocks at a chosen time: both endpoints then time out. A restart clears the deadlock. Real kubelets add jitter and restart back-off; this model restarts after 1 s.</div>
+      <div class="row" style="margin-bottom:6px">
+        <button class="btn" data-preset="good">Preset: recommended</button>
+        <button class="btn" data-preset="badlive">Preset: liveness on /ready + slow warm-up</button>
+        <button class="btn" data-preset="nostartup">Preset: slow start, no startup probe</button>
+        <button class="btn" data-preset="hang">Preset: deadlock at t=60s</button>
+      </div>
+      <fieldset class="fieldset"><legend>App behaviour</legend><div class="grid-form">
+        <label>bind time (s)<input type="number" id="ps-bind" min="0" max="100" value="2"></label>
+        <label>READY_DELAY_SECONDS<input type="number" id="ps-ready" min="0" max="150" value="5"></label>
+        <label>deadlock at t= (0 = never)<input type="number" id="ps-hang" min="0" max="170" value="0"></label>
+      </div></fieldset>
+      <fieldset class="fieldset"><legend>startupProbe <label style="display:inline;font-weight:400"><input type="checkbox" id="ps-s-on"> enabled</label></legend><div class="grid-form">
+        <label>periodSeconds<input type="number" id="ps-s-period" min="1" max="60" value="5"></label>
+        <label>failureThreshold<input type="number" id="ps-s-ft" min="1" max="60" value="12"></label>
+      </div></fieldset>
+      <fieldset class="fieldset"><legend>livenessProbe</legend><div class="grid-form">
+        <label>path<select id="ps-l-path"><option>/health</option><option>/ready</option></select></label>
+        <label>initialDelaySeconds<input type="number" id="ps-l-delay" min="0" max="120" value="0"></label>
+        <label>periodSeconds<input type="number" id="ps-l-period" min="1" max="60" value="10"></label>
+        <label>failureThreshold<input type="number" id="ps-l-ft" min="1" max="20" value="3"></label>
+      </div></fieldset>
+      <fieldset class="fieldset"><legend>readinessProbe (GET /ready)</legend><div class="grid-form">
+        <label>initialDelaySeconds<input type="number" id="ps-r-delay" min="0" max="120" value="0"></label>
+        <label>periodSeconds<input type="number" id="ps-r-period" min="1" max="60" value="5"></label>
+        <label>failureThreshold<input type="number" id="ps-r-ft" min="1" max="20" value="3"></label>
+        <label>successThreshold<input type="number" id="ps-r-st" min="1" max="10" value="1"></label>
+      </div></fieldset>
+      <div id="ps-svg"></div>
+      <div class="out" id="ps-out"></div>
+    </div>
+
+    <h3>Correct probe configuration for reliability-api</h3>
+    <p>Our app has exactly the endpoints we need: <code>/health</code> returns 200 as long as the event loop answers; <code>/ready</code> returns 503 until <code>READY_DELAY_SECONDS</code> have passed since start. In a real service, readiness would also reflect "my model is loaded / my cache is warm / I am not shedding load".</p>
+    <pre data-title="Container probes in deploy/kubernetes/deployment.yaml"><code>          env:
+            - name: READY_DELAY_SECONDS
+              value: "20"              <span class="c"># simulate a 20 s warm-up for this module</span>
+          startupProbe:                <span class="c"># protects slow starts; disables the others until it passes</span>
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 12       <span class="c"># up to 60 s to bind the port before we give up</span>
+          readinessProbe:              <span class="c"># traffic gate: only route to Pods that are warmed up</span>
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3        <span class="c"># ~15 s of failures before removal from endpoints</span>
+            successThreshold: 1
+          livenessProbe:               <span class="c"># deadlock detector: restart only if truly stuck</span>
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3        <span class="c"># ~30 s of consecutive failures before a restart</span></code></pre>
+    <p>Why these choices:</p>
+    <ul>
+      <li><strong>Liveness uses <code>/health</code>, not <code>/ready</code>.</strong> A Pod that is warming up or temporarily overloaded is <em>not ready</em>, but killing it makes things worse: it restarts, warms up again, and the remaining replicas take even more load. Readiness handles "not now"; liveness handles "never again without a restart".</li>
+      <li><strong>Startup probe instead of a big <code>initialDelaySeconds</code>.</strong> A fixed delay is paid on every start even when the app is fast, and is still wrong when the app is slower than expected. The startup probe ends as soon as the app answers and allows up to 60 s if it is slow.</li>
+      <li><strong><code>timeoutSeconds: 2</code>.</strong> The default 1 s is tight. <code>/work</code> is a CPU-bound busy loop; when a Pod is saturated by load, <code>/health</code> responses can queue behind it. A too-short timeout turns load into liveness failures and restarts — a cascading failure. Tune it with data from load tests (Module 08).</li>
+      <li><strong>Liveness never checks dependencies.</strong> If a database were down and liveness checked it, every replica would restart simultaneously — and the database would still be down.</li>
+    </ul>
+
+    <h3>Failure cases &amp; how to diagnose</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Symptom</th><th>Typical cause</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr><td><code>READY 0/1</code> forever, no restarts</td><td>Readiness path/port wrong, or app never becomes ready</td><td><code>kubectl describe pod</code> → Events: <code>Readiness probe failed: HTTP probe failed with statuscode: 503</code> (or 404, or connection refused)</td></tr>
+        <tr><td>RESTARTS climbing every ~30 s, then <code>CrashLoopBackOff</code></td><td>Liveness failing (wrong path, too-short timeout, slow start without startup probe)</td><td>Events: <code>Liveness probe failed: …</code> followed by <code>Container reliability-api failed liveness probe, will be restarted</code>; <code>Last State: Terminated</code> with <code>Exit Code: 137</code> or <code>143</code></td></tr>
+        <tr><td>Restarts only under load</td><td>Probe timeouts during CPU saturation</td><td>Events show <code>context deadline exceeded</code> / timeout; correlate with load test timing</td></tr>
+        <tr><td>Rollout never finishes</td><td>New Pods never Ready</td><td><code>kubectl rollout status</code> hangs; Deployment condition <code>ProgressDeadlineExceeded</code> after 600 s</td></tr>
+      </tbody>
+    </table></div>
+    <p>Event message wording varies slightly between Kubernetes versions; the reason fields (<code>Unhealthy</code>, <code>Killing</code>, <code>BackOff</code>) are the stable things to grep for: <code>kubectl get events --field-selector reason=Unhealthy</code>.</p>
+
+    <details class="q"><summary>Self-check: Readiness fails on one of two replicas for 2 minutes. What do clients see, and what does Kubernetes do to the container?</summary><div class="a">Clients going through the Service are routed only to the other replica (more load on it, but no errors from the unready one). Kubernetes does nothing to the container — no restart — and keeps probing; when readiness passes again it is added back to the endpoints.</div></details>
+    <details class="q"><summary>Self-check: With <code>periodSeconds: 10</code> and <code>failureThreshold: 3</code>, how long can a deadlocked container keep running before restart? How would you halve it, and what is the risk?</summary><div class="a">About 30 s (three failed probes 10 s apart, plus up to the timeout). Halve with <code>periodSeconds: 5</code> (or <code>failureThreshold</code> lower). Risk: more false positives — a brief GC pause or load spike could trigger an unnecessary restart. Faster detection always trades against false restarts.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>2. Resource requests and limits</h2>
+    <p><strong>Definitions.</strong> For each container you can set, per resource (CPU, memory, and others like ephemeral-storage):</p>
+    <ul>
+      <li><strong>request</strong> — the amount the scheduler reserves for the container when choosing a node, and (for CPU) its relative weight under contention. A container <em>may</em> use more than its request if the node has spare capacity.</li>
+      <li><strong>limit</strong> — a ceiling enforced by the kernel through cgroups. For CPU it is a hard cap enforced by <strong>throttling</strong>; for memory it is enforced reactively by the <strong>OOM killer</strong>.</li>
+    </ul>
+    <p><strong>Problem it solves.</strong> Without requests the scheduler cannot know whether a node has room, so it overpacks nodes and Pods starve each other. Without limits a single leaking Pod can consume a node's memory and trigger evictions of innocent neighbours. Requests make placement predictable; limits contain the blast radius.</p>
+
+    <h3>Units</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Resource</th><th>Unit</th><th>Examples</th><th>Gotchas</th></tr></thead>
+      <tbody>
+        <tr><td>CPU</td><td>cpu units: 1 = one physical core or one virtual core (vCPU)</td><td><code>100m</code> = <code>0.1</code> = one hundred millicpu; <code>1500m</code> = <code>1.5</code></td><td>Precision finer than <code>1m</code> is not allowed. CPU is absolute: 500m is about the same compute on a 2-core or a 48-core node.</td></tr>
+        <tr><td>Memory</td><td>bytes, with suffixes</td><td><code>128Mi</code> = 128 × 2<sup>20</sup> = 134,217,728 bytes; <code>128M</code> = 128,000,000 bytes</td><td>Case matters: <code>400m</code> of memory means 0.4 <em>bytes</em> (m = milli). You meant <code>400Mi</code>. Prefer binary suffixes <code>Ki</code>, <code>Mi</code>, <code>Gi</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>If you set a limit but no request for a resource (and no admission policy sets a default), Kubernetes copies the limit into the request.</p>
+
+    <h3>What the scheduler sees: requests, not usage</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Scheduler fits Pods by requests against node allocatable CPU; a new Pod requesting 1500m does not fit although actual usage is low">
+        <rect x="40" y="40" width="560" height="60" rx="8" class="box"/>
+        <text x="40" y="30" class="t-bold">Node allocatable CPU: 2000m (illustrative)</text>
+        <rect x="40" y="40" width="168" height="60" rx="8" class="box2"/>
+        <text x="124" y="66" text-anchor="middle">system Pods</text>
+        <text x="124" y="84" text-anchor="middle" class="t-mono">600m req</text>
+        <rect x="208" y="40" width="28" height="60" class="box4"/>
+        <rect x="236" y="40" width="28" height="60" class="box4"/>
+        <text x="250" y="122" text-anchor="middle" class="t-muted">2 × reliability-api (100m each)</text>
+        <rect x="264" y="40" width="168" height="60" class="box3"/>
+        <text x="348" y="66" text-anchor="middle">other app</text>
+        <text x="348" y="84" text-anchor="middle" class="t-mono">600m req</text>
+        <text x="516" y="66" text-anchor="middle" class="t-bold">free: 600m</text>
+        <text x="516" y="84" text-anchor="middle" class="t-muted">(by requests)</text>
+        <rect x="40" y="160" width="420" height="60" rx="8" class="box" style="stroke-dasharray:5 4"/>
+        <text x="250" y="186" text-anchor="middle" class="t-bold">new Pod requests 1500m</text>
+        <text x="250" y="204" text-anchor="middle" class="t-muted">1500m &gt; 600m free → filtered out → Pending</text>
+        <circle cx="480" cy="190" r="8" class="dot-bad"/>
+        <rect x="620" y="40" width="220" height="180" rx="10" class="box2"/>
+        <text x="730" y="66" text-anchor="middle" class="t-bold">Actual usage now</text>
+        <text x="730" y="90" text-anchor="middle" class="t-mono">~400m</text>
+        <text x="730" y="120" text-anchor="middle" class="t-muted">Irrelevant to the</text>
+        <text x="730" y="138" text-anchor="middle" class="t-muted">scheduler's fit check:</text>
+        <text x="730" y="156" text-anchor="middle" class="t-muted">it sums requests of</text>
+        <text x="730" y="174" text-anchor="middle" class="t-muted">Pods already bound</text>
+        <text x="40" y="270" class="t-muted">Event: FailedScheduling … 0/1 nodes are available: 1 Insufficient cpu.</text>
+      </svg>
+      <figcaption>Figure 2 — Scheduling is accounting, not measurement. Over-requesting wastes capacity; under-requesting overpacks nodes.</figcaption>
+    </figure>
+    <p>Each node publishes <code>status.allocatable</code> (capacity minus what is reserved for the OS and Kubernetes daemons). The scheduler's resource filter checks that the sum of requests of Pods on the node plus the new Pod's requests fits in allocatable. See it with <code>kubectl describe node reliability-lab-control-plane</code> → <em>Allocatable</em> and <em>Allocated resources</em>.</p>
+
+    <h3>CPU limits: CFS throttling</h3>
+    <p>On Linux the container runtime configures cgroups from your values. A CPU <strong>limit</strong> becomes a CFS bandwidth quota: in each scheduling period (the kernel default period is 100 ms) the container's cgroup may consume at most <em>quota</em> of CPU time; once it is used up, its threads are <strong>throttled</strong> — not allowed to run — until the next period. On cgroup v2 this is the <code>cpu.max</code> file (<code>"$MAX $PERIOD"</code>), and the throttling counters <code>nr_periods</code>, <code>nr_throttled</code>, <code>throttled_usec</code> are in <code>cpu.stat</code>. A CPU <strong>request</strong> becomes a relative weight: under contention, containers with larger requests get proportionally more CPU time.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 260" role="img" aria-label="CFS throttling: with a 200m limit a request needing 50 ms of CPU runs 20 ms per 100 ms period and finishes after about 210 ms; without a limit it finishes in about 50 ms">
+        <text x="20" y="28" class="t-bold">GET /work?ms=50 on one thread</text>
+        <text x="20" y="70" class="t-muted">no CPU limit</text>
+        <rect x="150" y="52" width="80" height="28" class="box4"/>
+        <text x="190" y="71" text-anchor="middle" class="t-mono">50ms</text>
+        <text x="245" y="71" class="t-muted">done at ≈ 50 ms</text>
+        <text x="20" y="140" class="t-muted">limit 200m</text>
+        <text x="20" y="156" class="t-muted">(20 ms / 100 ms)</text>
+        <rect x="150" y="122" width="32" height="28" class="box4"/>
+        <rect x="182" y="122" width="128" height="28" class="box3"/>
+        <text x="246" y="141" text-anchor="middle" class="t-muted">throttled</text>
+        <rect x="310" y="122" width="32" height="28" class="box4"/>
+        <rect x="342" y="122" width="128" height="28" class="box3"/>
+        <text x="406" y="141" text-anchor="middle" class="t-muted">throttled</text>
+        <rect x="470" y="122" width="16" height="28" class="box4"/>
+        <text x="500" y="141" class="t-muted">done at ≈ 210 ms</text>
+        <path d="M150 190 L790 190" class="line"/>
+        <path d="M150 184 L150 196 M310 184 L310 196 M470 184 L470 196 M630 184 L630 196 M790 184 L790 196" class="line"/>
+        <text x="150" y="214" text-anchor="middle" class="t-mono">0</text>
+        <text x="310" y="214" text-anchor="middle" class="t-mono">100ms</text>
+        <text x="470" y="214" text-anchor="middle" class="t-mono">200ms</text>
+        <text x="630" y="214" text-anchor="middle" class="t-mono">300ms</text>
+        <text x="790" y="214" text-anchor="middle" class="t-mono">400ms</text>
+        <text x="150" y="246" class="t-muted">green = running on CPU · tan = runnable but throttled · one period = 100 ms</text>
+      </svg>
+      <figcaption>Figure 3 — The container never "fails"; it just gets slower. CPU throttling shows up as latency, not errors — and probe timeouts can turn it into restarts.</figcaption>
+    </figure>
+
+    <div class="widget" id="cfs-calc">
+      <div class="w-title">CFS throttling calculator</div>
+      <div class="w-sub">Idealised single-threaded model: how long does a CPU-bound request take under a CPU limit? (Multi-threaded processes share the same quota and can exhaust it faster.)</div>
+      <div class="grid-form">
+        <label>CPU limit (millicores, 0 = none)<input type="number" id="cfs-limit" min="0" max="8000" step="50" value="200"></label>
+        <label>CPU work per request (ms)<input type="number" id="cfs-work" min="1" max="5000" value="50"></label>
+        <label>CFS period (ms)<input type="number" id="cfs-period" min="1" max="1000" value="100"></label>
+      </div>
+      <div class="out" id="cfs-out"></div>
+    </div>
+
+    <h3>Memory limits: the OOM killer</h3>
+    <p>A memory limit becomes the cgroup's memory limit. If the container tries to allocate beyond it, the kernel's out-of-memory handling typically kills a process in the container. If that process is PID 1, the container terminates with reason <code>OOMKilled</code> and exit code <code>137</code> (128 + 9, SIGKILL), and Kubernetes restarts it per <code>restartPolicy</code>. The docs stress that enforcement is <em>reactive</em>: a container can briefly exceed its limit and is killed only when the kernel detects memory pressure. Memory, unlike CPU, is not compressible: there is no way to "slow down" memory use, so the only remedy is to kill.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th></th><th>CPU</th><th>Memory</th></tr></thead>
+      <tbody>
+        <tr><td>Request used for</td><td>Scheduling + relative weight under contention</td><td>Scheduling (and, on cgroup v2, possibly a hint for memory protection)</td></tr>
+        <tr><td>Exceeding the request</td><td>Allowed if the node has idle CPU</td><td>Allowed, but makes the Pod an eviction candidate under node memory pressure</td></tr>
+        <tr><td>Hitting the limit</td><td>Throttled → higher latency</td><td>OOM kill → <code>OOMKilled</code>, exit 137, restart</td></tr>
+        <tr><td>Signal in kubectl</td><td>Nothing in status; see latency and <code>cpu.stat</code></td><td><code>Last State: Terminated, Reason: OOMKilled</code>, RESTARTS +1</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Applied to reliability-api: our choices and why</h3>
+    <pre data-title="resources for container api"><code>          resources:
+            requests:
+              cpu: 100m        <span class="c"># scheduler reserves 0.1 core; also the base for HPA "CPU 60%" in Module 08</span>
+              memory: 128Mi    <span class="c"># measured baseline of a FastAPI + Uvicorn worker, with headroom</span>
+            limits:
+              memory: 256Mi    <span class="c"># contain leaks; 2× request leaves room for bursts</span>
+              <span class="c"># no cpu limit: see trade-off below</span></code></pre>
+    <ul>
+      <li><strong>Memory limit, yes.</strong> A leak in one Pod should OOM-kill that Pod, not push the node into memory pressure and evict other workloads.</li>
+      <li><strong>CPU limit — a real trade-off.</strong> Without a CPU limit, <code>/work</code> can use idle CPU on the node: lower latency, better use of hardware. The cost: one busy Pod can take spare CPU from neighbours (they still get at least their requested share through weighting), and behaviour depends on how busy the node is, making load tests less reproducible. With a CPU limit you get predictable, isolated performance but pay throttling latency even when the node is idle. For this lab we leave it off and <em>measure</em>; Lab 2 shows what a 200m limit does.</li>
+      <li><strong>Requests drive HPA.</strong> CPU utilisation for the HPA is computed relative to the CPU <em>request</em>. Change the request and you change what "60%" means.</li>
+      <li><strong>Measure, then set.</strong> These numbers are starting points. Use <code>kubectl top pod</code> (needs metrics-server, Module 08) and Prometheus under load to adjust.</li>
+    </ul>
+
+    <div class="callout warn"><span class="label">Failure cases &amp; diagnosis</span>
+      <ul>
+        <li><strong><code>Pending</code> with <code>Insufficient cpu</code>/<code>memory</code></strong> — requests too large for any node. <code>kubectl describe pod</code> Events; <code>kubectl describe node</code> → Allocated resources.</li>
+        <li><strong>RESTARTS rising, <code>OOMKilled</code></strong> — memory limit too low or a leak. <code>kubectl describe pod</code> → Last State; check memory metrics before the kill.</li>
+        <li><strong>p99 latency high, CPU usage looks "low"</strong> — throttling. Averages hide it: a container can be throttled every period while average CPU is under the limit. Check <code>cpu.stat</code> (<code>nr_throttled</code>) or the cAdvisor metric for throttled periods in Prometheus (Module 07).</li>
+        <li><strong>Typo units</strong> — <code>memory: 256m</code> (millibytes) is accepted by the API but makes the container unstartable; always <code>Mi</code>/<code>Gi</code>.</li>
+      </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>3. QoS classes and eviction</h2>
+    <p><strong>Definition.</strong> Kubernetes assigns every Pod a Quality of Service class from its containers' requests and limits. The class is stored in <code>status.qosClass</code> and decides the order in which Pods are evicted when a node runs out of resources.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Class</th><th>Rule (all containers in the Pod)</th><th>Under node pressure</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Guaranteed</strong></td><td>Every container has CPU <em>and</em> memory requests and limits, and request = limit for each.</td><td>Evicted last. Kubelet sets <code>oom_score_adj = -997</code>.</td></tr>
+        <tr><td><strong>Burstable</strong></td><td>Not Guaranteed, but at least one container has a CPU or memory request or limit.</td><td>Evicted after BestEffort. <code>oom_score_adj</code> between 2 and 999, lower for larger memory requests (formula below).</td></tr>
+        <tr><td><strong>BestEffort</strong></td><td>No container has any CPU or memory request or limit.</td><td>Evicted first. <code>oom_score_adj = 1000</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>For Burstable Pods the kubelet sets <code>oom_score_adj = min(max(2, 1000 − (1000 × memoryRequestBytes) / machineMemoryCapacityBytes), 999)</code>. The kernel adds this to its own badness score when choosing what to kill under <em>node-wide</em> memory exhaustion. The intuition: <strong>the more memory you request (relative to the machine), the less likely the kernel OOM killer is to pick you</strong>. (A container exceeding its <em>own</em> limit is killed regardless of class.) Memorise the ordering, not the constants.</p>
+
+    <div class="widget" id="qos-widget">
+      <div class="w-title">QoS classifier</div>
+      <div class="w-sub">Enter requests and limits for up to two containers (leave blank for "not set"). Remember the API copies a limit into an unset request.</div>
+      <div class="row" style="margin-bottom:6px">
+        <button class="btn" data-qos="ours">reliability-api (ours)</button>
+        <button class="btn" data-qos="guar">Guaranteed example</button>
+        <button class="btn" data-qos="limitsonly">Limits only</button>
+        <button class="btn" data-qos="none">Nothing set</button>
+        <button class="btn" data-qos="sidecar">App + bare sidecar</button>
+      </div>
+      <fieldset class="fieldset"><legend>Container 1 (reliability-api)</legend><div class="grid-form">
+        <label>req cpu<input type="text" id="q1-rc" placeholder="e.g. 100m"></label>
+        <label>req memory<input type="text" id="q1-rm" placeholder="e.g. 128Mi"></label>
+        <label>limit cpu<input type="text" id="q1-lc"></label>
+        <label>limit memory<input type="text" id="q1-lm"></label>
+      </div></fieldset>
+      <fieldset class="fieldset"><legend>Container 2 <label style="display:inline;font-weight:400"><input type="checkbox" id="q2-on"> present</label></legend><div class="grid-form">
+        <label>req cpu<input type="text" id="q2-rc"></label>
+        <label>req memory<input type="text" id="q2-rm"></label>
+        <label>limit cpu<input type="text" id="q2-lc"></label>
+        <label>limit memory<input type="text" id="q2-lm"></label>
+      </div></fieldset>
+      <div id="qos-verdict"></div>
+      <div class="out" id="qos-out"></div>
+    </div>
+
+    <h3>Node-pressure eviction (the kubelet's last line of defence)</h3>
+    <p>Separately from the kernel OOM killer, the kubelet watches eviction signals such as <code>memory.available</code>, <code>nodefs.available</code>, <code>imagefs.available</code> and <code>pid.available</code>. Default <em>hard</em> thresholds on Linux include <code>memory.available &lt; 100Mi</code>, <code>nodefs.available &lt; 10%</code>, <code>imagefs.available &lt; 15%</code>, <code>nodefs.inodesFree &lt; 5%</code> and <code>imagefs.inodesFree &lt; 5%</code> (these defaults apply only if you change none of them). When a threshold is crossed the kubelet sets a node condition (e.g. <code>MemoryPressure=True</code>), the node gets a matching taint so new Pods avoid it, it tries to reclaim node-level resources (unused images, dead containers), and then evicts Pods ranked by:</p>
+    <ol>
+      <li>whether the Pod's usage exceeds its requests,</li>
+      <li>Pod priority,</li>
+      <li>usage relative to requests.</li>
+    </ol>
+    <p>Consequences you must know: node-pressure eviction <strong>does not respect PodDisruptionBudgets</strong>, and for hard thresholds it does not honour <code>terminationGracePeriodSeconds</code> (0 s grace). Evicted Pods show <code>Status: Failed, Reason: Evicted</code>; their controller creates replacements elsewhere.</p>
+    <div class="callout example"><span class="label">Applied to reliability-api</span>
+      <p>Our Pods are <strong>Burstable</strong> (requests set; memory limit ≠ request; no CPU limit). To make them Guaranteed we would need CPU request = CPU limit and memory request = memory limit — i.e. adopt a CPU limit and its throttling. For a stateless API with 2+ replicas, Burstable is a reasonable trade: if one Pod is evicted, the other serves while the controller replaces it. The bigger protection is keeping usage near requests so we are not first in line.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>4. Scheduling basics</h2>
+    <p><strong>Definition.</strong> kube-scheduler watches for Pods with no node assigned and, for each, picks the best node in two steps: <strong>filtering</strong> (which nodes are feasible?) and <strong>scoring</strong> (which feasible node is best?). It then <strong>binds</strong> the Pod by telling the API server. If no node is feasible the Pod stays <code>Pending</code> (unschedulable) until something changes, and a <code>FailedScheduling</code> Event explains why.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 280" role="img" aria-label="Scheduler pipeline: all nodes, filtering removes infeasible nodes, scoring ranks feasible nodes, highest score wins and the Pod is bound">
+        <defs><marker id="b3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="20" y="40" width="170" height="200" rx="10" class="box"/>
+        <text x="105" y="64" text-anchor="middle" class="t-bold">All nodes</text>
+        <text x="105" y="94" text-anchor="middle" class="t-mono">node-a</text>
+        <text x="105" y="118" text-anchor="middle" class="t-mono">node-b</text>
+        <text x="105" y="142" text-anchor="middle" class="t-mono">node-c</text>
+        <text x="105" y="166" text-anchor="middle" class="t-mono">node-d</text>
+        <rect x="240" y="40" width="250" height="200" rx="10" class="box3"/>
+        <text x="365" y="64" text-anchor="middle" class="t-bold">1. Filter (hard rules)</text>
+        <text x="260" y="94" class="t-mono">node-a  ✓</text>
+        <text x="260" y="118" class="t-mono">node-b  ✗ Insufficient cpu</text>
+        <text x="260" y="142" class="t-mono">node-c  ✓</text>
+        <text x="260" y="166" class="t-mono">node-d  ✗ untolerated taint</text>
+        <text x="365" y="206" text-anchor="middle" class="t-muted">requests, nodeSelector, required</text>
+        <text x="365" y="224" text-anchor="middle" class="t-muted">affinity, taints, ports, volumes</text>
+        <rect x="540" y="40" width="160" height="200" rx="10" class="box2"/>
+        <text x="620" y="64" text-anchor="middle" class="t-bold">2. Score</text>
+        <text x="620" y="100" text-anchor="middle" class="t-mono">node-a  71</text>
+        <text x="620" y="124" text-anchor="middle" class="t-mono">node-c  88</text>
+        <text x="620" y="206" text-anchor="middle" class="t-muted">preferences,</text>
+        <text x="620" y="224" text-anchor="middle" class="t-muted">spreading, balance</text>
+        <rect x="740" y="100" width="105" height="70" rx="10" class="box4"/>
+        <text x="792" y="130" text-anchor="middle" class="t-bold">3. Bind</text>
+        <text x="792" y="150" text-anchor="middle" class="t-mono">node-c</text>
+        <path d="M190 140 L238 140" class="line" marker-end="url(#b3)"/>
+        <path d="M490 140 L538 140" class="line" marker-end="url(#b3)"/>
+        <path d="M700 135 L738 135" class="line" marker-end="url(#b3)"/>
+        <text x="430" y="268" text-anchor="middle" class="t-muted">Scores are illustrative. Ties are broken randomly. Empty feasible set → Pod stays Pending.</text>
+      </svg>
+      <figcaption>Figure 4 — Hard constraints filter; soft preferences only change scores. A "preferred" rule can never make a Pod Pending; a "required" rule can.</figcaption>
+    </figure>
+
+    <h3>Placement tools, from simplest to most expressive</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Tool</th><th>Lives on</th><th>Hard / soft</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td><code>nodeSelector</code></td><td>Pod</td><td>Hard</td><td>"Only nodes with all these labels" (e.g. <code>disktype: ssd</code>).</td></tr>
+        <tr><td>Node affinity</td><td>Pod</td><td><code>required…</code> hard, <code>preferred…</code> soft (weight 1–100)</td><td>Expressive node label rules with operators <code>In</code>, <code>NotIn</code>, <code>Exists</code>, <code>DoesNotExist</code>, <code>Gt</code>, <code>Lt</code>.</td></tr>
+        <tr><td>Inter-pod affinity / anti-affinity</td><td>Pod</td><td>Hard or soft</td><td>"Near / away from Pods with these labels" within a <code>topologyKey</code> domain (node, zone).</td></tr>
+        <tr><td>Taints &amp; tolerations</td><td>Taint on Node, toleration on Pod</td><td><code>NoSchedule</code>, <code>PreferNoSchedule</code>, <code>NoExecute</code></td><td>Nodes <em>repel</em> Pods unless they tolerate (dedicated/GPU nodes, control plane, unhealthy nodes).</td></tr>
+        <tr><td><code>topologySpreadConstraints</code></td><td>Pod</td><td><code>DoNotSchedule</code> hard / <code>ScheduleAnyway</code> soft</td><td>Even spread of replicas across zones/nodes with a maximum skew.</td></tr>
+        <tr><td><code>nodeName</code></td><td>Pod</td><td>Bypasses the scheduler</td><td>Almost never; debugging only.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The suffix <code>IgnoredDuringExecution</code> in affinity rules means: if node labels change after the Pod is running, the Pod is not evicted. Only <code>NoExecute</code> taints affect already-running Pods.</p>
+
+    <h3>Spreading reliability-api replicas</h3>
+    <p>Two replicas on the same node die together with that node. A soft anti-affinity asks the scheduler to put them on different nodes when possible but still schedule them on a single-node kind cluster:</p>
+    <pre data-title="Pod template spec: prefer one replica per node"><code>      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname       <span class="c"># domain = individual node</span>
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: reliability-api</code></pre>
+    <p>On a multi-zone cloud cluster (Module 11) you would rather express "even across zones" with topology spread:</p>
+    <pre data-title="Pod template spec: spread across zones"><code>      topologySpreadConstraints:
+        - maxSkew: 1                                   <span class="c"># zone counts may differ by at most 1</span>
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway            <span class="c"># soft; DoNotSchedule would make it hard</span>
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: reliability-api</code></pre>
+    <div class="callout warn"><span class="label">Trade-off: hard anti-affinity</span>
+      <p><code>requiredDuringScheduling…</code> anti-affinity on <code>kubernetes.io/hostname</code> guarantees one replica per node — and makes replica N+1 <code>Pending</code> when you have N nodes. It also blocks rolling updates with <code>maxSurge</code> on small clusters, because the surge Pod has nowhere legal to go. Prefer soft rules unless co-location is truly unacceptable.</p>
+    </div>
+
+    <h3>Taints and tolerations</h3>
+    <p>A <strong>taint</strong> on a node (<code>key=value:Effect</code>) repels Pods; a <strong>toleration</strong> on a Pod lets it ignore a matching taint. A toleration matches when key and effect match and either <code>operator: Exists</code> or <code>operator: Equal</code> with the same value. A toleration <em>permits</em> scheduling on the node; it does not attract the Pod there — combine with node affinity for dedicated nodes.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 275" role="img" aria-label="A GPU node tainted gpu=true:NoSchedule; reliability-api Pod without toleration lands on a general node; an inference Pod with toleration can land on the GPU node">
+        <defs><marker id="b4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="40" y="20" width="250" height="60" rx="8" class="box4"/>
+        <text x="165" y="44" text-anchor="middle" class="t-bold">Pod reliability-api</text>
+        <text x="165" y="64" text-anchor="middle" class="t-muted">no tolerations</text>
+        <rect x="560" y="20" width="270" height="60" rx="8" class="box3"/>
+        <text x="695" y="44" text-anchor="middle" class="t-bold">Pod inference (Module 12)</text>
+        <text x="695" y="64" text-anchor="middle" class="t-mono">tolerates gpu=true:NoSchedule</text>
+        <rect x="40" y="160" width="250" height="70" rx="10" class="box"/>
+        <text x="165" y="188" text-anchor="middle" class="t-bold">general node</text>
+        <text x="165" y="208" text-anchor="middle" class="t-muted">no taints</text>
+        <rect x="560" y="160" width="270" height="70" rx="10" class="box2"/>
+        <text x="695" y="188" text-anchor="middle" class="t-bold">GPU node</text>
+        <text x="695" y="208" text-anchor="middle" class="t-mono">taint gpu=true:NoSchedule</text>
+        <path d="M165 80 L165 158" class="line ok" marker-end="url(#b4)"/>
+        <path d="M260 80 L600 158" class="line bad" marker-end="url(#b4)" style="stroke-dasharray:5 4"/>
+        
+        <path d="M695 80 L695 158" class="line ok" marker-end="url(#b4)"/>
+        <path d="M600 80 L260 168" class="line dash" marker-end="url(#b4)"/>
+        <text x="430" y="262" text-anchor="middle" class="t-muted">red dashed = repelled (no matching toleration) · grey dashed = also allowed: a toleration is not an attraction</text>
+      </svg>
+      <figcaption>Figure 5 — Taints keep the wrong Pods off special nodes. To make the right Pods go there, add node affinity as well.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Effect</th><th>New Pods without toleration</th><th>Running Pods without toleration</th></tr></thead>
+      <tbody>
+        <tr><td><code>NoSchedule</code></td><td>Not scheduled</td><td>Keep running</td></tr>
+        <tr><td><code>PreferNoSchedule</code></td><td>Scheduler tries to avoid the node</td><td>Keep running</td></tr>
+        <tr><td><code>NoExecute</code></td><td>Not scheduled</td><td>Evicted (immediately, or after <code>tolerationSeconds</code> if the toleration sets it)</td></tr>
+      </tbody>
+    </table></div>
+    <pre><code>kubectl taint nodes reliability-lab-control-plane dedicated=lab:NoSchedule     <span class="c"># add</span>
+kubectl taint nodes reliability-lab-control-plane dedicated=lab:NoSchedule-    <span class="c"># remove (trailing -)</span>
+kubectl describe node reliability-lab-control-plane | grep -i taints</code></pre>
+    <p>Kubernetes uses taints itself: control-plane nodes typically carry <code>node-role.kubernetes.io/control-plane:NoSchedule</code>, and the node lifecycle controller adds taints such as <code>node.kubernetes.io/not-ready</code> and <code>node.kubernetes.io/unreachable</code> (effect <code>NoExecute</code>) to failing nodes — that is how Pods are eventually evicted from a dead node. Node-pressure conditions also add taints (e.g. <code>node.kubernetes.io/memory-pressure</code>).</p>
+
+    <div class="callout warn"><span class="label">Diagnosing Pending</span>
+      <p><code>kubectl describe pod &lt;p&gt;</code> → Events → <code>FailedScheduling</code>. The message summarises, per reason, how many nodes were rejected — e.g. <em>"0/3 nodes are available: 1 Insufficient memory, 2 node(s) didn't match Pod's node affinity/selector"</em> (wording varies by version). Then: <code>kubectl get nodes --show-labels</code>, <code>kubectl describe node</code> (Taints, Allocatable, Allocated resources). Remember a Pod can be Pending for non-scheduling reasons too (e.g. waiting for a PersistentVolumeClaim).</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>5. Rolling updates, rollout and rollback</h2>
+    <p><strong>Definition.</strong> When a Deployment's Pod template changes, the Deployment controller creates a new ReplicaSet and gradually <em>scales it up</em> while <em>scaling the old one down</em>. Two knobs bound how aggressive this is:</p>
+    <ul>
+      <li><strong><code>maxSurge</code></strong> — how many Pods may exist <em>above</em> <code>replicas</code> during the update. Number or percentage; percentages <strong>round up</strong>. Default 25%.</li>
+      <li><strong><code>maxUnavailable</code></strong> — how many Pods may be <em>unavailable below</em> <code>replicas</code>. Number or percentage; percentages <strong>round down</strong>. Default 25%.</li>
+      <li>They cannot both be 0 (nothing could ever change).</li>
+    </ul>
+    <p>So with the defaults and 10 replicas: maxSurge = ceil(2.5) = 3, maxUnavailable = floor(2.5) = 2 → at most 13 Pods total, at least 8 available. With <code>reliability-api</code>'s 2 replicas: ceil(0.5) = 1 and floor(0.5) = 0 → at most 3 Pods, at least 2 available. That is exactly what we wrote explicitly in the manifest.</p>
+    <p><strong>Problem it solves.</strong> Zero-downtime deploys. Because "available" is defined by readiness (plus <code>minReadySeconds</code>), the rollout naturally waits for new Pods to warm up before removing old ones — <em>if your readiness probe is honest</em>.</p>
+
+    <div class="widget stepper" data-steps='[
+      {"title":"Steady state: v0.1.0","html":"ReplicaSet <b>old</b> (image 0.1.0) has 2 Ready Pods. <code>replicas: 2</code>, <code>maxSurge: 1</code>, <code>maxUnavailable: 0</code> → total may reach 3, available must stay ≥ 2."},
+      {"title":"Template changes → new ReplicaSet scaled to 1","html":"You apply <code>image: reliability-api:0.2.0</code>. The controller creates ReplicaSet <b>new</b> and scales it to 1 (total 3 = 2 + maxSurge). The new Pod is starting; with READY_DELAY_SECONDS it reports 503 on /ready, so it is not yet available. Old Pods keep serving all traffic."},
+      {"title":"New Pod Ready → old ReplicaSet scaled to 1","html":"The new Pod passes readiness (and has been Ready for <code>minReadySeconds</code>, default 0). Available = 3, so the controller may remove one old Pod while keeping ≥ 2 available. One old Pod starts graceful termination (section 7)."},
+      {"title":"New ReplicaSet scaled to 2","html":"Total is back under the surge ceiling, so the second new Pod is created. Again it must pass readiness before it counts as available. <code>kubectl rollout status</code> prints <i>1 of 2 updated replicas are available</i>."},
+      {"title":"Second new Pod Ready → old ReplicaSet scaled to 0","html":"Available = 3 again; the last old Pod is terminated. At no point were fewer than 2 Ready Pods behind the Service."},
+      {"title":"Complete","html":"New ReplicaSet: 2/2. Old ReplicaSet is kept with 0 replicas (up to <code>revisionHistoryLimit</code> = 10) so <code>kubectl rollout undo</code> can scale it back up. Condition <code>Progressing=True</code>, reason <code>NewReplicaSetAvailable</code>."}
+    ]'>
+      <div class="w-title">Stepper — rolling update of reliability-api (2 replicas, maxSurge 1, maxUnavailable 0)</div>
+      <div class="w-sub">Blue = old Pod (0.1.0) · amber dashed = new Pod not Ready yet · green = new Pod Ready · red dashed = terminating</div>
+      <svg viewBox="0 0 860 230" role="img" aria-label="Rolling update steps showing old and new ReplicaSet Pods">
+        <text x="20" y="62" class="t-bold">RS old (0.1.0)</text>
+        <text x="20" y="152" class="t-bold">RS new (0.2.0)</text>
+        <rect x="170" y="30" width="660" height="60" rx="10" class="zone"/>
+        <rect x="170" y="120" width="660" height="60" rx="10" class="zone"/>
+        <!-- step 0 -->
+        <g data-step="0"><rect x="190" y="40" width="120" height="40" rx="8" class="box2"/><text x="250" y="65" text-anchor="middle">old-1 ✓</text><rect x="330" y="40" width="120" height="40" rx="8" class="box2"/><text x="390" y="65" text-anchor="middle">old-2 ✓</text></g>
+        <!-- step 1 -->
+        <g data-step="1"><rect x="190" y="40" width="120" height="40" rx="8" class="box2"/><text x="250" y="65" text-anchor="middle">old-1 ✓</text><rect x="330" y="40" width="120" height="40" rx="8" class="box2"/><text x="390" y="65" text-anchor="middle">old-2 ✓</text><rect x="190" y="130" width="120" height="40" rx="8" class="box3" style="stroke-dasharray:5 4"/><text x="250" y="155" text-anchor="middle">new-1 …</text></g>
+        <!-- step 2 -->
+        <g data-step="2"><rect x="190" y="40" width="120" height="40" rx="8" class="box2"/><text x="250" y="65" text-anchor="middle">old-1 ✓</text><rect x="330" y="40" width="120" height="40" rx="8" class="box" style="stroke-dasharray:3 3"/><text x="390" y="65" text-anchor="middle" class="t-muted">old-2 ✗</text><rect x="190" y="130" width="120" height="40" rx="8" class="box4"/><text x="250" y="155" text-anchor="middle">new-1 ✓</text></g>
+        <!-- step 3 -->
+        <g data-step="3"><rect x="190" y="40" width="120" height="40" rx="8" class="box2"/><text x="250" y="65" text-anchor="middle">old-1 ✓</text><rect x="190" y="130" width="120" height="40" rx="8" class="box4"/><text x="250" y="155" text-anchor="middle">new-1 ✓</text><rect x="330" y="130" width="120" height="40" rx="8" class="box3" style="stroke-dasharray:5 4"/><text x="390" y="155" text-anchor="middle">new-2 …</text></g>
+        <!-- step 4 -->
+        <g data-step="4"><rect x="190" y="40" width="120" height="40" rx="8" class="box" style="stroke-dasharray:3 3"/><text x="250" y="65" text-anchor="middle" class="t-muted">old-1 ✗</text><rect x="190" y="130" width="120" height="40" rx="8" class="box4"/><text x="250" y="155" text-anchor="middle">new-1 ✓</text><rect x="330" y="130" width="120" height="40" rx="8" class="box4"/><text x="390" y="155" text-anchor="middle">new-2 ✓</text></g>
+        <!-- step 5 -->
+        <g data-step="5"><text x="250" y="65" text-anchor="middle" class="t-muted">replicas: 0 (kept for undo)</text><rect x="190" y="130" width="120" height="40" rx="8" class="box4"/><text x="250" y="155" text-anchor="middle">new-1 ✓</text><rect x="330" y="130" width="120" height="40" rx="8" class="box4"/><text x="390" y="155" text-anchor="middle">new-2 ✓</text></g>
+        <!-- counters -->
+        <g data-step="0"><text x="640" y="110" text-anchor="middle" class="t-mono">total 2 · available 2</text></g>
+        <g data-step="1"><text x="640" y="110" text-anchor="middle" class="t-mono">total 3 · available 2</text></g>
+        <g data-step="2"><text x="640" y="110" text-anchor="middle" class="t-mono">total 3 · available 2</text></g>
+        <g data-step="3"><text x="640" y="110" text-anchor="middle" class="t-mono">total 3 · available 2</text></g>
+        <g data-step="4"><text x="640" y="110" text-anchor="middle" class="t-mono">total 3 · available 2</text></g>
+        <g data-step="5"><text x="640" y="110" text-anchor="middle" class="t-mono">total 2 · available 2</text></g>
+        <text x="500" y="215" text-anchor="middle" class="t-muted">Terminating Pods are not counted as available; ceiling = replicas + maxSurge = 3, floor = replicas − maxUnavailable = 2</text>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+    <div class="widget" id="roll-calc">
+      <div class="w-title">Rolling-update calculator &amp; simulator</div>
+      <div class="w-sub">Enter replicas and the two knobs as numbers or percentages. The simulation is an idealised round-based model (each round: scale up within the ceiling, scale down within the floor, then new Pods become Ready). The real controller is event-driven, but the bounds are exact.</div>
+      <div class="grid-form">
+        <label>replicas<input type="number" id="rc-rep" min="1" max="40" value="2"></label>
+        <label>maxSurge<input type="text" id="rc-surge" value="25%"></label>
+        <label>maxUnavailable<input type="text" id="rc-unav" value="25%"></label>
+      </div>
+      <div class="out" id="rc-out"></div>
+      <div id="rc-rows" style="margin-top:8px"></div>
+    </div>
+
+    <h3>Other rollout fields</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Field</th><th>Default</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td><code>strategy.type</code></td><td><code>RollingUpdate</code></td><td><code>Recreate</code> kills all old Pods before creating new ones: guaranteed no mixed versions, guaranteed downtime.</td></tr>
+        <tr><td><code>minReadySeconds</code></td><td>0</td><td>A new Pod must stay Ready this long before it counts as available. Catches Pods that pass readiness and crash seconds later.</td></tr>
+        <tr><td><code>progressDeadlineSeconds</code></td><td>600</td><td>If the rollout makes no progress for this long, condition <code>Progressing=False</code> with reason <code>ProgressDeadlineExceeded</code>. The controller does <em>not</em> roll back by itself; <code>kubectl rollout status</code> exits non-zero, which CI can act on.</td></tr>
+        <tr><td><code>revisionHistoryLimit</code></td><td>10</td><td>Old ReplicaSets kept for rollback.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Rollout commands</h3>
+    <pre><code>kubectl rollout status deploy/reliability-api --timeout=120s     <span class="c"># blocks; non-zero exit on failure/timeout</span>
+kubectl rollout history deploy/reliability-api                   <span class="c"># revisions + CHANGE-CAUSE</span>
+kubectl rollout history deploy/reliability-api --revision=2      <span class="c"># template of one revision</span>
+kubectl rollout undo deploy/reliability-api                      <span class="c"># back to previous revision</span>
+kubectl rollout undo deploy/reliability-api --to-revision=1      <span class="c"># specific revision</span>
+kubectl rollout restart deploy/reliability-api                   <span class="c"># new revision with same image (restarts Pods gradually)</span>
+kubectl rollout pause|resume deploy/reliability-api              <span class="c"># batch several edits into one rollout</span>
+kubectl annotate deploy/reliability-api kubernetes.io/change-cause="0.2.0: faster /work" --overwrite</code></pre>
+    <pre data-title="Example output — kubectl rollout history (yours will differ)"><code><span class="o">deployment.apps/reliability-api
+REVISION  CHANGE-CAUSE
+1         deploy 0.1.0
+2         0.2.0: faster /work</span></code></pre>
+    <div class="callout warn"><span class="label">Rollback is not "git revert"</span>
+      <p><code>kubectl rollout undo</code> changes the <em>live</em> Deployment's template back to an older ReplicaSet's template; that restored revision reappears in the history under a new, higher revision number. Your manifest in Git still says 0.2.0, so the next <code>kubectl apply</code> (or CI run) re-deploys the bad version. Use undo to stop the bleeding, then fix Git.</p>
+    </div>
+
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>Bad image tag</strong> → new Pod <code>ImagePullBackOff</code>; with <code>maxUnavailable: 0</code> old Pods are untouched, so users see no impact, but the rollout is stuck until <code>ProgressDeadlineExceeded</code>. (Lab 3.)</li>
+      <li><strong>New version fails readiness</strong> → same: stuck, safe. This is why honest readiness matters.</li>
+      <li><strong>New version passes readiness but is broken</strong> → rollout completes and you are fully on a broken version. Readiness is not a test suite; add smoke tests in CI and metrics/alerts (Modules 07, 09).</li>
+      <li><strong>Mixed versions</strong> → during any rolling update, v0.1.0 and v0.2.0 serve traffic at the same time. API and schema changes must be backward compatible.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>6. Pod lifecycle: phases, container states, conditions</h2>
+    <p>A Pod's <code>status.phase</code> is a deliberately coarse, high-level summary. Each container additionally has a detailed <em>state</em>, and the Pod has a list of <em>conditions</em>. When you debug, read all three.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 290" role="img" aria-label="Pod phases: Pending to Running, Running to Succeeded or Failed; Unknown when the node cannot be reached">
+        <defs><marker id="b5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="20" y="100" width="170" height="70" rx="12" class="box3"/>
+        <text x="105" y="128" text-anchor="middle" class="t-bold">Pending</text>
+        <text x="105" y="148" text-anchor="middle" class="t-muted">scheduling, image pull</text>
+        <rect x="290" y="100" width="190" height="70" rx="12" class="box4"/>
+        <text x="385" y="128" text-anchor="middle" class="t-bold">Running</text>
+        <text x="385" y="148" text-anchor="middle" class="t-muted">≥1 container running</text>
+        <rect x="600" y="30" width="230" height="64" rx="12" class="box2"/>
+        <text x="715" y="56" text-anchor="middle" class="t-bold">Succeeded</text>
+        <text x="715" y="76" text-anchor="middle" class="t-muted">all exited 0, no restart</text>
+        <rect x="600" y="176" width="230" height="64" rx="12" class="box"/>
+        <text x="715" y="202" text-anchor="middle" class="t-bold">Failed</text>
+        <text x="715" y="222" text-anchor="middle" class="t-muted">all ended, ≥1 failed, no restart</text>
+        <rect x="290" y="226" width="190" height="50" rx="12" class="box" style="stroke-dasharray:5 4"/>
+        <text x="385" y="250" text-anchor="middle" class="t-bold">Unknown</text>
+        <text x="385" y="266" text-anchor="middle" class="t-muted">node unreachable</text>
+        <path d="M190 135 L288 135" class="line" marker-end="url(#b5)"/>
+        <text x="239" y="126" text-anchor="middle" class="t-muted">bound +</text>
+        <text x="239" y="158" text-anchor="middle" class="t-muted">started</text>
+        <path d="M480 120 L598 70" class="line ok" marker-end="url(#b5)"/>
+        <path d="M480 150 L598 200" class="line bad" marker-end="url(#b5)"/>
+        <path d="M385 100 Q 385 40 440 60 Q 470 75 440 100" class="line dash" marker-end="url(#b5)"/>
+        <text x="370" y="40" text-anchor="end" class="t-muted">container restarts stay in Running</text>
+      </svg>
+      <figcaption>Figure 6 — With <code>restartPolicy: Always</code> (Deployments), a Pod whose container keeps crashing stays in phase <code>Running</code>; <code>CrashLoopBackOff</code> is a container <em>state reason</em>, not a phase.</figcaption>
+    </figure>
+
+    <div class="grid">
+      <div class="card"><h4>Container states</h4>
+        <p><code>Waiting</code> — not running yet; <code>reason</code> says why: <code>ContainerCreating</code>, <code>ErrImagePull</code>, <code>ImagePullBackOff</code>, <code>CrashLoopBackOff</code>, <code>CreateContainerConfigError</code>.</p>
+        <p><code>Running</code> — executing (postStart hook, if any, has run).</p>
+        <p><code>Terminated</code> — finished; has <code>exitCode</code>, <code>reason</code> (<code>Completed</code>, <code>Error</code>, <code>OOMKilled</code>), <code>signal</code>, <code>startedAt</code>, <code>finishedAt</code>.</p></div>
+      <div class="card"><h4>Pod conditions</h4>
+        <p><code>PodScheduled</code> → <code>PodReadyToStartContainers</code> (sandbox + network ready) → <code>Initialized</code> (init containers done) → <code>ContainersReady</code> → <code>Ready</code> (can serve; this is what Services use).</p>
+        <p>Each has <code>status</code>, <code>reason</code>, <code>message</code>, <code>lastTransitionTime</code>.</p></div>
+      <div class="card"><h4>restartPolicy</h4>
+        <p><code>Always</code> (default; required for Deployments), <code>OnFailure</code>, <code>Never</code> (Jobs use the latter two).</p>
+        <p>Restarts use exponential back-off: 10 s, 20 s, 40 s, … capped at 300 s; reset after a container has run 10 minutes without problems.</p></div>
+    </div>
+    <pre><code>kubectl get pod &lt;p&gt; -o jsonpath='{.status.phase}{"\n"}'
+kubectl get pod &lt;p&gt; -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
+kubectl get pod &lt;p&gt; -o jsonpath='{.status.containerStatuses[0].lastState}{"\n"}'</code></pre>
+
+    <h3>Exit codes you will meet</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Exit code</th><th>Meaning</th><th>Typical cause</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>Success</td><td>Job finished; or app exited when it should not have (Deployment → restart)</td></tr>
+        <tr><td>1 (or other small n)</td><td>Application error</td><td>Uncaught exception, bad config (check <code>logs --previous</code>)</td></tr>
+        <tr><td>137 = 128 + 9</td><td>Killed by SIGKILL</td><td><code>OOMKilled</code>, or grace period expired after a liveness kill / delete</td></tr>
+        <tr><td>143 = 128 + 15</td><td>Terminated by SIGTERM</td><td>Normal graceful stop where the process exits with the signal status</td></tr>
+      </tbody>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>7. Graceful termination</h2>
+    <p><strong>Definition.</strong> When a Pod is deleted (scale-down, rolling update, drain, <code>kubectl delete</code>), Kubernetes gives its processes a chance to finish work before forcibly killing them. The time budget is <code>terminationGracePeriodSeconds</code>, default <strong>30</strong>.</p>
+    <p><strong>Problem it solves.</strong> Every rolling update deletes Pods. If deleting a Pod dropped its in-flight requests, every deploy would cause errors. Graceful termination plus readiness-driven endpoint removal is what makes rollouts zero-downtime — but only if the app and the Pod spec cooperate.</p>
+
+    <h3>The sequence (two things happen in parallel)</h3>
+    <figure class="diagram">
+      <svg viewBox="0 0 900 370" role="img" aria-label="Termination timeline: at t=0 the Pod is marked terminating; on the node the kubelet runs preStop then sends SIGTERM and waits until the grace period ends then SIGKILL; in parallel the control plane marks the endpoint terminating and kube-proxy stops routing new traffic">
+        <defs><marker id="b6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <text x="20" y="28" class="t-bold">t = 0: delete → API sets deletionTimestamp + grace period; Pod shows "Terminating"</text>
+        <text x="20" y="80" class="t-bold">Node</text>
+        <text x="20" y="96" class="t-muted">(kubelet)</text>
+        <rect x="150" y="60" width="140" height="44" rx="6" class="box3"/>
+        <text x="220" y="87" text-anchor="middle">preStop: sleep 5</text>
+        <path d="M290 82 L298 82" class="line" marker-end="url(#b6)"/>
+        <rect x="300" y="60" width="150" height="44" rx="6" class="box2"/>
+        <text x="375" y="87" text-anchor="middle">SIGTERM → PID 1</text>
+        <rect x="460" y="60" width="250" height="44" rx="6" class="box4"/>
+        <text x="585" y="87" text-anchor="middle">app drains, then exits</text>
+        <rect x="720" y="60" width="170" height="44" rx="6" class="box" style="stroke-dasharray:5 4"/>
+        <text x="805" y="87" text-anchor="middle">SIGKILL if still alive</text>
+        <text x="20" y="160" class="t-bold">Control</text>
+        <text x="20" y="176" class="t-bold">plane</text>
+        <rect x="150" y="138" width="300" height="50" rx="6" class="box2"/>
+        <text x="300" y="159" text-anchor="middle">EndpointSlice: endpoint marked</text>
+        <text x="300" y="177" text-anchor="middle">terminating, ready=false</text>
+        <path d="M450 163 L458 163" class="line" marker-end="url(#b6)"/>
+        <rect x="460" y="138" width="250" height="50" rx="6" class="box2"/>
+        <text x="585" y="159" text-anchor="middle">kube-proxy on every node</text>
+        <text x="585" y="177" text-anchor="middle">updates its rules</text>
+        <text x="20" y="240" class="t-bold">Traffic</text>
+        <rect x="150" y="218" width="300" height="50" rx="6" class="box3"/>
+        <text x="300" y="239" text-anchor="middle">new requests may still arrive</text>
+        <text x="300" y="257" text-anchor="middle" class="t-muted">(rule propagation delay)</text>
+        <rect x="460" y="218" width="250" height="50" rx="6" class="box4"/>
+        <text x="585" y="239" text-anchor="middle">no new requests;</text>
+        <text x="585" y="257" text-anchor="middle" class="t-muted">in-flight ones finish</text>
+        <path d="M150 300 L890 300" class="line"/>
+        <path d="M150 294 L150 306 M300 294 L300 306 M720 294 L720 306" class="line"/>
+        <text x="150" y="324" text-anchor="middle" class="t-mono">0s</text>
+        <text x="300" y="324" text-anchor="middle" class="t-mono">~5s</text>
+        <text x="720" y="324" text-anchor="middle" class="t-mono">30s</text>
+        <text x="20" y="356" class="t-muted">Grace period (30 s) covers preStop AND app shutdown; +2 s one-off extension if preStop is still running. Not to scale.</text>
+      </svg>
+      <figcaption>Figure 7 — The kubelet lane and the endpoint lane start at the same moment and are not synchronised. The preStop sleep buys time for the endpoint lane to finish before the app stops accepting connections.</figcaption>
+    </figure>
+    <ol>
+      <li>You (or a controller) delete the Pod. The API server records a deletion timestamp and grace period; <code>kubectl get pods</code> shows <code>Terminating</code>.</li>
+      <li><strong>On the node:</strong> the kubelet runs each container's <code>preStop</code> hook (if defined and the grace period is not 0). The hook must <em>finish</em> before TERM is sent. If it is still running when the grace period expires, the kubelet grants a one-off 2-second extension.</li>
+      <li>The kubelet has the runtime send <strong>TERM</strong> to process 1 in each container (or the image's <code>STOPSIGNAL</code>, if set). Without sidecars, containers receive TERM in arbitrary order.</li>
+      <li><strong>In parallel in the control plane:</strong> the Pod is no longer a valid replica for its ReplicaSet (the replacement is created immediately), and its endpoints in EndpointSlices are marked <em>terminating</em> with <code>ready: false</code>, so load balancers and kube-proxy stop sending it new traffic — after the change propagates to every node.</li>
+      <li>When the grace period expires, the runtime sends <strong>SIGKILL</strong> to anything still running; the kubelet sets the terminal phase and the Pod object is removed from the API.</li>
+    </ol>
+
+    <h3>Why the preStop sleep?</h3>
+    <p>Step 2–3 (kubelet) and step 4 (endpoints) race. If the app exits immediately on SIGTERM while some node's kube-proxy still routes to this Pod's IP, clients get connection refused/reset. A short <code>preStop</code> sleep keeps the app serving normally for a few seconds while the endpoint removal propagates; only then does SIGTERM start the drain. The app itself must also handle SIGTERM properly — as Module 02 covered, that requires the server to be PID 1 (exec-form <code>CMD</code>) or a proper init. Uvicorn performs a graceful shutdown: it stops accepting new connections and waits for in-flight responses, bounded by <code>--timeout-graceful-shutdown</code> if you set it.</p>
+    <pre data-title="reliability-api: graceful termination settings"><code>    spec:
+      terminationGracePeriodSeconds: 30     <span class="c"># budget for preStop + app shutdown</span>
+      containers:
+        - name: reliability-api
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5                  <span class="c"># built-in sleep action, executed by the kubelet</span>
+          <span class="c"># Alternative on clusters/images where needed:</span>
+          <span class="c">#   preStop: { exec: { command: ["sleep", "5"] } }   # requires a sleep binary in the image</span></code></pre>
+    <ul>
+      <li><strong>Budget check:</strong> 5 s preStop + Uvicorn drain (our longest request is a few hundred ms of <code>/work</code>) ≪ 30 s. If you had 60-second requests (e.g. LLM streaming, Module 12), you would raise <code>terminationGracePeriodSeconds</code>.</li>
+      <li><strong>Hook failures</strong> kill the container and are reported as a <code>FailedPreStopHook</code> Event. Hook logs are not shown in Pod events.</li>
+      <li><strong><code>kubectl delete pod --grace-period=0 --force</code></strong> removes the API object immediately without waiting for confirmation from the kubelet. Use only for stuck Pods you understand; it is not a "faster delete".</li>
+    </ul>
+    <div class="callout warn"><span class="label">Failure cases &amp; diagnosis</span>
+      <ul>
+        <li><strong>5xx/connection resets during every deploy</strong> → missing preStop delay or app exits instantly on SIGTERM. Reproduce under load during <code>kubectl rollout restart</code> (Module 08).</li>
+        <li><strong>Pods take exactly 30 s to terminate</strong> → app ignores SIGTERM (shell-form CMD, PID 1 is <code>sh</code>), so it waits for SIGKILL. Exit code 137 in <code>lastState</code> confirms.</li>
+        <li><strong>Pod stuck in Terminating for minutes</strong> → node unreachable, or finalizers on the object. <code>kubectl get pod -o yaml</code> → <code>metadata.finalizers</code>; <code>kubectl describe node</code>.</li>
+      </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>8. PodDisruptionBudget</h2>
+    <p><strong>Definition.</strong> A PodDisruptionBudget (PDB, <code>policy/v1</code>) limits how many Pods of a replicated application can be down at the same time due to <strong>voluntary disruptions</strong>.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Voluntary (PDB can limit)</th><th>Involuntary (PDB cannot prevent)</th></tr></thead>
+      <tbody>
+        <tr><td>Draining a node for upgrade/repair (<code>kubectl drain</code>); cluster autoscaler removing a node; an admin evicting Pods via the Eviction API</td><td>Hardware/VM failure, kernel panic, node network partition, node-pressure eviction (out of resources)</td></tr>
+      </tbody>
+    </table></div>
+    <p><strong>How it works.</strong> Tools that respect PDBs use the <strong>Eviction API</strong> instead of plain delete. The API server checks the budget: if allowed it returns 200 and the Pod is gracefully terminated (honouring <code>terminationGracePeriodSeconds</code>); if not, it returns <strong>429 Too Many Requests</strong> and the caller (e.g. <code>kubectl drain</code>) retries later. Important limits:</p>
+    <ul>
+      <li>Deleting Pods or Deployments directly, and Deployment rolling updates, are <strong>not</strong> governed by PDBs (rollouts use <code>maxUnavailable</code>).</li>
+      <li>Involuntary disruptions still count against the budget.</li>
+      <li>Set either <code>minAvailable</code> or <code>maxUnavailable</code>, not both. Percentages round <em>up</em> (e.g. <code>minAvailable: "50%"</code> of 7 → 4).</li>
+    </ul>
+    <pre data-title="deploy/kubernetes/pdb.yaml"><code>apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+spec:
+  minAvailable: 1                       <span class="c"># of 2 replicas → at most 1 voluntary disruption at a time</span>
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reliability-api
+  unhealthyPodEvictionPolicy: AlwaysAllow   <span class="c"># do not let crash-looping Pods block a drain</span></code></pre>
+    <pre data-title="Example output — kubectl get pdb (yours will differ)"><code><span class="o">NAME              MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE
+reliability-api   1               N/A               1                     20s</span></code></pre>
+    <div class="callout warn"><span class="label">Trade-offs &amp; traps</span>
+      <ul>
+        <li><strong><code>minAvailable</code> = replicas</strong> (e.g. 2 of 2) means ALLOWED DISRUPTIONS = 0: node drains block forever. A common way to accidentally freeze cluster upgrades.</li>
+        <li><code>unhealthyPodEvictionPolicy</code>: the default <code>IfHealthyBudget</code> lets running-but-not-ready Pods be evicted only if the budget is not already violated; <code>AlwaysAllow</code> lets them be evicted regardless — usually what you want so a broken Pod cannot block maintenance.</li>
+        <li>A PDB with 1 replica and <code>minAvailable: 1</code> is a contradiction: the only way to move it is downtime. Run ≥ 2 replicas for anything with a PDB.</li>
+      </ul>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>9. Other workload types</h2>
+    <p>Deployments are for long-running, stateless, interchangeable replicas. Other controllers encode other contracts:</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Kind (apiVersion)</th><th>Contract</th><th>Key fields &amp; defaults</th><th>In this project</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Job</strong> (<code>batch/v1</code>)</td><td>Run Pods until a number of them complete successfully.</td><td><code>completions</code> (1), <code>parallelism</code> (1), <code>backoffLimit</code> (6), <code>activeDeadlineSeconds</code>, <code>ttlSecondsAfterFinished</code>; Pod <code>restartPolicy</code> must be <code>Never</code> or <code>OnFailure</code>.</td><td>One-shot smoke test or load-test run inside the cluster.</td></tr>
+        <tr><td><strong>CronJob</strong> (<code>batch/v1</code>)</td><td>Create Jobs on a cron schedule.</td><td><code>schedule</code> (5-field cron), <code>concurrencyPolicy</code> (<code>Allow</code> default, <code>Forbid</code>, <code>Replace</code>), <code>startingDeadlineSeconds</code>, <code>successfulJobsHistoryLimit</code> (3), <code>failedJobsHistoryLimit</code> (1), <code>suspend</code>; optional <code>timeZone</code>. Name ≤ 52 chars.</td><td>Periodic synthetic check of <code>/ready</code>.</td></tr>
+        <tr><td><strong>DaemonSet</strong> (<code>apps/v1</code>)</td><td>One Pod on every (or every selected) node; new nodes get one automatically.</td><td>Update strategies <code>RollingUpdate</code> (default) or <code>OnDelete</code>; node selection via nodeSelector/affinity.</td><td>kube-proxy and kindnet are DaemonSets; node-exporter in kube-prometheus-stack (Module 07).</td></tr>
+        <tr><td><strong>StatefulSet</strong> (<code>apps/v1</code>)</td><td>Stable identity per replica: ordinal names (<code>web-0</code>, <code>web-1</code>), stable DNS via a headless Service (<code>serviceName</code>), per-replica storage via <code>volumeClaimTemplates</code>, ordered rollout.</td><td><code>podManagementPolicy</code> <code>OrderedReady</code> (default) or <code>Parallel</code>; <code>updateStrategy.rollingUpdate.partition</code>. Deleting it does <em>not</em> delete its PVCs.</td><td>Prometheus and Alertmanager run as StatefulSets via the operator (Module 07). Not for reliability-api: it is stateless.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>A smoke-test Job and CronJob for reliability-api</h3>
+    <p>Uses our own image (it already contains Python) to call the Service — so no extra image is needed. The Service <code>reliability-api</code> is created in Lab 1 below (and explained fully in Module 05).</p>
+    <pre data-title="deploy/kubernetes/smoke-job.yaml"><code>apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reliability-api-smoke
+  namespace: reliability-lab
+spec:
+  backoffLimit: 2                     <span class="c"># retry a failed Pod at most twice</span>
+  activeDeadlineSeconds: 60           <span class="c"># whole Job must finish within 60 s</span>
+  ttlSecondsAfterFinished: 600        <span class="c"># garbage-collect 10 min after finishing</span>
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: smoke
+          image: reliability-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-c"]
+          args:
+            - |
+              import urllib.request, sys
+              for path in ("/health", "/ready", "/work?ms=10"):
+                  r = urllib.request.urlopen("http://reliability-api" + path, timeout=5)
+                  print(path, r.status, r.read().decode())
+                  if r.status != 200: sys.exit(1)</code></pre>
+    <pre data-title="deploy/kubernetes/smoke-cronjob.yaml (excerpt)"><code>apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reliability-api-smoke
+  namespace: reliability-lab
+spec:
+  schedule: "*/5 * * * *"             <span class="c"># every 5 minutes</span>
+  concurrencyPolicy: Forbid           <span class="c"># skip a run if the previous one is still going</span>
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: smoke
+              image: reliability-api:0.1.0
+              <span class="c"># … same command/args as the Job above …</span></code></pre>
+    <p><code>urllib.request.urlopen</code> raises an exception on 4xx/5xx responses, which makes the Python process exit non-zero — so a 503 from <code>/ready</code> fails the Job, as intended.</p>
+
+    <!-- ============================================================ -->
+    <h2>10. The reliability-api Deployment after this module</h2>
+    <p>Everything from this module applied to the running example. Differences from Module 03 are marked <code>NEW</code>.</p>
+    <pre data-title="deploy/kubernetes/deployment.yaml"><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+  labels:
+    app.kubernetes.io/name: reliability-api
+    app.kubernetes.io/part-of: kubernetes-reliability-lab
+  annotations:
+    kubernetes.io/change-cause: "0.1.0 with probes, preStop, anti-affinity"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  minReadySeconds: 5                               <span class="c"># NEW: must stay Ready 5 s to count as available</span>
+  progressDeadlineSeconds: 300                     <span class="c"># NEW: fail a stuck rollout after 5 min (default 600)</span>
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reliability-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reliability-api
+        app.kubernetes.io/version: "0.1.0"
+    spec:
+      terminationGracePeriodSeconds: 30
+      affinity:                                    <span class="c"># NEW: prefer one replica per node</span>
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: reliability-api
+      containers:
+        - name: reliability-api
+          image: reliability-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - { name: APP_MODE, value: "normal" }
+            - { name: LOG_LEVEL, value: "info" }
+            - { name: READY_DELAY_SECONDS, value: "20" }     <span class="c"># NEW: longer warm-up to make readiness visible</span>
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { memory: 256Mi }
+          startupProbe:                                       <span class="c"># NEW</span>
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:                                          <span class="c"># NEW</span>
+            preStop:
+              sleep: { seconds: 5 }</code></pre>
+    <pre data-title="deploy/kubernetes/service.yaml (preview of Module 05)"><code>apiVersion: v1
+kind: Service
+metadata:
+  name: reliability-api
+  namespace: reliability-lab
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: reliability-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>11. Labs on the kind cluster <code>reliability-lab</code></h2>
+    <p>Start from the end state of Module 03 Lab 2 (cluster <code>reliability-lab</code>, namespace <code>reliability-lab</code> as default, image <code>reliability-api:0.1.0</code> loaded).</p>
+
+    <section class="lab"><header>Lab 1 — Probes: watch readiness gate traffic, then break liveness</header><div class="body">
+      <ol class="steps">
+        <li>Apply the Service and the updated Deployment from section 10:
+<pre><code>kubectl apply -f deploy/kubernetes/service.yaml
+kubectl apply -f deploy/kubernetes/deployment.yaml</code></pre></li>
+        <li>In terminal A watch Pods; in terminal B watch the Service's endpoints:
+<pre><code>kubectl get pods -l app.kubernetes.io/name=reliability-api -w                      <span class="c"># A</span>
+kubectl get endpointslices -l kubernetes.io/service-name=reliability-api -w        <span class="c"># B</span></code></pre>
+          <p>Trigger a fresh rollout so you can watch new Pods warm up: <code>kubectl rollout restart deploy/reliability-api</code>.</p>
+<pre data-title="Example output in A (abridged; timings will differ)"><code><span class="o">NAME                               READY   STATUS    RESTARTS   AGE
+reliability-api-7c9d8f6b4-q2m5t    0/1     Running   0          3s
+reliability-api-7c9d8f6b4-q2m5t    0/1     Running   0          10s    &lt;- startup probe passed, readiness still 503
+reliability-api-7c9d8f6b4-q2m5t    1/1     Running   0          22s    &lt;- READY_DELAY_SECONDS=20 elapsed</span></code></pre>
+          <p>The new Pod's IP appears in the EndpointSlice only after it turns <code>1/1</code>. Read the probe history: <code>kubectl describe pod &lt;new-pod&gt;</code> → Events (<code>Readiness probe failed: HTTP probe failed with statuscode: 503</code> during warm-up).</p></li>
+        <li>Confirm traffic only goes to ready Pods from inside the cluster:
+<pre><code>kubectl run curl --rm -it --restart=Never --image=busybox:1.36 -- \
+  sh -c 'for i in 1 2 3 4 5; do wget -qO- http://reliability-api/ready; echo; done'</code></pre></li>
+        <li><strong>Break liveness.</strong> Change the liveness path to <code>/healthz</code> (404) in a copy of the manifest and apply it. Watch RESTARTS climb:
+<pre><code>kubectl get pods -l app.kubernetes.io/name=reliability-api -w
+kubectl get events --field-selector reason=Unhealthy --sort-by=.metadata.creationTimestamp</code></pre>
+<pre data-title="Example output (abridged; wording may vary by version)"><code><span class="o">Warning  Unhealthy  …  Liveness probe failed: HTTP probe failed with statuscode: 404
+Normal   Killing    …  Container reliability-api failed liveness probe, will be restarted</span></code></pre>
+          <p>Questions to answer from the evidence: how many seconds between container start and the first kill? (Startup probe passes fast, then 3 × 10 s.) What does <code>kubectl rollout status</code> report? Notice that with <code>maxUnavailable: 0</code> the old Pods kept serving: the rollout is stuck rather than broken. Also notice the new Pods became Ready (readiness was fine) — a liveness bug can pass a rollout and then restart-loop.</p></li>
+        <li>Recover: <code>kubectl rollout undo deploy/reliability-api</code>, then re-apply the correct manifest from Git so the live state and Git agree again.</li>
+        <li>Use the probe simulator above with the same numbers and compare its predicted kill time with what you observed.</li>
+      </ol>
+    </div></section>
+
+    <section class="lab"><header>Lab 2 — Resources: OOMKill, CPU throttling, QoS, unschedulable</header><div class="body">
+      <ol class="steps">
+        <li><strong>OOMKill.</strong> Run a Pod from our image that allocates more than its 256Mi limit:
+<pre data-title="lab/oom.yaml"><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-demo
+  namespace: reliability-lab
+spec:
+  containers:
+    - name: hog
+      image: reliability-api:0.1.0
+      imagePullPolicy: IfNotPresent
+      command: ["python", "-c", "import time; b = bytearray(400 * 1024 * 1024); time.sleep(3600)"]
+      resources:
+        requests: { memory: 128Mi }
+        limits:   { memory: 256Mi }</code></pre>
+<pre><code>kubectl apply -f lab/oom.yaml
+kubectl get pod oom-demo -w
+kubectl describe pod oom-demo | sed -n '/Last State/,/Restart Count/p'</code></pre>
+<pre data-title="Example output (yours will differ)"><code><span class="o">NAME       READY   STATUS             RESTARTS      AGE
+oom-demo   0/1     OOMKilled          0             3s
+oom-demo   0/1     OOMKilled          1 (2s ago)    5s
+oom-demo   0/1     CrashLoopBackOff   1 (12s ago)   16s
+
+    Last State:     Terminated
+      Reason:       OOMKilled
+      Exit Code:    137
+    Ready:          False
+    Restart Count:  2</span></code></pre>
+          <p>Note the back-off growing between restarts (10 s, 20 s, 40 s…). Clean up: <code>kubectl delete pod oom-demo</code>.</p></li>
+        <li><strong>QoS.</strong>
+<pre><code>kubectl get pods -l app.kubernetes.io/name=reliability-api -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass</code></pre>
+          <p>Expected: <code>Burstable</code>. Predict the result before checking with the QoS widget.</p></li>
+        <li><strong>CPU throttling.</strong> Add a 200m CPU limit imperatively (lab only — Git still says "no CPU limit"):
+<pre><code>kubectl set resources deploy/reliability-api -c reliability-api --limits=cpu=200m,memory=256Mi
+kubectl rollout status deploy/reliability-api
+kubectl port-forward deploy/reliability-api 8000:8000 &amp;
+time curl -s "localhost:8000/work?ms=300"; echo
+POD=$(kubectl get pods -l app.kubernetes.io/name=reliability-api -o name | head -1)
+kubectl exec $POD -c reliability-api -- cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/cpu.stat</code></pre>
+<pre data-title="Example output (cgroup v2 node; yours will differ)"><code><span class="o">{"worked_ms":300.0}
+real    0m1.4…s
+20000 100000
+usage_usec …
+nr_periods …
+nr_throttled …
+throttled_usec …</span></code></pre>
+          <p>The app reports 300 ms of work, but wall time is ≈ 1.4–1.5 s: about 300 / 20 periods × 100 ms. <code>cpu.max</code> shows quota 20000 µs per 100000 µs period. If your node uses cgroup v1 the files differ (<code>cpu.cfs_quota_us</code>, <code>cpu.cfs_period_us</code>). Compare with the throttling calculator. Revert: <code>kubectl apply -f deploy/kubernetes/deployment.yaml</code> and stop the port-forward.</p></li>
+        <li><strong>Unschedulable.</strong>
+<pre><code>kubectl run too-big --image=reliability-api:0.1.0 --image-pull-policy=IfNotPresent \
+  --overrides='{"spec":{"containers":[{"name":"too-big","image":"reliability-api:0.1.0","imagePullPolicy":"IfNotPresent","resources":{"requests":{"cpu":"64"}}}]}}'
+kubectl describe pod too-big | grep -A3 Events
+kubectl describe node reliability-lab-control-plane | sed -n '/Allocated resources/,/Events/p'
+kubectl delete pod too-big</code></pre>
+<pre data-title="Example output (wording varies)"><code><span class="o">Warning  FailedScheduling  …  default-scheduler  0/1 nodes are available: 1 Insufficient cpu. …</span></code></pre></li>
+      </ol>
+    </div></section>
+
+    <section class="lab"><header>Lab 3 — Rolling update, stuck rollout, rollback</header><div class="body">
+      <ol class="steps">
+        <li>Create a "new version" (same content, new tag — enough to change the Pod template) and load it:
+<pre><code>docker tag reliability-api:0.1.0 reliability-api:0.2.0
+kind load docker-image reliability-api:0.2.0 --name reliability-lab</code></pre></li>
+        <li>Edit <code>deployment.yaml</code>: image <code>reliability-api:0.2.0</code>, label <code>app.kubernetes.io/version: "0.2.0"</code>, change-cause <code>"0.2.0"</code>. Then in terminal A:
+<pre><code>kubectl get rs -l app.kubernetes.io/name=reliability-api -w</code></pre>
+          and in terminal B:
+<pre><code>kubectl diff -f deploy/kubernetes/deployment.yaml
+kubectl apply -f deploy/kubernetes/deployment.yaml
+kubectl rollout status deploy/reliability-api</code></pre>
+<pre data-title="Example output in A (abridged)"><code><span class="o">NAME                         DESIRED   CURRENT   READY   AGE
+reliability-api-7c9d8f6b4    2         2         2       20m
+reliability-api-5f6b7d9c8    1         1         0       0s
+reliability-api-5f6b7d9c8    1         1         1       26s
+reliability-api-7c9d8f6b4    1         2         2       31s
+reliability-api-7c9d8f6b4    1         1         1       31s
+reliability-api-5f6b7d9c8    2         1         1       31s
+reliability-api-5f6b7d9c8    2         2         2       57s
+reliability-api-7c9d8f6b4    0         1         1       62s
+reliability-api-7c9d8f6b4    0         0         0       62s</span></code></pre>
+          <p>Match each line to a step of the rollout stepper. Why ~25 s per new Pod? 20 s READY_DELAY + readiness period + <code>minReadySeconds: 5</code>.</p></li>
+        <li><strong>A bad release.</strong> Set image <code>reliability-api:0.9.9</code> (never built), change-cause <code>"0.9.9 (bad)"</code>, apply, and:
+<pre><code>kubectl rollout status deploy/reliability-api --timeout=60s; echo "exit=$?"
+kubectl get pods -l app.kubernetes.io/name=reliability-api</code></pre>
+<pre data-title="Example output (abridged)"><code><span class="o">Waiting for deployment "reliability-api" rollout to finish: 1 out of 2 new replicas have been updated...
+error: timed out waiting for the condition
+exit=1
+NAME                               READY   STATUS             RESTARTS   AGE
+reliability-api-5f6b7d9c8-abcde    1/1     Running            0          5m
+reliability-api-5f6b7d9c8-fghij    1/1     Running            0          5m
+reliability-api-6a1b2c3d4-zzzzz    0/1     ImagePullBackOff   0          60s</span></code></pre>
+          <p>Users are unaffected (2 old Pods Ready, <code>maxUnavailable: 0</code>). After <code>progressDeadlineSeconds</code> (300 s in our manifest), <code>kubectl describe deploy reliability-api</code> shows <code>Progressing False ProgressDeadlineExceeded</code>.</p></li>
+        <li><strong>Roll back and read history.</strong>
+<pre><code>kubectl rollout history deploy/reliability-api
+kubectl rollout undo deploy/reliability-api
+kubectl rollout status deploy/reliability-api
+kubectl rollout history deploy/reliability-api</code></pre>
+          <p>Observe that the restored revision reappears under a new, higher number. Finally fix Git (set the image back to 0.2.0) and apply, so Git and cluster agree.</p></li>
+      </ol>
+    </div></section>
+
+    <section class="lab"><header>Lab 4 — Graceful termination, PDB and a node drain</header><div class="body">
+      <ol class="steps">
+        <li>Time a graceful delete (preStop sleep 5 + fast Uvicorn shutdown):
+<pre><code>POD=$(kubectl get pods -l app.kubernetes.io/name=reliability-api -o name | head -1)
+time kubectl delete $POD</code></pre>
+          <p>Expect roughly 5–7 s, not 30 s. If it takes ~30 s, the app is not receiving or handling SIGTERM; check what PID 1 is in a running Pod: <code>kubectl exec &lt;pod&gt; -c reliability-api -- cat /proc/1/cmdline</code> (it should be the Uvicorn/Python process, not a shell). Then try <code>terminationGracePeriodSeconds: 10</code> and a preStop sleep of 15 s and predict what happens (hint: the 2-second extension).</p></li>
+        <li>Apply the PDB and inspect it:
+<pre><code>kubectl apply -f deploy/kubernetes/pdb.yaml
+kubectl get pdb reliability-api</code></pre></li>
+        <li>Drain the (only) node, evicting only our Pods, with a timeout:
+<pre><code>kubectl drain reliability-lab-control-plane \
+  --pod-selector=app.kubernetes.io/name=reliability-api --timeout=60s</code></pre>
+<pre data-title="Example output (abridged; wording may vary)"><code><span class="o">node/reliability-lab-control-plane cordoned
+evicting pod reliability-lab/reliability-api-5f6b7d9c8-abcde
+evicting pod reliability-lab/reliability-api-5f6b7d9c8-fghij
+error when evicting pods/"reliability-api-5f6b7d9c8-fghij" -n "reliability-lab" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.
+pod/reliability-api-5f6b7d9c8-abcde evicted
+…
+error: unable to drain node "reliability-lab-control-plane" due to error: … global timeout reached: 1m0s</span></code></pre>
+          <p>What happened: the first eviction was allowed (2 → 1 available). Its replacement is <code>Pending</code> because the only node is cordoned (<code>SchedulingDisabled</code>). The second eviction got HTTP 429 from the Eviction API over and over. On a single node, the PDB just prevented a full outage of <code>reliability-api</code>.</p></li>
+        <li>Recover: <code>kubectl uncordon reliability-lab-control-plane</code>; watch the Pending Pod schedule and become Ready.</li>
+        <li>Contrast: <code>kubectl delete pod</code> on both Pods at once is <em>not</em> blocked by the PDB (direct deletes bypass it). Try it and watch READY briefly drop to 0/2 — then explain why rolling updates still never drop below 2 (they use <code>maxUnavailable</code>, not the PDB).</li>
+      </ol>
+    </div></section>
+
+    <section class="lab"><header>Lab 5 — Scheduling constraints: nodeSelector and taints</header><div class="body">
+      <ol class="steps">
+        <li>Add a nodeSelector the node does not satisfy:
+<pre><code>kubectl patch deploy reliability-api --type=merge -p '{"spec":{"template":{"spec":{"nodeSelector":{"disktype":"ssd"}}}}}'
+kubectl get pods -l app.kubernetes.io/name=reliability-api
+kubectl describe pod &lt;the-Pending-pod&gt; | grep -A3 Events</code></pre>
+          <p>Expect one new Pod <code>Pending</code> with <code>FailedScheduling … didn't match Pod's node affinity/selector</code>, while the old Pods keep serving (rolling update safety again).</p></li>
+        <li>Satisfy it by labelling the node, and watch the Pod schedule:
+<pre><code>kubectl label node reliability-lab-control-plane disktype=ssd
+kubectl rollout status deploy/reliability-api</code></pre></li>
+        <li>Taint the node and scale up:
+<pre><code>kubectl taint nodes reliability-lab-control-plane dedicated=lab:NoSchedule
+kubectl scale deploy/reliability-api --replicas=3
+kubectl get pods -l app.kubernetes.io/name=reliability-api      <span class="c"># 2 Running (NoSchedule does not evict), 1 Pending</span>
+kubectl taint nodes reliability-lab-control-plane dedicated=lab:NoSchedule-
+kubectl get pods -l app.kubernetes.io/name=reliability-api -w   <span class="c"># Pending one schedules</span></code></pre></li>
+        <li>Clean up: <code>kubectl label node reliability-lab-control-plane disktype-</code> and <code>kubectl apply -f deploy/kubernetes/deployment.yaml</code> (removes the nodeSelector and resets replicas to 2).</li>
+      </ol>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>12. Troubleshooting quick reference</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Symptom</th><th>Most likely area</th><th>First commands</th></tr></thead>
+      <tbody>
+        <tr><td><code>Pending</code></td><td>Requests too large, selector/affinity, taints, PVC</td><td><code>describe pod</code> → <code>FailedScheduling</code>; <code>describe node</code></td></tr>
+        <tr><td><code>Running 0/1</code></td><td>Readiness</td><td><code>describe pod</code> → <code>Readiness probe failed</code>; curl the path via port-forward</td></tr>
+        <tr><td>RESTARTS rising, exit 137, <code>OOMKilled</code></td><td>Memory limit</td><td><code>describe pod</code> → Last State; memory metrics</td></tr>
+        <tr><td>RESTARTS rising, <code>Killing … failed liveness probe</code></td><td>Liveness config or app hang</td><td>Events; <code>logs --previous</code>; simulator</td></tr>
+        <tr><td>Latency high, no errors, CPU "under limit"</td><td>CPU throttling</td><td><code>cpu.stat</code> <code>nr_throttled</code>; Prometheus throttling metrics</td></tr>
+        <tr><td>Rollout hangs</td><td>New Pods not available</td><td><code>rollout status</code>, <code>get rs</code>, <code>describe deploy</code> conditions</td></tr>
+        <tr><td>Errors during every deploy</td><td>Termination / readiness</td><td>preStop delay, SIGTERM handling, <code>minReadySeconds</code></td></tr>
+        <tr><td><code>kubectl drain</code> never finishes</td><td>PDB allows 0 disruptions</td><td><code>kubectl get pdb</code> (ALLOWED DISRUPTIONS)</td></tr>
+        <tr><td>Pod <code>Failed</code>, reason <code>Evicted</code></td><td>Node pressure</td><td><code>describe node</code> → Conditions (MemoryPressure/DiskPressure)</td></tr>
+      </tbody>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Topic</th><th>Remember</th></tr></thead>
+      <tbody>
+        <tr><td>Probe defaults</td><td><code>initialDelaySeconds 0 · periodSeconds 10 · timeoutSeconds 1 · successThreshold 1 · failureThreshold 3</code></td></tr>
+        <tr><td>Probe actions</td><td>startup/liveness fail → restart container · readiness fail → out of endpoints, no restart · startup gates the others</td></tr>
+        <tr><td>Detection window</td><td><code>failureThreshold × periodSeconds</code></td></tr>
+        <tr><td>HTTP probe success</td><td>200 ≤ status &lt; 400</td></tr>
+        <tr><td>CPU units</td><td><code>1</code> = 1 core/vCPU · <code>100m</code> = 0.1 · min <code>1m</code></td></tr>
+        <tr><td>Memory units</td><td><code>Mi</code> = 2<sup>20</sup> bytes · <code>M</code> = 10<sup>6</sup> · <code>m</code> = milli-bytes (a typo!)</td></tr>
+        <tr><td>Over CPU limit</td><td>Throttled (CFS quota per 100 ms period) → latency</td></tr>
+        <tr><td>Over memory limit</td><td>OOMKilled, exit 137, restart with back-off</td></tr>
+        <tr><td>QoS</td><td>Guaranteed (req = lim for CPU &amp; mem, every container) · Burstable (something set) · BestEffort (nothing) · evicted in reverse order</td></tr>
+        <tr><td>Rolling defaults</td><td><code>maxSurge 25%</code> (round up) · <code>maxUnavailable 25%</code> (round down) · not both 0</td></tr>
+        <tr><td>Deployment defaults</td><td><code>revisionHistoryLimit 10 · progressDeadlineSeconds 600 · minReadySeconds 0</code></td></tr>
+        <tr><td>Rollout</td><td><code>kubectl rollout status|history|undo [--to-revision=N]|restart deploy/reliability-api</code></td></tr>
+        <tr><td>Termination</td><td>grace 30 s default · preStop then TERM · endpoints removed in parallel · SIGKILL at end · preStop overrun +2 s</td></tr>
+        <tr><td>Back-off</td><td>10 s, doubling, max 300 s; reset after 10 min OK</td></tr>
+        <tr><td>PDB</td><td><code>policy/v1</code> · minAvailable XOR maxUnavailable · Eviction API only · 429 when blocked</td></tr>
+        <tr><td>Taints</td><td><code>kubectl taint nodes N k=v:NoSchedule[-]</code> · NoSchedule / PreferNoSchedule / NoExecute</td></tr>
+        <tr><td>Job</td><td><code>backoffLimit 6</code> default · <code>restartPolicy Never|OnFailure</code></td></tr>
+        <tr><td>CronJob</td><td><code>concurrencyPolicy Allow|Forbid|Replace</code> · history 3 success / 1 failed</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>Probe</dt><dd>Periodic diagnostic run by the kubelet: exec, httpGet, tcpSocket or grpc.</dd>
+      <dt>Liveness / readiness / startup</dt><dd>Restart-if-stuck / route-traffic-if-ready / protect-slow-start checks.</dd>
+      <dt>Request</dt><dd>Resource amount reserved for scheduling (and CPU weight).</dd>
+      <dt>Limit</dt><dd>Kernel-enforced ceiling: CPU throttled, memory OOM-killed.</dd>
+      <dt>Allocatable</dt><dd>Node capacity minus system reservations; what the scheduler can hand out.</dd>
+      <dt>CFS quota / period</dt><dd>Linux CPU bandwidth control: max CPU time per period for a cgroup (<code>cpu.max</code> on cgroup v2).</dd>
+      <dt>Throttling</dt><dd>Runnable threads prevented from running because the quota is used up.</dd>
+      <dt>OOMKilled</dt><dd>Container terminated by the kernel out-of-memory killer; exit code 137.</dd>
+      <dt>QoS class</dt><dd>Guaranteed, Burstable, BestEffort — derived from requests/limits; drives eviction order and <code>oom_score_adj</code>.</dd>
+      <dt>Node-pressure eviction</dt><dd>Kubelet terminating Pods to reclaim memory/disk/PIDs; ignores PDBs.</dd>
+      <dt>Filtering / scoring</dt><dd>Scheduler steps: remove infeasible nodes, then rank feasible ones.</dd>
+      <dt>Affinity / anti-affinity</dt><dd>Rules attracting or repelling Pods relative to node labels or other Pods within a topology domain.</dd>
+      <dt>Taint / toleration</dt><dd>Node-side repulsion / Pod-side permission to ignore it.</dd>
+      <dt>Topology spread</dt><dd>Constraint limiting the skew of Pod counts across domains (zones, nodes).</dd>
+      <dt>maxSurge / maxUnavailable</dt><dd>Rolling update bounds above / below the desired replica count.</dd>
+      <dt>minReadySeconds</dt><dd>How long a new Pod must be Ready before it counts as available.</dd>
+      <dt>Revision</dt><dd>A Deployment Pod-template version, backed by a ReplicaSet.</dd>
+      <dt>CrashLoopBackOff</dt><dd>Waiting reason while the kubelet delays restarting a repeatedly failing container.</dd>
+      <dt>Grace period</dt><dd><code>terminationGracePeriodSeconds</code>: time from start of termination to SIGKILL.</dd>
+      <dt>preStop hook</dt><dd>Action (exec, httpGet, sleep) run before TERM is sent.</dd>
+      <dt>PodDisruptionBudget</dt><dd>Limit on concurrent voluntary disruptions, enforced via the Eviction API.</dd>
+      <dt>Eviction API</dt><dd>Policy-aware Pod removal used by <code>kubectl drain</code>; returns 429 when a PDB would be violated.</dd>
+      <dt>Job / CronJob / DaemonSet / StatefulSet</dt><dd>Run-to-completion / scheduled Jobs / one per node / stable identity and storage.</dd>
+    </dl>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. Why should liveness not check <code>/ready</code> for reliability-api?</summary><div class="a"><code>/ready</code> is 503 during warm-up and could be 503 under overload. Liveness failure restarts the container, which repeats warm-up (making the outage longer) and moves load to other replicas (possibly making them fail too). Readiness is for "not now", liveness for "stuck forever".</div></details>
+    <details class="q"><summary>2. App takes up to 90 s to start, then must be restarted within ~30 s of hanging. Give probe settings.</summary><div class="a">startupProbe on <code>/health</code> with <code>periodSeconds: 10</code>, <code>failureThreshold: 9</code> (or 5 s × 18) → up to 90 s to start. livenessProbe <code>periodSeconds: 10</code>, <code>failureThreshold: 3</code> → ~30 s detection once started. Readiness separately on <code>/ready</code>.</div></details>
+    <details class="q"><summary>3. A container has requests cpu 100m and no CPU limit. The node is idle. How much CPU can it use? What if the node is busy?</summary><div class="a">On an idle node it can use as much CPU as is free (requests are a floor/weight, not a cap). On a busy node, CPU is shared in proportion to requests (weights), so it is guaranteed roughly its 100m share but not more.</div></details>
+    <details class="q"><summary>4. Memory request 128Mi, limit 256Mi; the process grows to 300Mi. What happens? What if the limit were absent?</summary><div class="a">With the limit: the kernel OOM-kills it (OOMKilled, exit 137) and it restarts with back-off. Without a limit: it can keep growing until the node runs low; then the kubelet's node-pressure eviction (and/or kernel OOM at node level) acts, and because it exceeds its request it is a prime eviction candidate — possibly after other Pods have suffered.</div></details>
+    <details class="q"><summary>5. Classify: container A requests cpu 200m / mem 256Mi with equal limits; container B (sidecar) has no resources.</summary><div class="a">Burstable. Guaranteed requires <em>every</em> container to have equal CPU and memory requests and limits; B has none, so the Pod is not Guaranteed, but A has some, so it is not BestEffort.</div></details>
+    <details class="q"><summary>6. replicas 10, maxSurge 30%, maxUnavailable 30%. Bounds during a rollout?</summary><div class="a">maxSurge = ceil(3.0) = 3 → at most 13 Pods. maxUnavailable = floor(3.0) = 3 → at least 7 available. (With 25%: ceil(2.5) = 3 and floor(2.5) = 2.)</div></details>
+    <details class="q"><summary>7. Why can replicas 1 with default strategy cause downtime during a rollout, and how do you fix it?</summary><div class="a">Defaults with 1 replica: maxSurge = ceil(0.25) = 1, maxUnavailable = floor(0.25) = 0, so a rollout itself keeps 1 available. But a single replica still means downtime on node failure, eviction or drain, and no capacity spare during restarts. Fix: run ≥ 2 replicas, plus a PDB.</div></details>
+    <details class="q"><summary>8. During a rollout clients see a few connection errors each time an old Pod goes away. Diagnose.</summary><div class="a">Endpoint removal and SIGTERM happen in parallel; the app likely exits (or stops accepting) before all nodes stop routing to it. Add a preStop delay (e.g. sleep 5), make sure the app handles SIGTERM gracefully (PID 1, Uvicorn graceful shutdown), and ensure grace period covers both.</div></details>
+    <details class="q"><summary>9. Your PDB has minAvailable: 2 and the Deployment has 2 replicas. What happens on a node upgrade?</summary><div class="a">ALLOWED DISRUPTIONS = 0, so every eviction returns 429 and <code>kubectl drain</code> blocks until timeout. Use <code>minAvailable: 1</code> (or <code>maxUnavailable: 1</code>), or more replicas.</div></details>
+    <details class="q"><summary>10. Pod is in phase Running but kubectl shows CrashLoopBackOff. Contradiction?</summary><div class="a">No. Phase is the Pod-level summary; with <code>restartPolicy: Always</code> the Pod stays Running while its container cycles. <code>CrashLoopBackOff</code> is the container's <code>Waiting</code> state reason during the restart back-off.</div></details>
+    <details class="q"><summary>11. A toleration for <code>gpu=true:NoSchedule</code> is added to reliability-api. Will it run on GPU nodes?</summary><div class="a">It <em>may</em>, but nothing makes it prefer them; a toleration only removes the repulsion. To steer it there you would add node affinity; to keep it off, simply don't add the toleration.</div></details>
+    <details class="q"><summary>12. <code>kubectl rollout undo</code> fixed production. What must you do next, and why?</summary><div class="a">Update Git (and/or the Helm values) to the good version. The undo changed only the live object; the next declarative apply from Git or a CI pipeline would re-deploy the bad version.</div></details>
+    <details class="q"><summary>13. When would a Job be better than a Deployment for the smoke test?</summary><div class="a">When the work should run to completion and report success/failure (exit code), not run forever. A Deployment would restart the finished container endlessly (restartPolicy Always).</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/">Configure Liveness, Readiness and Startup Probes — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/probes/">Liveness, Readiness, and Startup Probes (concept: mechanisms, results, fields) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/">Pod Lifecycle (phases, states, conditions, back-off, termination) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/">Container Lifecycle Hooks (preStop, sleep handler) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/">Resource Management for Pods and Containers — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/configure-pod-container/assign-cpu-resource/">Assign CPU Resources to Containers and Pods — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/">Pod Quality of Service Classes — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/">Node-pressure Eviction — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/">Kubernetes Scheduler (filtering and scoring) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/">Assigning Pods to Nodes — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/">Taints and Tolerations — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/">Deployments (strategy, rollout, rollback, defaults) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/pods/disruptions/">Disruptions — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/tasks/run-application/configure-pdb/">Specifying a Disruption Budget for your Application — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/scheduling-eviction/api-eviction/">API-initiated Eviction — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/job/">Jobs — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/">CronJob — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/daemonset/">DaemonSet — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/">StatefulSets — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/kubectl/generated/kubectl_drain/">kubectl drain (--pod-selector, --timeout) — kubernetes.io</a></li>
+      <li><a href="https://kubernetes.io/docs/reference/kubectl/generated/kubectl_rollout/kubectl_rollout_undo/">kubectl rollout undo — kubernetes.io</a></li>
+      <li><a href="https://docs.kernel.org/scheduler/sched-bwc.html">CFS Bandwidth Control — Linux kernel documentation (docs.kernel.org)</a></li>
+      <li><a href="https://docs.kernel.org/admin-guide/cgroup-v2.html">Control Group v2 (cpu.max, cpu.stat) — Linux kernel documentation (docs.kernel.org)</a></li>
+      <li><a href="https://uvicorn.dev/server-behavior/">Server Behavior: graceful process shutdown — Uvicorn documentation</a></li>
+      <li><a href="https://kind.sigs.k8s.io/docs/user/quick-start/">kind Quick Start (load docker-image) — kind.sigs.k8s.io</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="03-kubernetes-architecture.html"><small>◀ Previous</small>Module 03 · Kubernetes Architecture &amp; Core Objects</a>
+      <a class="next" href="05-kubernetes-networking-config.html"><small>Next ▶</small>Module 05 · Networking, Configuration, Storage &amp; Access Control</a>
+    </nav>
+  </article></main>
+</div>
+<script>
+/* ---------- helpers ---------- */
+function $id(id) { return document.getElementById(id); }
+function num(id) { var v = parseFloat($id(id).value); return isNaN(v) ? 0 : v; }
+
+/* ---------- Probe timeline simulator ---------- */
+(function () {
+  if (!$id("probe-sim")) return;
+  var T = 180;
+  var presets = {
+    good:      { bind: 2,  ready: 20, hang: 0,  s_on: true,  s_period: 5, s_ft: 12, l_path: "/health", l_delay: 0, l_period: 10, l_ft: 3, r_delay: 0, r_period: 5, r_ft: 3, r_st: 1 },
+    badlive:   { bind: 2,  ready: 40, hang: 0,  s_on: false, s_period: 5, s_ft: 12, l_path: "/ready",  l_delay: 0, l_period: 10, l_ft: 3, r_delay: 0, r_period: 5, r_ft: 3, r_st: 1 },
+    nostartup: { bind: 45, ready: 50, hang: 0,  s_on: false, s_period: 5, s_ft: 12, l_path: "/health", l_delay: 0, l_period: 10, l_ft: 3, r_delay: 0, r_period: 5, r_ft: 3, r_st: 1 },
+    hang:      { bind: 2,  ready: 20, hang: 60, s_on: true,  s_period: 5, s_ft: 12, l_path: "/health", l_delay: 0, l_period: 10, l_ft: 3, r_delay: 0, r_period: 5, r_ft: 3, r_st: 1 }
+  };
+  var map = { bind: "ps-bind", ready: "ps-ready", hang: "ps-hang", s_period: "ps-s-period", s_ft: "ps-s-ft", l_path: "ps-l-path", l_delay: "ps-l-delay", l_period: "ps-l-period", l_ft: "ps-l-ft", r_delay: "ps-r-delay", r_period: "ps-r-period", r_ft: "ps-r-ft", r_st: "ps-r-st" };
+  function apply(p) { Object.keys(map).forEach(function (k) { $id(map[k]).value = p[k]; }); $id("ps-s-on").checked = p.s_on; run(); }
+
+  function simulate(c) {
+    var ev = { startup: [], liveness: [], readiness: [], restarts: [], alive: [], ready: [] };
+    var ts = 0, inc = 0, alive = true, downUntil = -1;
+    var sDone, sFails, lFails, rFails, rSucc, ready, sNext, lNext, rNext;
+    function resetInc(start) {
+      ts = start; sDone = c.s_on ? null : start; sFails = 0; lFails = 0; rFails = 0; rSucc = 0; ready = false;
+      sNext = c.s_on ? start : null;
+      lNext = c.s_on ? null : start + c.l_delay;
+      rNext = c.s_on ? null : start + c.r_delay;
+    }
+    function respond(t, path) {
+      if (t - ts < c.bind) return "refused";
+      if (c.hang > 0 && ts < c.hang && t >= c.hang) return "timeout";
+      if (path === "/ready" && t - ts < c.ready) return "503";
+      return "ok";
+    }
+    resetInc(0);
+    var aliveStart = 0;
+    for (var t = 0; t <= T; t++) {
+      if (!alive) {
+        if (t >= downUntil) { alive = true; inc++; resetInc(t); aliveStart = t; }
+        else { ev.ready.push(false); continue; }
+      }
+      var killed = false;
+      if (c.s_on && sDone === null && sNext !== null && t >= sNext) {
+        var r = respond(t, "/health"), ok = r === "ok";
+        ev.startup.push({ t: t, ok: ok, r: r });
+        if (ok) { sDone = t; lNext = t + c.l_delay; rNext = t + c.r_delay; }
+        else { sFails++; if (sFails >= c.s_ft) killed = "startup"; }
+        sNext = t + c.s_period;
+      }
+      if (!killed && sDone !== null && lNext !== null && t >= lNext) {
+        var r2 = respond(t, c.l_path), ok2 = r2 === "ok";
+        ev.liveness.push({ t: t, ok: ok2, r: r2 });
+        if (ok2) lFails = 0; else { lFails++; if (lFails >= c.l_ft) killed = "liveness"; }
+        lNext = t + c.l_period;
+      }
+      if (!killed && sDone !== null && rNext !== null && t >= rNext) {
+        var r3 = respond(t, "/ready"), ok3 = r3 === "ok";
+        ev.readiness.push({ t: t, ok: ok3, r: r3 });
+        if (ok3) { rSucc++; rFails = 0; if (rSucc >= c.r_st) ready = true; }
+        else { rFails++; rSucc = 0; if (rFails >= c.r_ft) ready = false; }
+        rNext = t + c.r_period;
+      }
+      if (killed) {
+        ev.restarts.push({ t: t, why: killed });
+        ev.alive.push([aliveStart, t]);
+        alive = false; ready = false; downUntil = t + 1;
+      }
+      ev.ready.push(ready);
+    }
+    if (alive) ev.alive.push([aliveStart, T]);
+    return ev;
+  }
+
+  function svgFor(ev) {
+    var x0 = 120, x1 = 845, W = x1 - x0;
+    function X(t) { return (x0 + t / T * W).toFixed(1); }
+    var s = '<svg class="sim-svg" viewBox="0 0 860 250" role="img" aria-label="Simulated probe timeline">';
+    var rows = [["container", 30], ["startup", 72], ["liveness", 108], ["readiness", 144], ["Ready (in Service)", 186]];
+    rows.forEach(function (r) { s += '<text x="10" y="' + (r[1] + 4) + '" class="t-muted">' + r[0] + '</text><path d="M' + x0 + ' ' + r[1] + ' L' + x1 + ' ' + r[1] + '" class="line dash" style="opacity:.35"/>'; });
+    ev.alive.forEach(function (a) { s += '<rect x="' + X(a[0]) + '" y="22" width="' + Math.max(1, (a[1] - a[0]) / T * W).toFixed(1) + '" height="16" rx="3" class="box4"/>'; });
+    ev.restarts.forEach(function (r) { s += '<circle cx="' + X(r.t) + '" cy="30" r="6" class="dot-bad"/>'; });
+    [["startup", 72], ["liveness", 108], ["readiness", 144]].forEach(function (row) {
+      ev[row[0]].forEach(function (p) { s += '<circle cx="' + X(p.t) + '" cy="' + row[1] + '" r="3.5" class="' + (p.ok ? "dot-ok" : "dot-bad") + '"/>'; });
+    });
+    var start = null;
+    for (var t = 0; t <= T + 1; t++) {
+      var on = t <= T && ev.ready[t];
+      if (on && start === null) start = t;
+      if (!on && start !== null) { s += '<rect x="' + X(start) + '" y="178" width="' + Math.max(1, (t - start) / T * W).toFixed(1) + '" height="16" rx="3" class="box4"/>'; start = null; }
+    }
+    for (var k = 0; k <= T; k += 30) { s += '<path d="M' + X(k) + ' 210 L' + X(k) + ' 216" class="line"/><text x="' + X(k) + '" y="232" text-anchor="middle" class="t-mono">' + k + 's</text>'; }
+    s += '<path d="M' + x0 + ' 210 L' + x1 + ' 210" class="line"/>';
+    s += '<text x="' + x1 + '" y="248" text-anchor="end" class="t-muted">green dot = probe success · red dot = failure · red circle on container row = kill &amp; restart</text>';
+    return s + "</svg>";
+  }
+
+  function run() {
+    var c = {};
+    Object.keys(map).forEach(function (k) { c[k] = k === "l_path" ? $id(map[k]).value : Math.max(0, num(map[k])); });
+    ["s_period", "s_ft", "l_period", "l_ft", "r_period", "r_ft", "r_st"].forEach(function (k) { c[k] = Math.max(1, Math.round(c[k])); });
+    c.s_on = $id("ps-s-on").checked;
+    var ev = simulate(c);
+    $id("ps-svg").innerHTML = svgFor(ev);
+    var firstReady = ev.ready.indexOf(true);
+    var readySecs = ev.ready.filter(Boolean).length;
+    var lines = [];
+    lines.push("First Ready at: " + (firstReady < 0 ? "never (within " + T + " s)" : "t=" + firstReady + " s"));
+    lines.push("Time in Service: " + Math.round(readySecs / (T + 1) * 100) + "% of " + T + " s");
+    lines.push("Restarts: " + ev.restarts.length + (ev.restarts.length ? "  (" + ev.restarts.map(function (r) { return "t=" + r.t + "s by " + r.why; }).join(", ") + ")" : ""));
+    if (c.s_on) lines.push("Startup allowance: " + (c.s_ft * c.s_period) + " s (failureThreshold × periodSeconds)");
+    lines.push("Liveness detection window: ~" + (c.l_ft * c.l_period) + " s · readiness removal: ~" + (c.r_ft * c.r_period) + " s");
+    if (ev.restarts.length >= 3) lines.push("⚠ Restart loop. A real kubelet would show CrashLoopBackOff and wait 10 s, 20 s, 40 s… (max 300 s) between restarts.");
+    if (c.l_path === "/ready") lines.push("⚠ Liveness on /ready: warm-up or overload now causes restarts instead of just removing traffic.");
+    if (!c.s_on && c.bind > c.l_delay + c.l_period * (c.l_ft - 1)) lines.push("⚠ App binds its port after liveness has already failed " + c.l_ft + " times: add a startupProbe.");
+    $id("ps-out").textContent = lines.join("\n");
+  }
+  document.querySelectorAll("#probe-sim [data-preset]").forEach(function (b) { b.addEventListener("click", function () { apply(presets[b.getAttribute("data-preset")]); }); });
+  document.querySelectorAll("#probe-sim input, #probe-sim select").forEach(function (el) { el.addEventListener("input", run); el.addEventListener("change", run); });
+  apply(presets.good);
+})();
+
+/* ---------- CFS throttling calculator ---------- */
+(function () {
+  if (!$id("cfs-calc")) return;
+  function run() {
+    var L = Math.max(0, num("cfs-limit")), work = Math.max(1, num("cfs-work")), period = Math.max(1, num("cfs-period"));
+    var out;
+    if (L === 0) out = "No CPU limit → no CFS quota. Wall time ≈ " + work + " ms (if the node has idle CPU).";
+    else {
+      var quota = L / 1000 * period;
+      if (quota >= period) out = "Quota " + quota.toFixed(1) + " ms per " + period + " ms period ≥ one full core: a single thread is never throttled. Wall ≈ " + work + " ms.\n(Multi-threaded work could still exhaust the quota.)";
+      else {
+        var full = Math.floor(work / quota), rem = +(work - full * quota).toFixed(3), wall, thr;
+        if (rem === 0) { wall = (full - 1) * period + quota; thr = full - 1; } else { wall = full * period + rem; thr = full; }
+        out = "cpu.max (cgroup v2) would read: " + Math.round(quota * 1000) + " " + Math.round(period * 1000) + "\n" +
+              "Quota per period: " + quota.toFixed(1) + " ms of CPU every " + period + " ms\n" +
+              "Throttled periods for this request: " + thr + "\n" +
+              "Wall-clock time ≈ " + wall.toFixed(1) + " ms  (vs " + work + " ms unthrottled → " + (wall / work).toFixed(1) + "× slower)";
+      }
+    }
+    $id("cfs-out").textContent = out;
+  }
+  ["cfs-limit", "cfs-work", "cfs-period"].forEach(function (id) { $id(id).addEventListener("input", run); });
+  run();
+})();
+
+/* ---------- QoS classifier ---------- */
+(function () {
+  if (!$id("qos-widget")) return;
+  var SUF = { Ki: 1024, Mi: 1048576, Gi: 1073741824, Ti: 1099511627776, k: 1e3, K: 1e3, M: 1e6, G: 1e9, T: 1e12, m: 1e-3 };
+  function qty(s) {
+    s = (s || "").trim(); if (!s) return null;
+    var m = s.match(/^([0-9]*\.?[0-9]+)(Ki|Mi|Gi|Ti|k|K|M|G|T|m)?$/);
+    if (!m) throw new Error("cannot parse quantity '" + s + "'");
+    return parseFloat(m[1]) * (m[2] ? SUF[m[2]] : 1);
+  }
+  var presets = {
+    ours:       [["100m", "128Mi", "", "256Mi"], null],
+    guar:       [["250m", "256Mi", "250m", "256Mi"], null],
+    limitsonly: [["", "", "500m", "256Mi"], null],
+    none:       [["", "", "", ""], null],
+    sidecar:    [["200m", "256Mi", "200m", "256Mi"], ["", "", "", ""]]
+  };
+  var ids = [["q1-rc", "q1-rm", "q1-lc", "q1-lm"], ["q2-rc", "q2-rm", "q2-lc", "q2-lm"]];
+  function setP(p) {
+    ids[0].forEach(function (id, i) { $id(id).value = p[0][i]; });
+    $id("q2-on").checked = !!p[1];
+    ids[1].forEach(function (id, i) { $id(id).value = p[1] ? p[1][i] : ""; });
+    run();
+  }
+  function run() {
+    var v = $id("qos-verdict"), out = $id("qos-out"), notes = [];
+    try {
+      var cs = [ids[0]]; if ($id("q2-on").checked) cs.push(ids[1]);
+      var parsed = cs.map(function (g, idx) {
+        var c = { rc: qty($id(g[0]).value), rm: qty($id(g[1]).value), lc: qty($id(g[2]).value), lm: qty($id(g[3]).value) };
+        if (c.lc !== null && c.rc === null) { c.rc = c.lc; notes.push("container " + (idx + 1) + ": cpu request defaulted to its limit"); }
+        if (c.lm !== null && c.rm === null) { c.rm = c.lm; notes.push("container " + (idx + 1) + ": memory request defaulted to its limit"); }
+        if (c.rc !== null && c.lc !== null && c.rc > c.lc) throw new Error("container " + (idx + 1) + ": cpu request > limit is invalid (API rejects it)");
+        if (c.rm !== null && c.lm !== null && c.rm > c.lm) throw new Error("container " + (idx + 1) + ": memory request > limit is invalid (API rejects it)");
+        return c;
+      });
+      var anySet = parsed.some(function (c) { return c.rc !== null || c.rm !== null || c.lc !== null || c.lm !== null; });
+      var guar = parsed.every(function (c) { return c.lc !== null && c.lm !== null && c.rc === c.lc && c.rm === c.lm && c.lc > 0 && c.lm > 0; });
+      var cls = guar ? "Guaranteed" : anySet ? "Burstable" : "BestEffort";
+      v.innerHTML = '<span class="verdict ' + (cls === "Guaranteed" ? "g" : cls === "Burstable" ? "b" : "e") + '">' + cls + "</span>";
+      var nodeMem = 8 * 1073741824;
+      var lines = [];
+      if (cls === "Guaranteed") lines.push("Why: every container has cpu AND memory limits, each equal to its request.");
+      else if (cls === "Burstable") {
+        var why = parsed.map(function (c, i) {
+          if (c.lc === null) return "container " + (i + 1) + " has no cpu limit";
+          if (c.lm === null) return "container " + (i + 1) + " has no memory limit";
+          if (c.rc !== c.lc) return "container " + (i + 1) + " cpu request ≠ limit";
+          if (c.rm !== c.lm) return "container " + (i + 1) + " memory request ≠ limit";
+          return null;
+        }).filter(Boolean);
+        lines.push("Why not Guaranteed: " + why.join("; ") + ".");
+        lines.push("Not BestEffort because at least one request/limit is set.");
+      } else lines.push("Why: no container sets any cpu or memory request or limit.");
+      lines.push("Eviction order under node pressure: BestEffort → Burstable → Guaranteed.");
+      lines.push("oom_score_adj (kubelet-set, per container, assuming an 8Gi node):");
+      parsed.forEach(function (c, i) {
+        var adj;
+        if (cls === "Guaranteed") adj = -997;
+        else if (cls === "BestEffort") adj = 1000;
+        else adj = Math.min(Math.max(2, Math.round(1000 - (1000 * (c.rm || 0)) / nodeMem)), 999);
+        lines.push("  container " + (i + 1) + ": " + adj + (cls === "Burstable" ? "  = min(max(2, 1000 − 1000×memRequest/nodeMemory), 999)" : ""));
+      });
+      if (notes.length) lines.push("Notes: " + notes.join("; ") + ".");
+      out.textContent = lines.join("\n");
+    } catch (e) { v.innerHTML = '<span class="verdict e">invalid</span>'; out.textContent = e.message; }
+  }
+  document.querySelectorAll("#qos-widget [data-qos]").forEach(function (b) { b.addEventListener("click", function () { setP(presets[b.getAttribute("data-qos")]); }); });
+  document.querySelectorAll("#qos-widget input").forEach(function (el) { el.addEventListener("input", run); el.addEventListener("change", run); });
+  setP(presets.ours);
+})();
+
+/* ---------- Rolling update calculator ---------- */
+(function () {
+  if (!$id("roll-calc")) return;
+  function val(str, rep, up) {
+    str = (str || "").trim();
+    var m = str.match(/^(\d+(?:\.\d+)?)%$/);
+    if (m) { var x = rep * parseFloat(m[1]) / 100; return up ? Math.ceil(x - 1e-9) : Math.floor(x + 1e-9); }
+    if (/^\d+$/.test(str)) return parseInt(str, 10);
+    throw new Error("use an integer or a percentage like 25%");
+  }
+  function run() {
+    var out = $id("rc-out"), rows = $id("rc-rows");
+    rows.innerHTML = "";
+    var rep = Math.max(1, Math.min(40, Math.round(num("rc-rep"))));
+    var surge, unav;
+    try { surge = val($id("rc-surge").value, rep, true); unav = val($id("rc-unav").value, rep, false); }
+    catch (e) { out.textContent = e.message; return; }
+    if (surge === 0 && unav === 0) { out.textContent = "maxSurge and maxUnavailable cannot both be 0 — the API rejects this (no Pod could ever be replaced)."; return; }
+    var maxTotal = rep + surge, minAvail = Math.max(0, rep - unav);
+    out.textContent = "maxSurge → " + surge + " Pod(s) (percentages round up)\n" +
+      "maxUnavailable → " + unav + " Pod(s) (percentages round down)\n" +
+      "Ceiling: at most " + maxTotal + " Pods total · Floor: at least " + minAvail + " available";
+    var old = rep, nr = 0, nn = 0, round = 0, html = "";
+    function draw(label, killed) {
+      var sq = "";
+      for (var i = 0; i < old; i++) sq += '<span class="sq old" title="old"></span>';
+      for (i = 0; i < killed; i++) sq += '<span class="sq term" title="terminating"></span>';
+      for (i = 0; i < nn; i++) sq += '<span class="sq newnr" title="new, not ready"></span>';
+      for (i = 0; i < nr; i++) sq += '<span class="sq new" title="new, ready"></span>';
+      html += '<div class="roll-row"><span style="min-width:80px">' + label + "</span>" + sq +
+        '<span style="margin-left:8px;color:var(--muted)">old ' + old + " · new ready " + nr + " · starting " + nn + " · total " + (old + nr + nn) + " · available " + (old + nr) + "</span></div>";
+    }
+    draw("start", 0);
+    while ((old > 0 || nr < rep) && round < 60) {
+      round++;
+      var total = old + nr + nn;
+      var want = Math.min(rep, nr + nn + Math.max(0, maxTotal - total));
+      nn += Math.max(0, want - (nr + nn));
+      var canKill = Math.max(0, old + nr - minAvail), kill = Math.min(canKill, old);
+      old -= kill;
+      draw("round " + round, kill);
+      nr += nn; nn = 0;
+    }
+    draw("done", 0);
+    rows.innerHTML = html + '<div style="font-size:12.5px;color:var(--muted);margin-top:6px">■ blue old · ■ amber new starting · ■ green new ready · ■ red terminating (not counted)</div>';
+  }
+  ["rc-rep", "rc-surge", "rc-unav"].forEach(function (id) { $id(id).addEventListener("input", run); });
+  run();
+})();
+</script>
+</body>
+</html>

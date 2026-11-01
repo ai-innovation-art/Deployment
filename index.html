@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DevOps Lab — Learning Portfolio</title>
+<link rel="stylesheet" href="notes-animated/assets/style.css">
+<script src="notes-animated/assets/notes.js"></script>
+<style>
+  .hero-section { padding: 56px 0 24px; }
+  .hero-section h1 { font-size: 2.4rem; margin-bottom: 12px; }
+  .hero-section .lede { font-size: 1.15rem; max-width: 680px; }
+  .hub-grid { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin: 32px 0; }
+  .hub-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px 28px; text-decoration: none; color: inherit; display: block; transition: border-color .15s, transform .15s, box-shadow .15s; }
+  .hub-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: 0 4px 24px color-mix(in srgb, var(--accent) 12%, transparent); }
+  .hub-card .icon { font-size: 2.4rem; display: block; margin-bottom: 12px; }
+  .hub-card h2 { margin: 0 0 8px; font-size: 1.3rem; border: none; padding: 0; }
+  .hub-card p { margin: 0; color: var(--muted); font-size: 15px; }
+  .hub-card .arrow { display: inline-block; margin-top: 14px; font-size: 14px; color: var(--accent); font-weight: 600; }
+  .hub-card.accent-card { border-color: var(--accent); background: var(--accent-soft); }
+  .roadmap-table { margin: 24px 0 0; }
+  .section-label { font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 40px 0 12px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Lab</a>
+  <span class="crumb">Portfolio Home</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+    <section class="hero-section">
+      <h1>DevOps Learning Portfolio</h1>
+      <p class="lede">13 module course notes + hands-on labs for Docker, Kubernetes, Observability, CI/CD, and Cloud — with interactive diagrams, animated step-throughs, and runnable labs in GitHub Codespaces.</p>
+      <div class="meta">
+        <span class="pill accent">13 modules</span>
+        <span class="pill">Docker · Kubernetes · Observability</span>
+        <span class="pill">CI/CD · Terraform · GKE · AI Inference</span>
+        <span class="pill">GitHub Codespaces ready</span>
+        <span class="verified">✓ Official docs only · Oct 2026</span>
+      </div>
+    </section>
+
+    <h2>What's in this portfolio</h2>
+    <div class="hub-grid">
+      <a class="hub-card" href="notes-animated/index.html">
+        <span class="icon">📖</span>
+        <h2>Course Notes (Animated)</h2>
+        <p>Thirteen detailed modules covering every layer of the DevOps stack. Every concept is checked against official documentation, with interactive diagrams, simulators, and self-check questions.</p>
+        <span class="arrow">Open notes →</span>
+      </a>
+      <a class="hub-card" href="labs/index.html">
+        <span class="icon">🧪</span>
+        <h2>Hands-on Labs</h2>
+        <p>Practical lab companion for each module. Commands are runnable in GitHub Codespaces — Docker is pre-installed. Copy any code block with one click.</p>
+        <span class="arrow">Open labs →</span>
+      </a>
+    </div>
+
+    <h2>Learning Roadmap</h2>
+    <p>The course is structured in four phases. Complete each phase before moving to the next. The Notes and Labs are complementary — read a concept, then do the lab.</p>
+
+    <div class="table-wrap roadmap-table"><table>
+      <tr>
+        <th>Phase</th>
+        <th>Modules (Notes)</th>
+        <th>Lab</th>
+        <th>Milestone</th>
+      </tr>
+      <tr>
+        <td><span class="pill accent">Foundations</span></td>
+        <td>01 Linux &amp; Networking · 02 Docker</td>
+        <td><a href="labs/02-docker.html">Lab 02 — Docker</a></td>
+        <td>Image builds and runs from a clean checkout</td>
+      </tr>
+      <tr>
+        <td><span class="pill">Kubernetes Core</span></td>
+        <td>03 Architecture · 04 Workloads · 05 Networking &amp; Config · 06 kind &amp; Helm</td>
+        <td>Labs 03–06 <em>(coming soon)</em></td>
+        <td>2 replicas on kind, probes and resources justified</td>
+      </tr>
+      <tr>
+        <td><span class="pill">Operate &amp; Measure</span></td>
+        <td>07 Observability · 08 Scaling &amp; Load &amp; Failure</td>
+        <td>Labs 07–08 <em>(coming soon)</em></td>
+        <td>Dashboard explains a load change; HPA fires and recovers</td>
+      </tr>
+      <tr>
+        <td><span class="pill">Automate / Cloud</span></td>
+        <td>09 CI/CD · 10 Terraform · 11 GKE · 12 AI Inference · 13 Troubleshooting</td>
+        <td>Labs 09–13 <em>(coming soon)</em></td>
+        <td>PRs gated by tests; reproducible Terraform plan</td>
+      </tr>
+    </table></div>
+
+    <h2>The running example</h2>
+    <p>Every module and every lab uses <strong>one running example</strong>: the <code>reliability-api</code> service — a small FastAPI app you build, containerize, deploy, observe, scale, break, and automate. Using the same app across all modules means every concept is concrete, not abstract.</p>
+
+    <div class="grid">
+      <div class="card">
+        <h4>📦 Module 02 — Docker</h4>
+        <p>Build the image, run a container, explore volumes and networks, write a production-grade Dockerfile.</p>
+      </div>
+      <div class="card">
+        <h4>☸️ Modules 03–06 — Kubernetes</h4>
+        <p>Deploy to a local kind cluster, add probes and resource limits, package with Helm.</p>
+      </div>
+      <div class="card">
+        <h4>📊 Module 07 — Observability</h4>
+        <p>Scrape with Prometheus, visualize in Grafana, define SLIs and error budgets.</p>
+      </div>
+      <div class="card">
+        <h4>🚀 Module 09 — CI/CD</h4>
+        <p>Gate PRs with GitHub Actions, build and push to GHCR, run kind integration tests in CI.</p>
+      </div>
+    </div>
+
+    <h2>How to use this site</h2>
+    <ol>
+      <li><strong>Read</strong> the course note for a module — understand the concept, the diagram, how it applies to <code>reliability-api</code>.</li>
+      <li><strong>Do</strong> the corresponding lab — run real commands, observe real output, note differences from the sample.</li>
+      <li><strong>Break</strong> something on purpose — the failure cases sections and lab sections guide you.</li>
+      <li><strong>Record</strong> what you observe in your study notes.</li>
+      <li><strong>Check</strong> the self-check questions and tick Done in the module topbar.</li>
+    </ol>
+
+    <div class="callout note">
+      <span class="label">GitHub Codespaces</span>
+      <p>All lab commands are designed to run in <strong>GitHub Codespaces</strong> — Docker is pre-installed, you get a full Linux environment in your browser, and nothing breaks your local machine. Open the repo in Codespaces and every <code>docker</code> command works immediately.</p>
+    </div>
+
+  </article></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,1195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Module 10 · Terraform &amp; Infrastructure as Code — DevOps Notes</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/anim.css">
+<script src="assets/notes.js"></script>
+<script src="assets/anim.js"></script>
+<style>
+  .pr-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .pr-btns .btn { font-family: var(--mono); min-width: 52px; }
+  .fb-ok { color: var(--ok); font-weight: 700; }
+  .fb-bad { color: var(--bad); font-weight: 700; }
+  .cf-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+  .act-c { color: var(--ok); } .act-d { color: var(--bad); } .act-r { color: var(--warn); } .act-n { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="index.html">DevOps Notes</a>
+  <span class="crumb">Module 10 · Terraform &amp; Infrastructure as Code</span>
+  <span class="spacer"></span>
+  <label class="pill"><input type="checkbox" data-done-key="10"> Done</label>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+    <h1>Module 10 · Terraform &amp; Infrastructure as Code</h1>
+    <p class="lede">Kubernetes manifests and Helm describe what runs <em>inside</em> a cluster. Something still has to create the cluster, its network, its identities, the registry and the bucket that stores state — and do it repeatably, reviewably and reversibly. Terraform is that tool. This module teaches the model behind it (desired configuration vs recorded state vs real world), the HCL language, providers, the dependency graph, state and locking, how to read a plan before you let it touch anything, and safe refactoring. You practise entirely for free against your kind cluster first, then see the skeleton of the Google Cloud setup that Module 11 builds on — with the cost traps called out.</p>
+    <div class="meta"><span class="pill accent">Prereq: Modules 03–06, 09</span><span class="pill">≈ 4 h study + 4 h lab</span><span class="verified">✓ Checked against official docs, Oct 2026</span></div>
+    <section class="explainer" id="explainer-video"><header>🎬 Animated explainer <span class="pill accent">Terraform: config, state & reality</span></header><video controls preload="metadata" playsinline poster="videos/m10.jpg" src="videos/m10.mp4"></video><div class="ex-foot"><strong>Watch first, then read.</strong> init → plan → apply, reading plan symbols, drift, and why state needs a locked remote backend. Rendered with Manim Community (MIT); source: <code>video-src/</code>. Facts match this page's verified sections.</div></section>
+
+
+    <h2>Learning objectives</h2>
+    <ul>
+      <li>Explain declarative, idempotent infrastructure and drift, and why "click-ops" fails at scale.</li>
+      <li>Run and explain the core workflow: write → <code>init</code> → <code>plan</code> → <code>apply</code> → <code>destroy</code>, including what each command reads and writes.</li>
+      <li>Read and write HCL: blocks, labels, arguments, expressions, references.</li>
+      <li>Configure providers with <code>required_providers</code>, version constraints and the dependency lock file.</li>
+      <li>Model infrastructure with resources and data sources; explain the dependency graph (implicit references vs <code>depends_on</code>).</li>
+      <li>Use variables (types, validation, sensitive), outputs and locals; know the variable precedence order.</li>
+      <li>Explain state — why it exists, why it's sensitive — and use a remote GCS backend with locking; use <code>state list/show/mv</code>, <code>moved</code> and <code>import</code> blocks.</li>
+      <li>Read plan symbols (<code>+ - ~ -/+ +/- &lt;=</code>) fluently and spot dangerous plans.</li>
+      <li>Apply lifecycle meta-arguments, choose <code>count</code> vs <code>for_each</code>, structure code into modules, choose workspaces vs separate directories.</li>
+      <li>Draw the boundary between Terraform, Helm, kubectl and GitHub Actions for reliability-api.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>Infrastructure as Code: declarative, idempotent, drift</h2>
+    <p><strong>Definition.</strong> <em>Infrastructure as Code (IaC)</em> means describing infrastructure — clusters, networks, buckets, IAM bindings, namespaces — in version-controlled text files, and letting a tool make reality match the files. HashiCorp's definition of Terraform: "an infrastructure as code tool that lets you build, change, and version cloud and on-prem resources safely and efficiently."</p>
+    <p><strong>Problem it solves.</strong> Infrastructure created by clicking in a console is undocumented, unreviewable and unreproducible: nobody knows exactly which settings the staging cluster has, re-creating it after a mistake takes days, and two environments that "should be identical" quietly aren't. With IaC, a change is a pull request — diffable, reviewable, revertible — and a new environment is a command.</p>
+    <dl class="defs">
+      <dt>Declarative</dt><dd>You describe the <em>end state</em> ("a namespace named reliability-tf with these labels exists"), not the steps. Terraform computes the steps. Same idea as a Kubernetes Deployment (Module 03).</dd>
+      <dt>Idempotent</dt><dd>Applying the same configuration twice produces the same result; the second apply changes nothing ("No changes. Your infrastructure matches the configuration."). A shell script that runs <code>kubectl create namespace</code> is not idempotent — the second run fails.</dd>
+      <dt>Drift</dt><dd>Real infrastructure diverges from what the configuration/state says, usually because someone changed it by hand (<code>kubectl edit</code>, console click). Terraform detects drift when it refreshes during <code>plan</code>.</dd>
+    </dl>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 860 320" role="img" aria-label="Configuration, state and real infrastructure; plan compares them and drift happens when real world changes outside Terraform">
+        <defs><marker id="t1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="20" y="30" width="230" height="96" rx="10" class="box2"/><text x="135" y="56" text-anchor="middle" class="t-bold">Configuration (.tf)</text><text x="135" y="78" text-anchor="middle" class="t-muted">what you WANT</text><text x="135" y="98" text-anchor="middle" class="t-mono">LOG_LEVEL = "info"</text><text x="135" y="116" text-anchor="middle" class="t-muted">in git, reviewed</text>
+        <rect x="315" y="30" width="230" height="96" rx="10" class="box3"/><text x="430" y="56" text-anchor="middle" class="t-bold">State (tfstate)</text><text x="430" y="78" text-anchor="middle" class="t-muted">what Terraform last SAW/DID</text><text x="430" y="98" text-anchor="middle" class="t-mono">LOG_LEVEL = "info"</text><text x="430" y="116" text-anchor="middle" class="t-muted">IDs, attributes, deps</text>
+        <rect x="610" y="30" width="230" height="96" rx="10" class="box4"/><text x="725" y="56" text-anchor="middle" class="t-bold">Real world (APIs)</text><text x="725" y="78" text-anchor="middle" class="t-muted">what EXISTS</text><text x="725" y="98" text-anchor="middle" class="t-mono">LOG_LEVEL = "debug"</text><text x="725" y="116" text-anchor="middle" class="t-muted">ConfigMap in kind</text>
+        <path d="M610 78 H549" class="line accent" marker-end="url(#t1)"/><text x="580" y="148" text-anchor="middle" class="t-muted">1 refresh</text><text x="580" y="162" text-anchor="middle" class="t-muted">(read real)</text>
+        <path d="M315 78 H254" class="line accent" marker-end="url(#t1)"/><text x="285" y="148" text-anchor="middle" class="t-muted">2 diff vs</text><text x="285" y="162" text-anchor="middle" class="t-muted">config</text>
+        <rect x="200" y="200" width="460" height="56" rx="10" class="box"/><text x="430" y="224" text-anchor="middle" class="t-bold">3 plan: ~ LOG_LEVEL "debug" → "info"</text><text x="430" y="244" text-anchor="middle" class="t-muted">apply would revert the manual change</text>
+        <path d="M430 126 V196" class="line" marker-end="url(#t1)"/>
+        <path d="M790 126 C790 200 760 230 720 236" class="line bad dash"/><text x="770" y="290" text-anchor="middle" class="t-muted">someone ran kubectl edit</text><text x="770" y="306" text-anchor="middle" class="t-muted">→ drift</text>
+        <circle cx="830" cy="40" r="8" class="dot-bad"/>
+      </svg>
+      <figcaption>Terraform keeps three views apart. Planning refreshes state from the real APIs, compares with configuration, and proposes actions to make reality match configuration.</figcaption>
+    </figure>
+
+    <h3>Imperative vs declarative, concretely</h3>
+<pre data-title="Imperative (script) — order and existence checks are your problem"><code>kubectl create namespace reliability-tf            <span class="c"># fails if it exists</span>
+kubectl -n reliability-tf create configmap reliability-api-config \
+  --from-literal=LOG_LEVEL=info                    <span class="c"># fails if it exists; changes need a different command</span></code></pre>
+<pre data-title="Declarative (Terraform) — describe the result"><code>resource "kubernetes_namespace_v1" "lab" {
+  metadata { name = "reliability-tf" }
+}
+resource "kubernetes_config_map_v1" "app" {
+  metadata {
+    name      = "reliability-api-config"
+    namespace = kubernetes_namespace_v1.lab.metadata[0].name   <span class="c"># reference = dependency</span>
+  }
+  data = { LOG_LEVEL = "info" }
+}</code></pre>
+    <h3>Trade-offs</h3>
+    <ul>
+      <li><strong>Pro:</strong> reviewable diffs, reproducibility, self-documentation, safe teardown, drift detection.</li>
+      <li><strong>Con:</strong> a new layer to learn; state to protect; provider bugs/version churn; a powerful tool can delete powerful things — plan review is mandatory.</li>
+      <li><strong>Rule of ownership:</strong> each real object must have exactly <em>one</em> owner (Terraform, Helm, or a human). Two tools managing the same object fight forever (each apply "fixes" the other's changes).</li>
+    </ul>
+    <details class="q"><summary>Self-check: you apply, then immediately apply again with no edits. What should the second plan say, and what does it mean if it proposes changes?</summary><div class="a">"No changes. Your infrastructure matches the configuration." If it proposes changes, something is non-idempotent: drift (someone/something changes the object between runs — e.g. a controller mutating a field), a provider normalising values differently from your config, or a value that changes every run (e.g. <code>timestamp()</code>). Use <code>lifecycle.ignore_changes</code> only for fields legitimately owned by something else.</div></details>
+
+    <!-- ============================================================ -->
+    <h2>The core workflow: write → init → plan → apply → destroy</h2>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Terraform core workflow and the files and systems each command touches">
+        <defs><marker id="t2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="30" width="130" height="62" rx="8" class="box"/><text x="75" y="56" text-anchor="middle" class="t-bold">write</text><text x="75" y="76" text-anchor="middle" class="t-mono">*.tf</text>
+        <rect x="180" y="30" width="130" height="62" rx="8" class="box2"/><text x="245" y="56" text-anchor="middle" class="t-bold">init</text><text x="245" y="76" text-anchor="middle" class="t-muted">once / on change</text>
+        <rect x="350" y="30" width="130" height="62" rx="8" class="box2"/><text x="415" y="56" text-anchor="middle" class="t-bold">plan</text><text x="415" y="76" text-anchor="middle" class="t-muted">read-only preview</text>
+        <rect x="520" y="30" width="130" height="62" rx="8" class="box3"/><text x="585" y="56" text-anchor="middle" class="t-bold">apply</text><text x="585" y="76" text-anchor="middle" class="t-muted">changes reality</text>
+        <rect x="690" y="30" width="150" height="62" rx="8" class="box3"/><text x="765" y="56" text-anchor="middle" class="t-bold">destroy</text><text x="765" y="76" text-anchor="middle" class="t-muted">= plan -destroy + apply</text>
+        <path d="M140 61 H176" class="line" marker-end="url(#t2)"/><path d="M310 61 H346" class="line" marker-end="url(#t2)"/><path d="M480 61 H516" class="line" marker-end="url(#t2)"/><path d="M650 61 H686" class="line dash" marker-end="url(#t2)"/>
+        <path d="M585 92 C585 140 75 140 75 96" class="line dash accent" marker-end="url(#t2)"/><text x="330" y="156" text-anchor="middle" class="t-muted">edit config → plan again (the everyday loop)</text>
+        <!-- touches -->
+        <text x="180" y="176" class="t-bold">writes</text>
+        <text x="180" y="196" class="t-mono">.terraform/</text><text x="180" y="212" class="t-mono">.terraform.lock.hcl</text><text x="180" y="228" class="t-muted">downloads providers,</text><text x="180" y="244" class="t-muted">modules; configures backend</text>
+        <text x="350" y="176" class="t-bold">reads</text>
+        <text x="350" y="196" class="t-muted">config + state +</text><text x="350" y="212" class="t-muted">real APIs (refresh)</text><text x="350" y="228" class="t-muted">writes only -out plan</text><text x="350" y="244" class="t-muted">file if asked</text>
+        <text x="520" y="176" class="t-bold">writes</text>
+        <text x="520" y="196" class="t-muted">real infrastructure +</text><text x="520" y="212" class="t-mono">terraform.tfstate</text><text x="520" y="228" class="t-muted">(holds the state lock</text><text x="520" y="244" class="t-muted">while running)</text>
+        <text x="690" y="176" class="t-bold">removes</text>
+        <text x="690" y="196" class="t-muted">every managed object</text><text x="690" y="212" class="t-muted">in this state</text><text x="690" y="228" class="t-muted">(not unmanaged ones)</text>
+        <text x="10" y="284" class="t-muted">fmt / validate sit between write and plan: cheap, offline checks (no API calls).</text>
+      </svg>
+      <figcaption>HashiCorp describes the core workflow as Write → Plan → Apply; <code>init</code> prepares the working directory and <code>destroy</code> is a special plan mode.</figcaption>
+    </figure>
+    <div class="table-wrap"><table>
+      <tr><th>Command</th><th>What it does</th><th>Safe to run anytime?</th></tr>
+      <tr><td><code>terraform init</code></td><td>Initialises the directory: configures the backend, installs providers (records selections in <code>.terraform.lock.hcl</code>) and modules (<code>.terraform/modules</code>). <code>-upgrade</code> ignores lock selections and picks the newest allowed versions.</td><td>Yes</td></tr>
+      <tr><td><code>terraform fmt</code></td><td>Rewrites files to canonical style. <code>-check</code> exits non-zero if changes needed; <code>-recursive</code>; <code>-diff</code>.</td><td>Yes</td></tr>
+      <tr><td><code>terraform validate</code></td><td>Syntax + internal consistency; does <em>not</em> contact remote services. Needs an initialised dir (<code>init -backend=false</code> works offline).</td><td>Yes</td></tr>
+      <tr><td><code>terraform plan</code></td><td>Refreshes state from real objects, compares with config, proposes actions. <code>-out=tfplan</code> saves it; <code>-detailed-exitcode</code> → 0 no changes, 1 error, 2 changes.</td><td>Yes (read-only, but it does call APIs)</td></tr>
+      <tr><td><code>terraform apply</code></td><td>Without a plan file: plans, asks for approval, executes. With a saved plan file: executes it <em>without prompting</em>.</td><td><strong>No</strong> — read the plan</td></tr>
+      <tr><td><code>terraform destroy</code></td><td>Plans destruction of everything in this state and applies after approval (same as <code>apply -destroy</code>).</td><td><strong>No</strong></td></tr>
+      <tr><td><code>terraform output</code></td><td>Prints root outputs from state (<code>-raw</code>, <code>-json</code> show sensitive values in plain text!).</td><td>Yes</td></tr>
+    </table></div>
+
+    <h3>Walk through one apply, step by step</h3>
+    <div class="widget stepper" data-steps='[
+      {"title":"Load configuration","html":"Terraform parses all <code>*.tf</code> files in the directory (one module), evaluates variables, and builds a dependency graph of resources, data sources, and providers."},
+      {"title":"Acquire the state lock","html":"For writes, Terraform locks the state (automatic for backends that support locking, like GCS). A second engineer running apply now gets <em>Error acquiring the state lock</em> instead of corrupting state."},
+      {"title":"Refresh","html":"For each resource in state, the provider reads the real object (here: GET the ConfigMap from the kind API server). Differences from state are reported as <em>Objects have changed outside of Terraform</em>."},
+      {"title":"Diff and propose","html":"Desired (config) is compared with current (refreshed state). Each resource gets an action: create, update in-place, replace, destroy, read, or no-op. The plan is printed with symbols and a summary line."},
+      {"title":"Approve","html":"You type <code>yes</code> (or apply a saved plan file you already reviewed). This is the human gate: the only moment you can stop a destructive change."},
+      {"title":"Walk the graph","html":"Terraform calls provider create/update/delete in dependency order, up to 10 operations in parallel by default (<code>-parallelism</code>). The namespace is created before the ConfigMap that references it."},
+      {"title":"Write state and unlock","html":"After each operation, results (IDs, computed attributes) are written to state. Finally the lock is released. Errors mid-way leave partial but recorded progress; re-run plan to see what remains."}
+    ]'>
+      <div class="w-title">terraform apply — what happens inside</div>
+      <svg viewBox="0 0 860 170" role="img" aria-label="Apply phases">
+        <defs><marker id="t2s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <g data-step="0"><rect x="10" y="50" width="104" height="56" rx="8" class="box"/><text x="62" y="74" text-anchor="middle" class="t-bold">load</text><text x="62" y="92" text-anchor="middle" class="t-muted">*.tf + vars</text></g>
+        <g data-step="1,6"><rect x="130" y="50" width="104" height="56" rx="8" class="box3"/><text x="182" y="74" text-anchor="middle" class="t-bold">lock</text><text x="182" y="92" text-anchor="middle" class="t-muted">state</text></g>
+        <g data-step="2"><rect x="250" y="50" width="104" height="56" rx="8" class="box2"/><text x="302" y="74" text-anchor="middle" class="t-bold">refresh</text><text x="302" y="92" text-anchor="middle" class="t-muted">read APIs</text></g>
+        <g data-step="3"><rect x="370" y="50" width="104" height="56" rx="8" class="box2"/><text x="422" y="74" text-anchor="middle" class="t-bold">diff</text><text x="422" y="92" text-anchor="middle" class="t-muted">plan</text></g>
+        <g data-step="4"><rect x="490" y="50" width="104" height="56" rx="8" class="box3"/><text x="542" y="74" text-anchor="middle" class="t-bold">approve</text><text x="542" y="92" text-anchor="middle" class="t-muted">yes / plan file</text></g>
+        <g data-step="5"><rect x="610" y="50" width="104" height="56" rx="8" class="box4"/><text x="662" y="74" text-anchor="middle" class="t-bold">execute</text><text x="662" y="92" text-anchor="middle" class="t-muted">graph order</text></g>
+        <g data-step="6"><rect x="730" y="50" width="120" height="56" rx="8" class="box4"/><text x="790" y="74" text-anchor="middle" class="t-bold">write state</text><text x="790" y="92" text-anchor="middle" class="t-muted">then unlock</text></g>
+        <path d="M114 78 H126" class="line" marker-end="url(#t2s)"/><path d="M234 78 H246" class="line" marker-end="url(#t2s)"/><path d="M354 78 H366" class="line" marker-end="url(#t2s)"/><path d="M474 78 H486" class="line" marker-end="url(#t2s)"/><path d="M594 78 H606" class="line" marker-end="url(#t2s)"/><path d="M714 78 H726" class="line" marker-end="url(#t2s)"/>
+        <text x="430" y="150" text-anchor="middle" class="t-muted">plan = load → lock (briefly) → refresh → diff ; apply adds approve → execute → write state</text>
+      </svg>
+      <div class="stage"></div>
+      <div class="controls"><button class="btn" data-prev>◀ Prev</button><button class="btn primary" data-next>Next ▶</button><span class="count"></span></div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>HCL syntax: blocks, arguments, expressions</h2>
+    <p>Terraform configuration is written in HCL (HashiCorp Configuration Language). Everything is built from three things:</p>
+    <ul>
+      <li><strong>Blocks</strong> — a type, zero or more labels, and a body in braces: <code>resource "kubernetes_config_map_v1" "app" { … }</code>. Blocks can nest (<code>metadata { … }</code>).</li>
+      <li><strong>Arguments</strong> — <code>name = expression</code> inside a block body.</li>
+      <li><strong>Expressions</strong> — literals (<code>"info"</code>, <code>2</code>, <code>true</code>), references (<code>var.log_level</code>, <code>kubernetes_namespace_v1.lab.metadata[0].name</code>), string templates (<code>"${var.project_id}-tfstate"</code>), function calls (<code>toset(…)</code>, <code>merge(…)</code>), conditionals (<code>a ? b : c</code>), and <code>for</code> expressions.</li>
+    </ul>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Anatomy of a Terraform resource block" xml:space="preserve" style="white-space:pre">
+        <rect x="20" y="20" width="560" height="260" rx="10" class="box"/>
+        <text x="36" y="50" class="t-mono"><tspan class="t-bold">resource</tspan> "kubernetes_config_map_v1" "app" {</text>
+        <text x="36" y="78" class="t-mono">  metadata {</text>
+        <text x="36" y="102" class="t-mono">    name      = "reliability-api-config"</text>
+        <text x="36" y="126" class="t-mono">    namespace = kubernetes_namespace_v1.lab.metadata[0].name</text>
+        <text x="36" y="150" class="t-mono">    labels    = local.common_labels</text>
+        <text x="36" y="174" class="t-mono">  }</text>
+        <text x="36" y="198" class="t-mono">  data = {</text>
+        <text x="36" y="222" class="t-mono">    LOG_LEVEL = var.log_level</text>
+        <text x="36" y="246" class="t-mono">    LAB_ID    = "lab-${random_pet.lab.id}"</text>
+        <text x="36" y="270" class="t-mono">  }  }</text>
+        <rect x="610" y="24" width="236" height="40" rx="6" class="box2"/><text x="622" y="42" class="t-bold">block type + 2 labels</text><text x="622" y="58" class="t-muted">resource TYPE, local NAME</text>
+        <rect x="610" y="74" width="236" height="40" rx="6" class="box2"/><text x="622" y="92" class="t-bold">nested block</text><text x="622" y="108" class="t-muted">metadata { } — no "="</text>
+        <rect x="610" y="124" width="236" height="40" rx="6" class="box3"/><text x="622" y="142" class="t-bold">reference expression</text><text x="622" y="158" class="t-muted">creates implicit dependency</text>
+        <rect x="610" y="174" width="236" height="40" rx="6" class="box2"/><text x="622" y="192" class="t-bold">argument with map value</text><text x="622" y="208" class="t-muted">data = { … } — uses "="</text>
+        <rect x="610" y="224" width="236" height="40" rx="6" class="box3"/><text x="622" y="242" class="t-bold">string template</text><text x="622" y="258" class="t-muted">${…} interpolation</text>
+        <path d="M606 44 H584" class="line dash"/><path d="M606 94 H584" class="line dash"/><path d="M606 144 H584" class="line dash"/><path d="M606 194 H584" class="line dash"/><path d="M606 244 H584" class="line dash"/>
+      </svg>
+      <figcaption>Address of this resource: <code>kubernetes_config_map_v1.app</code> (TYPE.NAME). The address — not the Kubernetes name — is how Terraform tracks it in state.</figcaption>
+    </figure>
+    <h3>The top-level block types you will meet</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Block</th><th>Purpose</th><th>Address / reference</th></tr>
+      <tr><td><code>terraform { }</code></td><td>settings: <code>required_version</code>, <code>required_providers</code>, <code>backend</code></td><td>—</td></tr>
+      <tr><td><code>provider "x" { }</code></td><td>configure a provider (endpoint, credentials, project)</td><td>—</td></tr>
+      <tr><td><code>resource "T" "n" { }</code></td><td>an object Terraform creates/manages</td><td><code>T.n</code></td></tr>
+      <tr><td><code>data "T" "n" { }</code></td><td>read an existing object (no management)</td><td><code>data.T.n</code></td></tr>
+      <tr><td><code>variable "n" { }</code></td><td>input parameter</td><td><code>var.n</code></td></tr>
+      <tr><td><code>output "n" { }</code></td><td>exported value</td><td><code>module.m.n</code> from a parent</td></tr>
+      <tr><td><code>locals { }</code></td><td>named intermediate values</td><td><code>local.n</code></td></tr>
+      <tr><td><code>module "n" { }</code></td><td>call a child module</td><td><code>module.n</code></td></tr>
+      <tr><td><code>moved</code>, <code>import</code></td><td>refactor addresses / adopt existing objects</td><td>—</td></tr>
+    </table></div>
+    <p>All <code>.tf</code> files in a directory form <em>one module</em>; file names are only for humans. Convention: <code>versions.tf</code>, <code>providers.tf</code>, <code>variables.tf</code>, <code>main.tf</code>, <code>outputs.tf</code>.</p>
+<pre data-title="Expression toolbox"><code>locals {
+  envs        = ["dev", "staging"]
+  ns_names    = [for e in local.envs : "reliability-${e}"]           <span class="c"># list comprehension</span>
+  ns_by_env   = { for e in local.envs : e =&gt; "reliability-${e}" }    <span class="c"># map comprehension</span>
+  replicas    = var.environment == "prod" ? 3 : 2                     <span class="c"># conditional</span>
+  all_labels  = merge(local.common_labels, { tier = "api" })          <span class="c"># function call</span>
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>Providers, version constraints and the lock file</h2>
+    <p><strong>Definition.</strong> A <em>provider</em> is a plugin that teaches Terraform one API: <code>hashicorp/kubernetes</code> talks to a Kubernetes API server, <code>hashicorp/google</code> to Google Cloud, <code>hashicorp/random</code> generates values locally. Terraform core knows nothing about ConfigMaps or buckets; it builds graphs, diffs and state, and delegates every CRUD call to providers.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 270" role="img" aria-label="Terraform core talks to provider plugins which call remote APIs">
+        <defs><marker id="t3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="20" y="70" width="210" height="120" rx="10" class="box2"/><text x="125" y="98" text-anchor="middle" class="t-bold">Terraform core</text><text x="125" y="122" text-anchor="middle" class="t-muted">parse HCL, graph,</text><text x="125" y="140" text-anchor="middle" class="t-muted">plan/diff, state,</text><text x="125" y="158" text-anchor="middle" class="t-muted">locking</text>
+        <rect x="320" y="20" width="220" height="60" rx="8" class="box3"/><text x="430" y="46" text-anchor="middle" class="t-bold">hashicorp/kubernetes</text><text x="430" y="66" text-anchor="middle" class="t-muted">plugin process</text>
+        <rect x="320" y="104" width="220" height="60" rx="8" class="box3"/><text x="430" y="130" text-anchor="middle" class="t-bold">hashicorp/google</text><text x="430" y="150" text-anchor="middle" class="t-muted">plugin process</text>
+        <rect x="320" y="188" width="220" height="60" rx="8" class="box3"/><text x="430" y="214" text-anchor="middle" class="t-bold">hashicorp/random</text><text x="430" y="234" text-anchor="middle" class="t-muted">no remote API</text>
+        <rect x="630" y="20" width="210" height="60" rx="8" class="box4"/><text x="735" y="46" text-anchor="middle" class="t-bold">kind API server</text><text x="735" y="66" text-anchor="middle" class="t-mono">kind-reliability-lab</text>
+        <rect x="630" y="104" width="210" height="60" rx="8" class="box4"/><text x="735" y="130" text-anchor="middle" class="t-bold">Google Cloud APIs</text><text x="735" y="150" text-anchor="middle" class="t-muted">storage, container…</text>
+        <path d="M230 110 C270 100 280 50 316 50" class="line" marker-end="url(#t3)"/>
+        <path d="M230 130 H316" class="line" marker-end="url(#t3)"/>
+        <path d="M230 150 C270 160 280 218 316 218" class="line" marker-end="url(#t3)"/>
+        <path d="M540 50 H626" class="line accent" marker-end="url(#t3)"/>
+        <path d="M540 134 H626" class="line accent" marker-end="url(#t3)"/>
+        <text x="273" y="262" text-anchor="middle" class="t-muted">gRPC plugin protocol</text><text x="583" y="98" text-anchor="middle" class="t-muted">HTTPS</text>
+      </svg>
+      <figcaption>Providers are separate executables downloaded by <code>terraform init</code> from a registry (default <code>registry.terraform.io</code>).</figcaption>
+    </figure>
+<pre data-title="versions.tf — pin what you depend on"><code>terraform {
+  required_version = "&gt;= 1.7, &lt; 2.0"          <span class="c"># Terraform CLI itself (latest release at writing: v1.17.1)</span>
+
+  required_providers {
+    kubernetes = {
+      source  = "hashicorp/kubernetes"          <span class="c"># = registry.terraform.io/hashicorp/kubernetes</span>
+      version = "~&gt; 3.4"                        <span class="c"># &gt;= 3.4, &lt; 4.0</span>
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~&gt; 3.9"
+    }
+  }
+}</code></pre>
+    <ul>
+      <li><strong>Source address</strong> = <code>[HOSTNAME/]NAMESPACE/TYPE</code>; hostname defaults to <code>registry.terraform.io</code>.</li>
+      <li><strong>Constraint operators:</strong> <code>=</code>, <code>!=</code>, <code>&gt;</code>, <code>&gt;=</code>, <code>&lt;</code>, <code>&lt;=</code>, and <code>~&gt;</code> ("pessimistic": allow only the rightmost component to increase — <code>~&gt; 3.4</code> allows 3.5, 3.99 but not 4.0; <code>~&gt; 3.4.0</code> allows only 3.4.x).</li>
+      <li><strong>Guidance:</strong> root modules (where you run apply) set both lower and upper bounds to avoid accidental major upgrades; reusable child modules set only minimums (<code>&gt;=</code>) so they don't block their callers.</li>
+      <li>Latest registry versions when this was written: kubernetes 3.4.0, google 8.9.0, random 3.9.1. Check the registry when you start.</li>
+    </ul>
+    <h3>The dependency lock file <code>.terraform.lock.hcl</code></h3>
+    <p><code>init</code> records the exact provider versions it selected plus checksums (<code>h1:</code> and <code>zh:</code> hashes). Later inits reuse those exact versions even if newer ones match the constraint — like <code>package-lock.json</code> or a pip lock. <strong>Commit it.</strong> Upgrading is explicit: <code>terraform init -upgrade</code>, review the lock-file diff in a PR. It tracks providers only — <em>not</em> modules (remote modules are re-selected as the newest matching version, so pin module versions exactly). If teammates or CI use another OS/CPU, pre-populate hashes: <code>terraform providers lock -platform=linux_amd64 -platform=darwin_arm64</code>.</p>
+    <h3>Provider configuration for kind</h3>
+<pre data-title="providers.tf"><code>provider "kubernetes" {
+  config_path    = "~/.kube/config"
+  config_context = "kind-reliability-lab"     <span class="c"># kind names contexts kind-&lt;cluster&gt;</span>
+}</code></pre>
+    <div class="callout warn"><span class="label">Gotchas from the provider docs</span>
+      <ul>
+        <li>The Kubernetes provider does <strong>not</strong> read the <code>KUBECONFIG</code> environment variable by default; set <code>config_path</code> (or <code>KUBE_CONFIG_PATH</code>). Always pin <code>config_context</code> so a plan can never run against the wrong cluster because your current kubectl context changed.</li>
+        <li>Don't create a cluster and use the Kubernetes provider against it in the same configuration/apply — the provider docs warn this causes intermittent, hard-to-debug errors. Create the cluster in one root module (Module 11), configure in-cluster resources in a separate apply.</li>
+      </ul></div>
+
+    <!-- ============================================================ -->
+    <h2>Resources, data sources and the dependency graph</h2>
+    <p>A <strong>resource</strong> block declares an object Terraform owns: it creates it, updates it, and destroys it when the block is removed. A <strong>data source</strong> (<code>data</code> block) only <em>reads</em> an object that something else owns — for example the <code>reliability-api</code> Service that your Helm release (Module 06) created. Data sources let Terraform consume facts without taking ownership.</p>
+    <h3>Resource behaviour on apply</h3>
+    <ul>
+      <li>In config, not in state → <strong>create</strong>.</li>
+      <li>In state, not in config → <strong>destroy</strong>.</li>
+      <li>Argument changed that the API can update → <strong>update in place</strong>.</li>
+      <li>Argument changed that the API can't update (e.g. a ConfigMap's <code>metadata.name</code>, "Cannot be updated") → <strong>destroy and re-create</strong> (replace).</li>
+    </ul>
+    <h3>Dependencies: implicit vs explicit</h3>
+    <p>When one block references another (<code>namespace = kubernetes_namespace_v1.lab.metadata[0].name</code>), Terraform adds a graph edge: the namespace is created first and destroyed last. That is an <em>implicit</em> dependency and covers almost everything. <code>depends_on = [ … ]</code> adds an <em>explicit</em> edge for hidden dependencies that no attribute expresses; HashiCorp calls it a last resort, because it makes plans more conservative (more values become "known after apply").</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Dependency graph of the local Terraform example">
+        <defs><marker id="t4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="20" y="30" width="230" height="56" rx="8" class="box"/><text x="135" y="54" text-anchor="middle" class="t-bold">provider kubernetes</text><text x="135" y="72" text-anchor="middle" class="t-muted">context kind-reliability-lab</text>
+        <rect x="20" y="200" width="230" height="56" rx="8" class="box"/><text x="135" y="224" text-anchor="middle" class="t-bold">provider random</text><text x="135" y="242" text-anchor="middle" class="t-muted">local only</text>
+        <rect x="320" y="20" width="250" height="56" rx="8" class="box2"/><text x="445" y="44" text-anchor="middle" class="t-mono">kubernetes_namespace_v1.lab</text><text x="445" y="64" text-anchor="middle" class="t-muted">resource</text>
+        <rect x="320" y="200" width="250" height="56" rx="8" class="box2"/><text x="445" y="224" text-anchor="middle" class="t-mono">random_pet.lab</text><text x="445" y="244" text-anchor="middle" class="t-muted">resource</text>
+        <rect x="320" y="110" width="250" height="56" rx="8" class="box3"/><text x="445" y="134" text-anchor="middle" class="t-mono">data.kubernetes_service_v1.api</text><text x="445" y="154" text-anchor="middle" class="t-muted">read-only (Helm owns it)</text>
+        <rect x="630" y="110" width="220" height="56" rx="8" class="box4"/><text x="740" y="134" text-anchor="middle" class="t-mono">kubernetes_config_map_v1</text><text x="740" y="154" text-anchor="middle" class="t-mono">.app</text>
+        <path d="M250 58 H316" class="line" marker-end="url(#t4)"/>
+        <path d="M250 70 C290 80 290 130 316 136" class="line" marker-end="url(#t4)"/>
+        <path d="M250 228 H316" class="line" marker-end="url(#t4)"/>
+        <path d="M570 48 C610 48 610 120 626 126" class="line accent" marker-end="url(#t4)"/><text x="640" y="62" class="t-muted">namespace = …metadata[0].name</text>
+        <path d="M570 228 C610 228 610 160 626 152" class="line accent" marker-end="url(#t4)"/><text x="640" y="214" class="t-muted">LAB_ID = random_pet.lab.id</text>
+        <path d="M570 138 H626" class="line accent dash" marker-end="url(#t4)"/>
+        <text x="20" y="290" class="t-muted">Arrows = "must exist first". Independent nodes (namespace, random_pet, data read) run in parallel; the ConfigMap waits for all three.</text>
+      </svg>
+      <figcaption>The dashed arrow is <code>API_CLUSTER_IP</code> flowing from the data source. The graph is built from references. Destroy walks it in reverse: ConfigMap first, then namespace. Inspect yours with <code>terraform graph</code> (DOT format).</figcaption>
+    </figure>
+    <h3>Failure cases</h3>
+    <ul>
+      <li><strong>Missing edge:</strong> you hard-code <code>namespace = "reliability-tf"</code> instead of referencing the resource. On the first apply, Terraform may create the ConfigMap in parallel with the namespace → "namespaces "reliability-tf" not found". Fix: reference, don't repeat.</li>
+      <li><strong>Data source target missing:</strong> <code>data.kubernetes_service_v1.api</code> fails the plan if the Helm release isn't installed. That's a feature: the dependency on "something outside Terraform" is explicit.</li>
+      <li><strong>Cycles:</strong> A references B and B references A → "Cycle:" error. Break it with a local value or by splitting a resource.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>Variables, outputs and locals</h2>
+    <h3>Input variables</h3>
+<pre data-title="variables.tf"><code>variable "namespace" {
+  description = "Namespace Terraform creates and owns for this lab"
+  type        = string
+  default     = "reliability-tf"
+}
+
+variable "log_level" {
+  description = "LOG_LEVEL for reliability-api"
+  type        = string
+  default     = "info"
+  validation {
+    condition     = contains(["debug", "info", "warning", "error"], var.log_level)
+    error_message = "log_level must be one of debug, info, warning, error."
+  }
+}
+
+variable "ready_delay_seconds" {
+  type    = number
+  default = 5
+  validation {
+    condition     = var.ready_delay_seconds &gt;= 0 &amp;&amp; var.ready_delay_seconds &lt;= 120
+    error_message = "ready_delay_seconds must be between 0 and 120."
+  }
+}
+
+variable "environments" {
+  description = "Extra per-environment namespaces (for_each demo)"
+  type        = set(string)
+  default     = []
+}
+
+variable "api_token" {
+  description = "Example secret input — never give it a default"
+  type        = string
+  sensitive   = true
+  default     = null
+  nullable    = true
+}</code></pre>
+    <ul>
+      <li><strong>Types:</strong> <code>string</code>, <code>number</code>, <code>bool</code>, <code>list(T)</code>, <code>set(T)</code>, <code>map(T)</code>, <code>object({…})</code>, <code>tuple([…])</code>, <code>any</code>. Types convert and validate input early.</li>
+      <li><strong>Validation</strong> blocks reject bad input at plan time with your message — far better than a cryptic API error halfway through apply.</li>
+      <li><strong><code>sensitive = true</code></strong> redacts the value in CLI output, but <strong>Terraform still stores it in state</strong>. <code>ephemeral = true</code> keeps a variable out of state and plan files (with restrictions on where it can be used).</li>
+    </ul>
+    <h3>Where variable values come from (precedence)</h3>
+    <p>Later sources override earlier ones (lowest → highest): variable <code>default</code> → environment variables <code>TF_VAR_name</code> → <code>terraform.tfvars</code> → <code>terraform.tfvars.json</code> → <code>*.auto.tfvars</code> / <code>*.auto.tfvars.json</code> (lexical order) → <code>-var</code> and <code>-var-file</code> on the command line (in the order given).</p>
+    <div class="widget" id="vprec">
+      <div class="w-title">Variable precedence resolver — which value of <code>log_level</code> wins?</div>
+      <div class="w-sub">Tick the sources that set a value. The highest-precedence source wins.</div>
+      <div class="cf-grid" id="vp-list"></div>
+      <div class="out" id="vp-out"></div>
+    </div>
+    <h3>Outputs</h3>
+<pre data-title="outputs.tf"><code>output "namespace" {
+  description = "Namespace managed by Terraform"
+  value       = kubernetes_namespace_v1.lab.metadata[0].name
+}
+
+output "lab_id" {
+  value = random_pet.lab.id
+}
+
+output "api_cluster_ip" {
+  description = "ClusterIP of the Helm-managed Service (read via data source)"
+  value       = data.kubernetes_service_v1.api.spec[0].cluster_ip
+}</code></pre>
+    <p>Outputs print after apply, can be read with <code>terraform output</code> (<code>-raw</code> for scripts, <code>-json</code> for tools), expose values from child modules to parents (<code>module.NAME.OUTPUT</code>), and can be read from another configuration's state. <code>sensitive = true</code> on an output shows <code>&lt;sensitive&gt;</code> in the CLI, but the value is in state and <code>-raw</code>/<code>-json</code> print it.</p>
+    <h3>Locals</h3>
+<pre data-title="main.tf (top)"><code>locals {
+  common_labels = {
+    "app.kubernetes.io/name"       = "reliability-api"
+    "app.kubernetes.io/managed-by" = "terraform"
+  }
+}</code></pre>
+    <p>Locals are named expressions inside a module — use them to avoid repetition (labels, name prefixes). Unlike variables, callers can't override them. Don't over-abstract: a local used once is noise.</p>
+
+    <!-- ============================================================ -->
+    <h2>State</h2>
+    <p><strong>What it is.</strong> State (<code>terraform.tfstate</code>, JSON) stores the binding between each resource address in your configuration and the real object it manages (<code>kubernetes_config_map_v1.app</code> ↔ ConfigMap <code>reliability-tf/reliability-api-config</code>), plus the last-known attributes and dependency metadata. <strong>Why it exists:</strong> many APIs can't answer "which of these objects did Terraform create for which block?"; state remembers, enables diffs, records deletion order even after a block is removed, and avoids scanning everything on each run.</p>
+    <p><strong>Why it's sensitive.</strong> State contains every attribute the provider returns — including secrets: database passwords, private keys, <code>sensitive</code> variables, kubeconfig credentials if you model them. Anyone who can read state can read those. HashiCorp warns against storing state in version control or any storage without locking and access control.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 320" role="img" aria-label="Local state file versus remote GCS backend with locking and versioning">
+        <defs><marker id="t5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="10" y="20" width="380" height="280" rx="12" class="zone"/>
+        <text x="24" y="44" class="t-bold">Local backend (default)</text>
+        <rect x="30" y="60" width="160" height="56" rx="8" class="box2"/><text x="110" y="84" text-anchor="middle" class="t-bold">your laptop</text><text x="110" y="102" text-anchor="middle" class="t-mono">terraform.tfstate</text>
+        <rect x="210" y="60" width="160" height="56" rx="8" class="box2"/><text x="290" y="84" text-anchor="middle" class="t-bold">teammate</text><text x="290" y="102" text-anchor="middle" class="t-mono">own tfstate copy</text>
+        <circle cx="200" cy="150" r="10" class="dot-bad"/>
+        <text x="30" y="186" class="t-muted">✗ two truths → duplicate/destroyed resources</text>
+        <text x="30" y="206" class="t-muted">✗ no locking between people</text>
+        <text x="30" y="226" class="t-muted">✗ lost laptop = lost state</text>
+        <text x="30" y="246" class="t-muted">✗ secrets on disk, maybe committed by accident</text>
+        <text x="30" y="276" class="t-muted">Fine for a solo kind lab (this module's Lab 1).</text>
+        <rect x="420" y="20" width="430" height="280" rx="12" class="zone"/>
+        <text x="434" y="44" class="t-bold">Remote backend: gcs</text>
+        <rect x="440" y="60" width="120" height="50" rx="8" class="box2"/><text x="500" y="90" text-anchor="middle">you</text>
+        <rect x="580" y="60" width="120" height="50" rx="8" class="box2"/><text x="640" y="90" text-anchor="middle">teammate</text>
+        <rect x="720" y="60" width="116" height="50" rx="8" class="box2"/><text x="778" y="84" text-anchor="middle">CI job</text><text x="778" y="100" text-anchor="middle" class="t-muted">(OIDC)</text>
+        <rect x="480" y="160" width="320" height="76" rx="10" class="box4"/><text x="640" y="184" text-anchor="middle" class="t-bold">GCS bucket (versioning ON)</text><text x="640" y="204" text-anchor="middle" class="t-mono">reliability-lab/gke/default.tfstate</text><text x="640" y="224" text-anchor="middle" class="t-mono">+ lock while a write runs</text>
+        <path d="M500 110 C500 140 560 150 590 158" class="line" marker-end="url(#t5)"/>
+        <path d="M640 110 V156" class="line" marker-end="url(#t5)"/>
+        <path d="M778 110 C778 140 720 150 690 158" class="line dash" marker-end="url(#t5)"/>
+        <text x="440" y="262" class="t-muted">✓ one source of truth   ✓ locking   ✓ IAM-controlled access</text>
+        <text x="440" y="282" class="t-muted">✓ object versions allow recovery from mistakes</text>
+        <circle cx="830" cy="36" r="8" class="dot-ok"/>
+      </svg>
+      <figcaption>Workspace states in the GCS backend are stored as <code>&lt;prefix&gt;/&lt;workspace&gt;.tfstate</code>. Second writer while locked: "Error acquiring the state lock".</figcaption>
+    </figure>
+    <h3>The GCS backend</h3>
+<pre data-title="backend.tf (in the cloud configuration, Module 11)"><code>terraform {
+  backend "gcs" {
+    bucket = "&lt;your-project-id&gt;-tfstate-&lt;suffix&gt;"   <span class="c"># created by the bootstrap config below</span>
+    prefix = "reliability-lab/gke"
+  }
+}</code></pre>
+    <ul>
+      <li><strong>Locking:</strong> the GCS backend supports state locking. Locking happens automatically on all operations that could write state. <code>-lock=false</code> exists but HashiCorp doesn't recommend it; <code>-lock-timeout=60s</code> waits for a lock instead of failing immediately.</li>
+      <li><strong>Versioning:</strong> HashiCorp "highly recommends" enabling Object Versioning on the bucket so state can be recovered after accidental deletion or human error.</li>
+      <li><strong>Auth:</strong> Application Default Credentials (<code>gcloud auth application-default login</code>), <code>GOOGLE_APPLICATION_CREDENTIALS</code>, or <code>impersonate_service_account</code>. Supply credentials via environment, not <code>-backend-config</code> or hard-coding — those values end up in <code>.terraform/</code> and plan files.</li>
+      <li><strong>Encryption:</strong> Google encrypts at rest by default; the backend also supports customer-supplied (<code>encryption_key</code>) or Cloud KMS (<code>kms_encryption_key</code>) keys.</li>
+      <li><strong>Backend blocks can't use variables, locals or data sources.</strong> Use partial configuration (<code>terraform init -backend-config="bucket=…"</code> or a <code>-backend-config=gcs.hcl</code> file) to keep environment-specific values out of the code.</li>
+      <li><strong>Changing backends</strong> = re-run <code>terraform init</code>; Terraform offers to migrate existing state. Back up <code>terraform.tfstate</code> first.</li>
+    </ul>
+    <div class="callout danger"><span class="label">Stale lock</span>If a run is killed (laptop sleeps, CI cancelled) the lock can stay. <code>terraform force-unlock LOCK_ID</code> removes it — the lock ID acts as a nonce so you unlock the right lock. "Be very careful with this command": unlocking while someone else is actually applying lets two writers corrupt state. Confirm nobody is running first.</div>
+
+    <h3>State commands</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Command</th><th>Use</th></tr>
+      <tr><td><code>terraform state list [addr…]</code></td><td>List managed addresses; filter by address or module; <code>-id=…</code> finds which address manages a given real ID.</td></tr>
+      <tr><td><code>terraform state show ADDR</code></td><td>Show all recorded attributes of one instance.</td></tr>
+      <tr><td><code>terraform state mv SRC DST</code></td><td>Re-bind an existing object to a new address (rename/move into module) without re-creating it; <code>-dry-run</code> first. Prefer <code>moved</code> blocks — declarative, reviewable, applies for everyone.</td></tr>
+      <tr><td><code>terraform plan -refresh-only</code> / <code>apply -refresh-only</code></td><td>Show/accept drift into state without changing infrastructure.</td></tr>
+    </table></div>
+    <p>Never edit the state JSON by hand; the <code>terraform state</code> commands insulate you from format changes.</p>
+    <h3>Refactoring with <code>moved</code></h3>
+<pre data-title="Rename kubernetes_config_map_v1.app → .api_config without re-creating it"><code>resource "kubernetes_config_map_v1" "api_config" {   <span class="c"># was "app"</span>
+  <span class="c"># … unchanged …</span>
+}
+
+moved {
+  from = kubernetes_config_map_v1.app
+  to   = kubernetes_config_map_v1.api_config
+}</code></pre>
+<pre class="o" data-title="Example plan output (yours will differ)"><code>  # kubernetes_config_map_v1.app has moved to kubernetes_config_map_v1.api_config
+    resource "kubernetes_config_map_v1" "api_config" {
+        id   = "reliability-tf/reliability-api-config"
+        # (2 unchanged attributes hidden)
+        # (1 unchanged block hidden)
+    }
+
+Plan: 0 to add, 0 to change, 0 to destroy.</code></pre>
+    <p>Without the <code>moved</code> block the plan would be "1 to add, 1 to destroy" — Terraform sees an unknown new address and an orphaned old one. In shared modules, keep historical <code>moved</code> blocks: removing them is a breaking change for callers still on old versions.</p>
+    <h3>Adopting existing objects with <code>import</code> blocks</h3>
+<pre data-title="import.tf"><code>import {
+  to = kubernetes_namespace_v1.legacy
+  id = "legacy-tools"                <span class="c"># namespaces import by name (provider docs)</span>
+}
+
+resource "kubernetes_namespace_v1" "legacy" {
+  metadata { name = "legacy-tools" }
+}</code></pre>
+    <p>Plan shows <code># kubernetes_namespace_v1.legacy will be imported</code>; apply records it in state; afterwards you may delete the <code>import</code> block. Don't want to write the resource body yourself? Write only the import block and run <code>terraform plan -generate-config-out=generated.tf</code>, then review and clean the generated code. The ID format differs per resource type (a ConfigMap imports as <code>namespace/name</code>) — always check the provider docs.</p>
+
+    <!-- ============================================================ -->
+    <h2>Reading plans: symbols and danger signs</h2>
+    <p>"Terraform used the selected providers to generate the following execution plan. Resource actions are indicated with the following symbols:" — then a legend containing only the symbols that occur in this plan, the per-resource diff, and a summary <code>Plan: X to add, Y to change, Z to destroy.</code></p>
+    <div class="table-wrap"><table>
+      <tr><th>Symbol</th><th>Legend text</th><th>Header line</th><th>Risk</th></tr>
+      <tr><td><code class="act-c">+</code></td><td>create</td><td><code># ADDR will be created</code></td><td>low (cost?)</td></tr>
+      <tr><td><code class="act-d">-</code></td><td>destroy</td><td><code># ADDR will be destroyed</code> (+ reason, e.g. "because … is not in configuration", "because key ["dev"] is not in for_each map")</td><td><strong>high</strong> — data loss</td></tr>
+      <tr><td><code class="act-r">~</code></td><td>update in-place</td><td><code># ADDR will be updated in-place</code></td><td>usually low; read which fields</td></tr>
+      <tr><td><code class="act-d">-/+</code></td><td>destroy and then create replacement</td><td><code># ADDR must be replaced</code>; offending field marked <code># forces replacement</code></td><td><strong>high</strong> — downtime, new IDs, data loss</td></tr>
+      <tr><td><code class="act-r">+/-</code></td><td>create replacement and then destroy</td><td>same, with <code>create_before_destroy</code></td><td>medium — brief overlap; name conflicts</td></tr>
+      <tr><td><code class="act-n">&lt;=</code></td><td>read (data resources)</td><td><code># data.ADDR will be read during apply</code> (+ why: config refers to values not yet known, or depends on pending changes)</td><td>low</td></tr>
+    </table></div>
+    <p>Other lines you'll see: <code>(known after apply)</code> — the value is computed by the API; <code># (3 unchanged attributes hidden)</code>; <code>Note: Objects have changed outside of Terraform</code> — drift detected during refresh, shown before the proposed changes.</p>
+    <div class="callout warn"><span class="label">Plan-review checklist</span>
+      <ol>
+        <li>Read the summary line first. Any <em>destroy</em> count you didn't expect → stop.</li>
+        <li>Search the plan for <code>must be replaced</code> and <code># forces replacement</code>. Is a stateful object (bucket, database, cluster, PVC) being replaced?</li>
+        <li>Check drift notes: is your apply about to revert someone's emergency fix?</li>
+        <li>Check the context/project: is this plan against <code>kind-reliability-lab</code> / the intended GCP project?</li>
+        <li>For important changes save the plan: <code>terraform plan -out=tfplan</code>, review, then <code>terraform apply tfplan</code> — what you approved is exactly what runs.</li>
+      </ol></div>
+
+    <div class="widget" id="planread">
+      <div class="w-title">Plan-reading drill</div>
+      <div class="w-sub">Read the (example) plan excerpt and pick the action symbol Terraform would show. All excerpts use the reliability-api lab resources.</div>
+      <div class="row"><button class="btn" id="pr-prev">◀</button><span id="pr-count" class="pill"></span><button class="btn" id="pr-next">▶</button></div>
+      <div class="out" id="pr-plan"></div>
+      <div class="pr-btns" id="pr-btns"></div>
+      <div id="pr-fb" style="margin-top:10px"></div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Lifecycle meta-arguments</h2>
+    <p><code>lifecycle { }</code> inside any resource changes how Terraform treats changes to it.</p>
+    <div class="table-wrap"><table>
+      <tr><th>Argument</th><th>Effect</th><th>Use for</th><th>Caveat</th></tr>
+      <tr><td><code>create_before_destroy = true</code></td><td>Replacement order becomes create-new → destroy-old (<code>+/-</code>)</td><td>avoid gaps when replacing something serving traffic</td><td>new and old exist at once: unique names collide (pair with <code>random_pet</code>/name suffixes)</td></tr>
+      <tr><td><code>prevent_destroy = true</code></td><td>Any plan that would destroy this object errors out</td><td>state bucket, production data stores</td><td>doesn't help if you delete the whole resource block (the guard goes with it)</td></tr>
+      <tr><td><code>ignore_changes = [attr, …]</code> or <code>all</code></td><td>Don't plan updates for those attributes after creation</td><td>fields owned by another system (e.g. an annotation a controller writes; HPA-managed replicas)</td><td>hides real drift for those fields — keep the list minimal</td></tr>
+      <tr><td><code>replace_triggered_by = [ref]</code></td><td>Replace this when the referenced resource/attribute changes</td><td>force a re-create when a dependency is replaced</td><td>—</td></tr>
+      <tr><td><code>precondition</code> / <code>postcondition</code></td><td>Assertions with <code>condition</code> + <code>error_message</code></td><td>guard assumptions (e.g. data source found the right Service type)</td><td>—</td></tr>
+    </table></div>
+<pre data-title="Applied to reliability-api"><code>resource "kubernetes_config_map_v1" "app" {
+  <span class="c"># …</span>
+  lifecycle {
+    create_before_destroy = false                         <span class="c"># default</span>
+    ignore_changes        = [metadata[0].annotations]     <span class="c"># tools may annotate it; not our concern</span>
+  }
+}
+
+resource "google_storage_bucket" "tf_state" {
+  <span class="c"># …</span>
+  lifecycle {
+    prevent_destroy = true                                <span class="c"># losing state = losing track of everything</span>
+  }
+}</code></pre>
+
+    <!-- ============================================================ -->
+    <h2><code>count</code> vs <code>for_each</code></h2>
+    <p>Both create several instances from one block. <code>count = N</code> gives instances addressed by <strong>integer index</strong> (<code>x[0]</code>, <code>x[1]</code>, <code>count.index</code>). <code>for_each</code> takes a <strong>map or set of strings</strong> and addresses instances by <strong>key</strong> (<code>x["dev"]</code>, <code>each.key</code>, <code>each.value</code>). HashiCorp's guidance: use <code>count</code> for nearly identical instances; use <code>for_each</code> when instances need distinct values that can't be derived from an integer. The keys must be known at plan time and can't be sensitive values. A block can't have both.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 300" role="img" aria-label="Removing the first element shifts count indexes but not for_each keys">
+        <text x="20" y="28" class="t-bold">Remove "dev" from ["dev", "staging", "prod"]</text>
+        <text x="20" y="62" class="t-bold">count</text>
+        <rect x="100" y="44" width="180" height="34" rx="6" class="box2"/><text x="112" y="66" class="t-mono">ns[0] = …-dev</text>
+        <rect x="100" y="86" width="180" height="34" rx="6" class="box2"/><text x="112" y="108" class="t-mono">ns[1] = …-staging</text>
+        <rect x="100" y="128" width="180" height="34" rx="6" class="box2"/><text x="112" y="150" class="t-mono">ns[2] = …-prod</text>
+        <rect x="330" y="44" width="180" height="34" rx="6" class="box3"/><text x="342" y="66" class="t-mono">ns[0] = …-staging</text>
+        <rect x="330" y="86" width="180" height="34" rx="6" class="box3"/><text x="342" y="108" class="t-mono">ns[1] = …-prod</text>
+        <rect x="330" y="128" width="180" height="34" rx="6" class="box" stroke-dasharray="5 4"/><text x="342" y="150" class="t-mono t-muted">ns[2] (gone)</text>
+        <text x="530" y="66" class="t-mono">-/+ ns[0]  name changes</text><text x="530" y="108" class="t-mono">-/+ ns[1]  name changes</text><text x="530" y="150" class="t-mono">-   ns[2]  out of range</text>
+        <circle cx="830" cy="100" r="9" class="dot-bad"/><text x="530" y="180" class="t-muted">→ staging + prod namespaces re-created:</text><text x="530" y="196" class="t-muted">every Pod inside them is deleted!</text>
+        <text x="20" y="226" class="t-bold">for_each</text>
+        <rect x="100" y="208" width="180" height="34" rx="6" class="box2"/><text x="112" y="230" class="t-mono">ns["dev"]</text>
+        <rect x="100" y="250" width="210" height="34" rx="6" class="box2"/><text x="112" y="272" class="t-mono">ns["staging"], ns["prod"]</text>
+        <rect x="330" y="208" width="180" height="34" rx="6" class="box" stroke-dasharray="5 4"/><text x="342" y="230" class="t-mono t-muted">(removed)</text>
+        <rect x="330" y="250" width="180" height="34" rx="6" class="box4"/><text x="342" y="272" class="t-mono">unchanged keys</text>
+        <text x="530" y="230" class="t-mono">-   ns["dev"]  not in for_each map</text><text x="530" y="272" class="t-mono">    others: no change</text>
+        <circle cx="830" cy="250" r="9" class="dot-ok"/>
+      </svg>
+      <figcaption>With <code>count</code>, identity = position, so deleting from the middle of a list shifts every later element. With <code>for_each</code>, identity = key.</figcaption>
+    </figure>
+<pre data-title="for_each over environments (main.tf)"><code>resource "kubernetes_namespace_v1" "env" {
+  for_each = var.environments                       <span class="c"># set(string), e.g. ["dev", "staging"]</span>
+  metadata {
+    name   = "reliability-${each.key}"
+    labels = merge(local.common_labels, { environment = each.key })
+  }
+}
+
+<span class="c"># count is right for "0 or 1" toggles:</span>
+resource "kubernetes_config_map_v1" "debug" {
+  count = var.log_level == "debug" ? 1 : 0
+  metadata {
+    name      = "reliability-api-debug"
+    namespace = kubernetes_namespace_v1.lab.metadata[0].name
+  }
+  data = { NOTE = "debug mode enabled by terraform" }
+}</code></pre>
+    <div class="widget" id="cfsim">
+      <div class="w-title">count vs for_each simulator</div>
+      <div class="w-sub">Currently applied: <code>["dev", "staging", "prod"]</code>. Change the desired list and compare the plans.</div>
+      <div class="row" id="cf-boxes"></div>
+      <div class="cf-grid">
+        <div><strong>count = length(var.envs)</strong><div class="out" id="cf-count"></div></div>
+        <div><strong>for_each = toset(var.envs)</strong><div class="out" id="cf-each"></div></div>
+      </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>Modules</h2>
+    <p><strong>Definition.</strong> A module is a set of <code>.tf</code> files in one directory managed as a unit. The directory where you run <code>terraform</code> is the <strong>root module</strong>; it can call <strong>child modules</strong> with <code>module</code> blocks. <strong>Published modules</strong> come from the public Terraform Registry, a private registry, Git, or buckets. <code>terraform init</code> downloads them into <code>.terraform/modules</code>.</p>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 280" role="img" aria-label="Root module calling local and registry child modules">
+        <defs><marker id="t7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor" style="color:var(--d-stroke)"/></marker></defs>
+        <rect x="300" y="16" width="260" height="70" rx="10" class="box2"/><text x="430" y="42" text-anchor="middle" class="t-bold">root module</text><text x="430" y="62" text-anchor="middle" class="t-mono">infra/terraform/envs/dev</text><text x="430" y="78" text-anchor="middle" class="t-muted">backend, providers, variables</text>
+        <rect x="40" y="150" width="300" height="90" rx="10" class="box3"/><text x="190" y="176" text-anchor="middle" class="t-bold">module "app_namespace"</text><text x="190" y="196" text-anchor="middle" class="t-mono">source = "../../modules/app-ns"</text><text x="190" y="216" text-anchor="middle" class="t-muted">local path: no version argument</text><text x="190" y="232" text-anchor="middle" class="t-muted">namespace + ConfigMap + labels</text>
+        <rect x="520" y="150" width="300" height="90" rx="10" class="box3"/><text x="670" y="176" text-anchor="middle" class="t-bold">module "network" (registry)</text><text x="670" y="196" text-anchor="middle" class="t-mono">source  = "ns/name/google"</text><text x="670" y="214" text-anchor="middle" class="t-mono">version = "= X.Y.Z"</text><text x="670" y="232" text-anchor="middle" class="t-muted">pin exactly: not in lock file</text>
+        <path d="M380 86 C380 120 200 120 196 146" class="line" marker-end="url(#t7)"/>
+        <path d="M480 86 C480 120 660 120 664 146" class="line" marker-end="url(#t7)"/>
+        <text x="190" y="266" text-anchor="middle" class="t-muted">inputs: variables · outputs: module.app_namespace.name</text>
+        <text x="670" y="266" text-anchor="middle" class="t-muted">read its README, inputs, outputs, provider reqs</text>
+      </svg>
+      <figcaption>The <code>version</code> argument is only for registry sources. For Git sources pin a tag/commit in the URL (<code>?ref=</code>).</figcaption>
+    </figure>
+<pre data-title="modules/app-ns/main.tf — a small child module"><code>variable "name"      { type = string }
+variable "log_level" { type = string }
+variable "labels" {
+  type    = map(string)
+  default = {}
+}
+
+resource "kubernetes_namespace_v1" "this" {
+  metadata {
+    name   = var.name
+    labels = var.labels
+  }
+}
+
+resource "kubernetes_config_map_v1" "app" {
+  metadata {
+    name      = "reliability-api-config"
+    namespace = kubernetes_namespace_v1.this.metadata[0].name
+  }
+  data = { LOG_LEVEL = var.log_level, APP_MODE = "normal" }
+}
+
+output "name" { value = kubernetes_namespace_v1.this.metadata[0].name }</code></pre>
+<pre data-title="Root calling it"><code>module "app_namespace" {
+  source    = "../../modules/app-ns"
+  name      = "reliability-dev"
+  log_level = "debug"
+  labels    = local.common_labels
+}
+
+output "dev_namespace" { value = module.app_namespace.name }</code></pre>
+    <ul>
+      <li><strong>When to write a module:</strong> when you instantiate the same group of resources more than once (per environment, per service) or want a stable interface. Not for a single resource ("wrapper modules" add indirection without value).</li>
+      <li><strong>Registry modules</strong> save time for complex infra (VPCs, GKE), but you inherit their design and upgrade cadence. Pin exact versions and read the changelog before bumping.</li>
+      <li>Moving existing resources into a module changes their addresses (<code>kubernetes_namespace_v1.lab</code> → <code>module.app_namespace.kubernetes_namespace_v1.this</code>) — add <code>moved</code> blocks or Terraform will plan destroy + create.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>Environments: workspaces vs separate directories</h2>
+    <p><strong>CLI workspaces</strong> let one configuration have several named states in the same backend (<code>terraform workspace new staging</code>; the built-in <code>default</code> can't be deleted; <code>terraform.workspace</code> is usable in expressions). HashiCorp states workspaces are <em>not</em> appropriate for system decomposition or for deployments that require separate credentials and access controls.</p>
+    <div class="table-wrap"><table>
+      <tr><th></th><th>CLI workspaces</th><th>Separate root directories (<code>envs/dev</code>, <code>envs/prod</code>)</th></tr>
+      <tr><td>Code</td><td>identical for all envs</td><td>each env calls shared modules with its own values</td></tr>
+      <tr><td>State</td><td>same backend, <code>&lt;prefix&gt;/&lt;workspace&gt;.tfstate</code></td><td>separate backend config / prefix (or bucket)</td></tr>
+      <tr><td>Credentials</td><td>same — you need prod access to touch dev</td><td>can differ per env (dev project vs prod project)</td></tr>
+      <tr><td>Risk</td><td>wrong selected workspace = apply to wrong env; it's invisible in the code</td><td>env is visible in the path and PR diff</td></tr>
+      <tr><td>Good for</td><td>short-lived copies (feature test stacks)</td><td>long-lived environments, different blast radius</td></tr>
+    </table></div>
+    <p><strong>For reliability-api:</strong> use separate directories once you have both a throw-away lab and anything you care about. For the kind lab, one directory is enough.</p>
+
+    <!-- ============================================================ -->
+    <h2>fmt, validate and Terraform in CI</h2>
+    <p>Run cheap checks on every PR (Module 09 pattern): <code>fmt -check</code> catches style drift, <code>validate</code> catches type errors and bad references without credentials. A <code>plan</code> in CI needs credentials to reach the backend and APIs — use OIDC (Module 11) and post the plan for review; keep <code>apply</code> behind an environment with a required reviewer.</p>
+<pre data-title=".github/workflows/terraform.yml (offline checks only)"><code>name: terraform
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform/local-kind
+    steps:
+      - uses: actions/checkout@v7                 <span class="c"># pin to SHA</span>
+        with: { persist-credentials: false }
+      - uses: hashicorp/setup-terraform@v4        <span class="c"># pin to SHA</span>
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false
+      - run: terraform validate</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>Secrets handling</h2>
+    <ul>
+      <li><strong>Never put secret values in <code>.tf</code> or committed <code>.tfvars</code>.</strong> Pass them at runtime: <code>TF_VAR_api_token</code> from a secret manager / CI secret, or better, have Terraform not handle the secret at all (create the Secret Manager entry, let the workload read it).</li>
+      <li><strong>sensitive ≠ secret-safe</strong>: <code>sensitive = true</code> hides values from CLI output only; they are stored in state in plain text. Treat state as a secret: restricted bucket IAM, versioning, encryption.</li>
+      <li><strong>ephemeral</strong> variables/outputs keep values out of state and plan files where supported.</li>
+      <li><strong>Saved plan files contain values too</strong> (including backend config passed with <code>-backend-config</code>). Don't upload <code>tfplan</code> as a public CI artifact.</li>
+      <li><strong>Provider credentials</strong> come from the environment (ADC/OIDC for Google, kubeconfig for Kubernetes) — never as provider arguments in code.</li>
+    </ul>
+<pre data-title=".gitignore for Terraform directories"><code>.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars          <span class="c"># commit only non-secret example files, e.g. dev.tfvars.example</span>
+tfplan
+crash.log
+<span class="c"># DO commit: .terraform.lock.hcl</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>Where Terraform stops: Terraform vs Helm vs kubectl vs GitHub Actions</h2>
+    <figure class="diagram">
+      <svg viewBox="0 0 860 340" role="img" aria-label="Layer boundaries: Terraform for cloud infrastructure, Helm for application releases, kubectl for inspection, GitHub Actions to automate">
+        <rect x="20" y="20" width="620" height="90" rx="10" class="box2"/>
+        <text x="36" y="44" class="t-bold">Terraform — infrastructure the cluster runs on</text>
+        <text x="36" y="66" class="t-muted">GCP project services, VPC/subnets, GKE cluster &amp; node pools, Artifact Registry,</text>
+        <text x="36" y="84" class="t-muted">service accounts &amp; IAM, Workload Identity Federation, state bucket, budgets</text>
+        <text x="36" y="102" class="t-mono">lifecycle: weeks–months · changes reviewed as plans</text>
+        <rect x="20" y="124" width="620" height="90" rx="10" class="box3"/>
+        <text x="36" y="148" class="t-bold">Helm (or raw YAML) — the application inside the cluster</text>
+        <text x="36" y="170" class="t-muted">Deployment/reliability-api, Service, ConfigMap, HPA, PDB; kube-prometheus-stack</text>
+        <text x="36" y="188" class="t-muted">release "reliability-api" from charts/reliability-api</text>
+        <text x="36" y="206" class="t-mono">lifecycle: every commit · upgrade/rollback</text>
+        <rect x="20" y="228" width="620" height="90" rx="10" class="box4"/>
+        <text x="36" y="252" class="t-bold">kubectl — observe and debug (imperative)</text>
+        <text x="36" y="274" class="t-muted">get / describe / logs / port-forward / rollout status; emergency edits are</text>
+        <text x="36" y="292" class="t-muted">followed by a code change, or they become drift</text>
+        <text x="36" y="310" class="t-mono">lifecycle: minutes</text>
+        <rect x="670" y="20" width="170" height="298" rx="10" class="box"/>
+        <text x="755" y="48" text-anchor="middle" class="t-bold">GitHub Actions</text>
+        <text x="755" y="70" text-anchor="middle" class="t-muted">automates all</text><text x="755" y="86" text-anchor="middle" class="t-muted">layers:</text>
+        <text x="755" y="118" text-anchor="middle" class="t-mono">fmt/validate/</text><text x="755" y="134" text-anchor="middle" class="t-mono">plan → apply</text>
+        <text x="755" y="166" text-anchor="middle" class="t-mono">build image →</text><text x="755" y="182" text-anchor="middle" class="t-mono">helm upgrade</text>
+        <text x="755" y="214" text-anchor="middle" class="t-mono">kubectl rollout</text><text x="755" y="230" text-anchor="middle" class="t-mono">status in CI</text>
+        <text x="755" y="270" text-anchor="middle" class="t-muted">gates: environments</text><text x="755" y="286" text-anchor="middle" class="t-muted">+ reviewers (M09)</text>
+      </svg>
+      <figcaption>One owner per object. Terraform can manage in-cluster objects (as in our local lab) — but if Helm deploys the app, Terraform must not also manage the app's Deployment or ConfigMap.</figcaption>
+    </figure>
+    <ul>
+      <li><strong>Why not deploy the app with Terraform too?</strong> You can (kubernetes/helm providers), but the app changes on every commit while infrastructure changes rarely; mixing them couples slow, high-risk infra plans with fast app releases, and the Kubernetes provider docs warn against creating a cluster and its in-cluster resources in the same apply.</li>
+      <li><strong>Our local lab breaks that rule on purpose</strong> in a separate namespace (<code>reliability-tf</code>) so you can learn Terraform with zero cost. The Helm release in <code>reliability-lab</code> stays Helm-owned; Terraform only <em>reads</em> its Service via a data source.</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>Worked example 1 (free): Terraform against your kind cluster</h2>
+    <p>Directory: <code>kubernetes-reliability-lab/infra/terraform/local-kind/</code>. Uses the <code>versions.tf</code>, <code>providers.tf</code>, <code>variables.tf</code>, <code>outputs.tf</code> shown above plus this <code>main.tf</code>:</p>
+<pre data-title="infra/terraform/local-kind/main.tf"><code>locals {
+  common_labels = {
+    "app.kubernetes.io/name"       = "reliability-api"
+    "app.kubernetes.io/managed-by" = "terraform"
+  }
+}
+
+resource "random_pet" "lab" {
+  length = 2
+}
+
+resource "kubernetes_namespace_v1" "lab" {
+  metadata {
+    name   = var.namespace
+    labels = local.common_labels
+  }
+}
+
+<span class="c"># Read-only: the Service created by the Helm release in Module 06.</span>
+data "kubernetes_service_v1" "api" {
+  metadata {
+    name      = "reliability-api"
+    namespace = "reliability-lab"
+  }
+}
+
+resource "kubernetes_config_map_v1" "app" {
+  metadata {
+    name      = "reliability-api-config"
+    namespace = kubernetes_namespace_v1.lab.metadata[0].name
+    labels    = local.common_labels
+  }
+  data = {
+    APP_MODE            = "normal"
+    LOG_LEVEL           = var.log_level
+    READY_DELAY_SECONDS = tostring(var.ready_delay_seconds)
+    LAB_ID              = random_pet.lab.id
+    API_CLUSTER_IP      = data.kubernetes_service_v1.api.spec[0].cluster_ip
+  }
+}
+
+resource "kubernetes_namespace_v1" "env" {
+  for_each = var.environments
+  metadata {
+    name   = "reliability-${each.key}"
+    labels = merge(local.common_labels, { environment = each.key })
+  }
+}</code></pre>
+
+    <section class="lab"><header>Lab 1 — init, plan, apply, inspect, change, replace, destroy (kind, free)</header><div class="body">
+      <p>Prereqs: kind cluster <code>reliability-lab</code> running with the Helm release from Module 06 (<code>kubectl -n reliability-lab get svc reliability-api</code> works). Install Terraform (macOS: <code>brew tap hashicorp/tap &amp;&amp; brew install hashicorp/tap/terraform</code>; other OS: see the install page).</p>
+      <ol class="steps">
+        <li>Init:
+<pre><code>cd infra/terraform/local-kind
+terraform version
+terraform init</code></pre>
+<pre class="o" data-title="Example output (yours will differ in versions)"><code>Initializing the backend...
+Initializing provider plugins...
+- Finding hashicorp/kubernetes versions matching "~&gt; 3.4"...
+- Finding hashicorp/random versions matching "~&gt; 3.9"...
+- Installing hashicorp/kubernetes v3.4.0...
+- Installing hashicorp/random v3.9.1...
+Terraform has created a lock file .terraform.lock.hcl to record the provider
+selections it made above. Include this file in your version control repository
+...
+Terraform has been successfully initialized!</code></pre></li>
+        <li>Format and validate: <code>terraform fmt -recursive &amp;&amp; terraform validate</code> → <code>Success! The configuration is valid.</code></li>
+        <li>Plan and save it:
+<pre><code>terraform plan -out=tfplan</code></pre>
+<pre class="o" data-title="Example output (abridged; yours will differ)"><code>data.kubernetes_service_v1.api: Reading...
+data.kubernetes_service_v1.api: Read complete after 0s [id=reliability-lab/reliability-api]
+
+Terraform used the selected providers to generate the following execution plan.
+Resource actions are indicated with the following symbols:
+  + create
+
+Terraform will perform the following actions:
+
+  # kubernetes_config_map_v1.app will be created
+  + resource "kubernetes_config_map_v1" "app" {
+      + data = {
+          + "API_CLUSTER_IP"      = "10.96.143.27"
+          + "APP_MODE"            = "normal"
+          + "LAB_ID"              = (known after apply)
+          + "LOG_LEVEL"           = "info"
+          + "READY_DELAY_SECONDS" = "5"
+        }
+      ...
+  # kubernetes_namespace_v1.lab will be created
+  # random_pet.lab will be created
+
+Plan: 3 to add, 0 to change, 0 to destroy.
+
+Saved the plan to: tfplan</code></pre>
+          <p>Notice: the data source was read at plan time (its inputs were known), and <code>LAB_ID</code> is <code>(known after apply)</code> because <code>random_pet</code> doesn't exist yet.</p></li>
+        <li>Apply exactly the reviewed plan (no prompt for saved plans): <code>terraform apply tfplan</code>
+<pre class="o" data-title="Example output (yours will differ)"><code>random_pet.lab: Creating...
+random_pet.lab: Creation complete after 0s [id=quick-otter]
+kubernetes_namespace_v1.lab: Creating...
+kubernetes_namespace_v1.lab: Creation complete after 0s [id=reliability-tf]
+kubernetes_config_map_v1.app: Creating...
+kubernetes_config_map_v1.app: Creation complete after 0s [id=reliability-tf/reliability-api-config]
+
+Apply complete! Resources: 3 added, 0 changed, 0 destroyed.
+
+Outputs:
+
+api_cluster_ip = "10.96.143.27"
+lab_id = "quick-otter"
+namespace = "reliability-tf"</code></pre></li>
+        <li>Verify with kubectl and inspect state:
+<pre><code>kubectl -n reliability-tf get configmap reliability-api-config -o yaml
+terraform state list
+terraform state show kubernetes_config_map_v1.app
+terraform output -raw lab_id</code></pre>
+<pre class="o" data-title="Example output of state list"><code>data.kubernetes_service_v1.api
+kubernetes_config_map_v1.app
+kubernetes_namespace_v1.lab
+random_pet.lab</code></pre></li>
+        <li>Idempotency: run <code>terraform plan</code> again → <code>No changes. Your infrastructure matches the configuration.</code></li>
+        <li>In-place update: <code>terraform plan -var log_level=debug</code> → <code>~ update in-place</code> on the ConfigMap, <code>"LOG_LEVEL" = "info" -&gt; "debug"</code>, and <code>+ create</code> for <code>kubernetes_config_map_v1.debug[0]</code> if you added the count example. Try <code>-var log_level=verbose</code> to see your validation message.</li>
+        <li>Replacement: change the ConfigMap's <code>metadata.name</code> to <code>"reliability-api-settings"</code> and plan → <code>-/+</code>, <code>must be replaced</code>, <code># forces replacement</code> on <code>name</code>. Revert the change.</li>
+        <li>Destroy: <code>terraform destroy</code> → review "Plan: 0 to add, 0 to change, 3 to destroy." → <code>yes</code>. Confirm <code>kubectl get ns reliability-tf</code> is gone and that the Helm-owned Service in <code>reliability-lab</code> is untouched (data sources are never destroyed).</li>
+      </ol>
+    </div></section>
+
+    <section class="lab"><header>Lab 2 — Drift detection exercise</header><div class="body">
+      <p>Goal: see drift, then practise both ways to resolve it. Start from an applied Lab 1 (<code>terraform apply</code> again if you destroyed).</p>
+      <ol class="steps">
+        <li>Simulate an "emergency hotfix" outside Terraform:
+<pre><code>kubectl -n reliability-tf patch configmap reliability-api-config \
+  --type merge -p '{"data":{"LOG_LEVEL":"debug"}}'
+kubectl -n reliability-tf label namespace reliability-tf owner=oncall</code></pre></li>
+        <li>Detect drift without proposing changes:
+<pre><code>terraform plan -refresh-only</code></pre>
+<pre class="o" data-title="Example output (abridged; yours will differ)"><code>Note: Objects have changed outside of Terraform
+
+Terraform detected the following changes made outside of Terraform since the
+last "terraform apply" which may have affected this plan:
+
+  # kubernetes_config_map_v1.app has changed
+  ~ resource "kubernetes_config_map_v1" "app" {
+      ~ data = {
+          ~ "LOG_LEVEL" = "info" -&gt; "debug"
+            # (4 unchanged elements hidden)
+        }
+    ...
+  # kubernetes_namespace_v1.lab has changed
+  ...
+          + "owner" = "oncall"</code></pre></li>
+        <li>Now run a normal <code>terraform plan</code>: it shows the drift note <em>and</em> proposes <code>~</code> updates that revert LOG_LEVEL to <code>info</code> and remove the <code>owner</code> label.</li>
+        <li><strong>Decision A — the code is right:</strong> <code>terraform apply</code> reverts the manual change. (In real life: confirm the hotfix is no longer needed first!)</li>
+        <li><strong>Decision B — the manual change is right:</strong> repeat step 1, then update the code (<code>log_level</code> default to <code>"debug"</code>, add <code>owner = "oncall"</code> to the namespace labels) until <code>terraform plan</code> shows no changes. Optionally <code>terraform apply -refresh-only</code> first to record the observed values in state without touching infrastructure.</li>
+        <li>Bonus — legitimately shared fields: if an on-call tool really owns the namespace labels, <code>lifecycle { ignore_changes = [metadata[0].labels] }</code> stops Terraform fighting it. Discuss why that is acceptable for labels written by another system, and why ignoring <code>data</code> would hide real drift.</li>
+        <li>Automate detection: in CI, a scheduled job can run <code>terraform plan -detailed-exitcode</code>; exit code 2 means changes/drift exist → alert.</li>
+      </ol>
+    </div></section>
+
+    <section class="lab"><header>Lab 3 — import and refactor without re-creating</header><div class="body">
+      <ol class="steps">
+        <li>Create a namespace by hand: <code>kubectl create namespace legacy-tools</code>.</li>
+        <li>Add the <code>import</code> + <code>resource "kubernetes_namespace_v1" "legacy"</code> blocks shown above. <code>terraform plan</code> → <code># kubernetes_namespace_v1.legacy will be imported</code>, "Plan: 1 to import, 0 to add, 0 to change, 0 to destroy." (an in-place update may also appear if your config differs from the live object, e.g. labels). Apply. Remove the import block; plan → no changes.</li>
+        <li>Rename <code>kubernetes_config_map_v1.app</code> to <code>api_config</code> <em>without</em> a <code>moved</code> block and plan: observe "1 to add, 1 to destroy". Add the <code>moved</code> block: plan shows "has moved to", 0 to add/destroy. Apply.</li>
+        <li>Compare with the imperative alternative: <code>terraform state mv -dry-run kubernetes_config_map_v1.app kubernetes_config_map_v1.api_config</code> — works, but only on your copy of state and leaves no record in code review.</li>
+      </ol>
+    </div></section>
+
+    <section class="lab"><header>Lab 4 — for_each environments and the count trap</header><div class="body">
+      <ol class="steps">
+        <li><code>terraform apply -var 'environments=["dev","staging","prod"]'</code> → three namespaces <code>reliability-dev/staging/prod</code>. <code>terraform state list | grep env</code> shows <code>kubernetes_namespace_v1.env["dev"]</code> etc.</li>
+        <li><code>terraform plan -var 'environments=["staging","prod"]'</code> → only <code>env["dev"]</code> destroyed "(because key ["dev"] is not in for_each map)".</li>
+        <li>Rewrite the block with <code>count = length(var.envs)</code> over a <code>list(string)</code> in a scratch copy and repeat: observe the <code>-/+</code> cascade on <code>[0]</code> and <code>[1]</code> and "(because index [2] is out of range for count)". Use the simulator above to predict first.</li>
+        <li>Clean up: <code>terraform destroy</code>.</li>
+      </ol>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>Worked example 2 (costs money): GCP skeleton for remote state</h2>
+    <div class="callout danger"><span class="label">Cost warning — read before running anything here</span>
+      <ul>
+        <li>Creating Google Cloud resources requires a billing-enabled project. A small GCS bucket costs very little, but <em>not zero</em>: storage, operations, retained object versions (versioning keeps old state copies) and possibly soft-deleted objects (see the bucket's <code>soft_delete_policy</code>) are billed. Check current pricing on cloud.google.com.</li>
+        <li>The expensive resources (GKE cluster, nodes, load balancers, NAT, logging volume) come in Module 11. Set a billing budget with alerts <em>before</em> creating anything, and keep a written list of what you created.</li>
+        <li>Free-tier/credit programs don't guarantee every associated resource is free. Destroy experiments when done and verify deletion in the console.</li>
+      </ul></div>
+    <p><strong>Chicken-and-egg:</strong> the state bucket must exist before any configuration can store its state in it. Standard answer: a tiny <em>bootstrap</em> root module with local state creates the bucket; everything else uses the gcs backend. (You can later migrate the bootstrap's own state into the bucket.)</p>
+<pre data-title="infra/terraform/gcp-bootstrap/main.tf"><code>terraform {
+  required_version = "&gt;= 1.7, &lt; 2.0"
+  required_providers {
+    google = { source = "hashicorp/google", version = "~&gt; 8.9" }
+    random = { source = "hashicorp/random", version = "~&gt; 3.9" }
+  }
+}
+
+variable "project_id" { type = string }                 <span class="c"># e.g. passed with -var or TF_VAR_project_id</span>
+variable "region" {
+  type    = string
+  default = "us-central1"
+}
+
+provider "google" {
+  project = var.project_id                              <span class="c"># credentials come from ADC, not from code</span>
+  region  = var.region
+}
+
+resource "random_id" "suffix" {
+  byte_length = 4                                       <span class="c"># .hex = 8 hex characters</span>
+}
+
+resource "google_storage_bucket" "tf_state" {
+  name                        = "${var.project_id}-tfstate-${random_id.suffix.hex}"   <span class="c"># globally unique, lowercase, ≤ 63 chars</span>
+  location                    = var.region
+  force_destroy               = false                   <span class="c"># default: refuse to delete a non-empty bucket</span>
+  uniform_bucket_level_access = true                    <span class="c"># IAM only, no per-object ACLs</span>
+  public_access_prevention    = "enforced"              <span class="c"># state must never be public</span>
+
+  versioning {
+    enabled = true                                      <span class="c"># recover earlier state versions</span>
+  }
+
+  labels = {
+    app        = "reliability-api"
+    managed-by = "terraform"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+output "state_bucket" {
+  value = google_storage_bucket.tf_state.name
+}</code></pre>
+    <section class="lab"><header>Lab 5 (optional, billable) — bootstrap the state bucket and migrate to it</header><div class="body">
+      <ol class="steps">
+        <li>Authenticate for Terraform with ADC and select your project (Module 11 covers projects/IAM):
+<pre><code>gcloud auth application-default login
+export TF_VAR_project_id="&lt;your-project-id&gt;"</code></pre></li>
+        <li>Bootstrap:
+<pre><code>cd infra/terraform/gcp-bootstrap
+terraform init
+terraform plan -out=tfplan      # expect: + random_id.suffix, + google_storage_bucket.tf_state
+terraform apply tfplan
+terraform output -raw state_bucket</code></pre></li>
+        <li>Point a configuration at it with partial backend configuration so the bucket name isn't hard-coded:
+<pre data-title="infra/terraform/envs/dev/backend.tf"><code>terraform {
+  backend "gcs" {
+    prefix = "reliability-lab/dev"
+  }
+}</code></pre>
+<pre><code>terraform init -backend-config="bucket=$(terraform -chdir=../../gcp-bootstrap output -raw state_bucket)"</code></pre>
+          If that directory already had local state, <code>init</code> offers to copy it to the new backend — back up <code>terraform.tfstate</code> first and answer <code>yes</code>.</li>
+        <li>Verify locking: in two terminals run <code>terraform apply</code> in the same directory at the same time; the second reports <em>Error acquiring the state lock</em> with the holder's details.</li>
+        <li>Inspect the stored state object: <code>gcloud storage ls gs://&lt;bucket&gt;/reliability-lab/dev/</code> → <code>default.tfstate</code>.</li>
+        <li><strong>Cleanup</strong> (when you're done with the cloud modules): destroy the configurations that use the bucket first. Then for the bucket itself: remove <code>prevent_destroy</code>, set <code>force_destroy = true</code> only if you're sure the state is no longer needed, <code>terraform apply</code>, then <code>terraform destroy</code>. Verify in the console that the bucket is gone.</li>
+      </ol>
+    </div></section>
+
+    <!-- ============================================================ -->
+    <h2>Troubleshooting</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
+      <tr><td><code>Error: Inconsistent dependency lock file</code> / provider not installed</td><td>constraints changed or lock file missing for this platform</td><td><code>terraform init</code> (or <code>-upgrade</code> deliberately); <code>providers lock -platform=…</code></td></tr>
+      <tr><td>Plan hits the wrong cluster</td><td>provider used a default/other context</td><td>set <code>config_path</code> + <code>config_context</code> explicitly</td></tr>
+      <tr><td><code>Error acquiring the state lock</code></td><td>another run in progress, or stale lock from a killed run</td><td>wait / <code>-lock-timeout</code>; <code>force-unlock</code> only after confirming no one runs</td></tr>
+      <tr><td>Plan wants to destroy + create after a rename</td><td>address changed</td><td>add a <code>moved</code> block</td></tr>
+      <tr><td>Plan wants to replace a stateful resource</td><td>changed an immutable argument (<code># forces replacement</code>)</td><td>revert, or plan a migration; consider <code>prevent_destroy</code></td></tr>
+      <tr><td>Plan never reaches "No changes"</td><td>another controller mutates a field; provider normalisation</td><td>find the owner; narrow <code>ignore_changes</code></td></tr>
+      <tr><td><code>Invalid for_each argument</code> … "known only after apply"</td><td>for_each keys depend on values computed during apply</td><td>derive keys from variables/static data, not from resource attributes</td></tr>
+      <tr><td><code>already exists</code> on create</td><td>object exists but isn't in state</td><td>import it (import block) or rename</td></tr>
+      <tr><td>Data source "not found"</td><td>referenced object (Helm Service) not deployed</td><td>deploy it first or make the lookup conditional</td></tr>
+      <tr><td>Secrets visible in <code>terraform output -json</code></td><td>sensitive only hides CLI display</td><td>restrict state access; avoid outputting secrets</td></tr>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>Cheat sheet</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Task</th><th>Command / syntax</th></tr>
+      <tr><td>Initialise / upgrade providers</td><td><code>terraform init</code> · <code>terraform init -upgrade</code></td></tr>
+      <tr><td>Offline checks</td><td><code>terraform fmt -check -recursive</code> · <code>terraform init -backend=false &amp;&amp; terraform validate</code></td></tr>
+      <tr><td>Preview / save plan</td><td><code>terraform plan</code> · <code>terraform plan -out=tfplan</code></td></tr>
+      <tr><td>Apply reviewed plan</td><td><code>terraform apply tfplan</code></td></tr>
+      <tr><td>CI change detection</td><td><code>terraform plan -detailed-exitcode</code> (0 none, 1 error, 2 changes)</td></tr>
+      <tr><td>Drift only</td><td><code>terraform plan -refresh-only</code> · <code>terraform apply -refresh-only</code></td></tr>
+      <tr><td>Force replace one instance</td><td><code>terraform apply -replace=ADDR</code></td></tr>
+      <tr><td>Destroy everything in this state</td><td><code>terraform destroy</code> (= <code>apply -destroy</code>)</td></tr>
+      <tr><td>Pass variables</td><td><code>-var 'k=v'</code> · <code>-var-file=dev.tfvars</code> · <code>TF_VAR_k=v</code></td></tr>
+      <tr><td>Outputs</td><td><code>terraform output</code> · <code>-raw NAME</code> · <code>-json</code></td></tr>
+      <tr><td>Inspect state</td><td><code>terraform state list</code> · <code>terraform state show ADDR</code></td></tr>
+      <tr><td>Rename / move</td><td><code>moved</code> block with <code>from = A</code> and <code>to = B</code> (preferred) · <code>terraform state mv -dry-run A B</code></td></tr>
+      <tr><td>Adopt existing</td><td><code>import</code> block with <code>to = ADDR</code> and <code>id = "…"</code> · <code>terraform plan -generate-config-out=gen.tf</code></td></tr>
+      <tr><td>Stale lock</td><td><code>terraform force-unlock LOCK_ID</code> (careful)</td></tr>
+      <tr><td>Workspaces</td><td><code>terraform workspace list|new|select NAME</code></td></tr>
+      <tr><td>Dependency graph</td><td><code>terraform graph</code> (DOT)</td></tr>
+      <tr><td>Multi-platform lock</td><td><code>terraform providers lock -platform=linux_amd64 -platform=darwin_arm64</code></td></tr>
+      <tr><td>Version pin</td><td><code>version = "~&gt; 3.4"</code> (≥3.4, &lt;4.0)</td></tr>
+    </table></div>
+
+    <h2>Glossary</h2>
+    <dl class="defs">
+      <dt>IaC</dt><dd>Infrastructure described in version-controlled code and applied by tools.</dd>
+      <dt>Declarative</dt><dd>Describe the end state; the tool computes the steps.</dd>
+      <dt>Idempotent</dt><dd>Re-applying the same input causes no further change.</dd>
+      <dt>Drift</dt><dd>Real infrastructure differs from configuration/state due to out-of-band changes.</dd>
+      <dt>HCL</dt><dd>HashiCorp Configuration Language: blocks, arguments, expressions.</dd>
+      <dt>Provider</dt><dd>Plugin implementing CRUD against one API.</dd>
+      <dt>Resource / data source</dt><dd>Object Terraform manages / object Terraform only reads.</dd>
+      <dt>Address</dt><dd>Terraform's identity for an instance, e.g. <code>kubernetes_namespace_v1.env["dev"]</code>.</dd>
+      <dt>State</dt><dd>Record binding addresses to real objects plus their attributes; sensitive.</dd>
+      <dt>Backend</dt><dd>Where state is stored (local, gcs, …) and whether it's locked.</dd>
+      <dt>Lock file</dt><dd><code>.terraform.lock.hcl</code>: exact provider versions + checksums.</dd>
+      <dt>Plan</dt><dd>Proposed actions computed from config vs refreshed state.</dd>
+      <dt>Replace</dt><dd>Destroy + create because an argument can't be updated in place.</dd>
+      <dt>Module (root/child)</dt><dd>Directory of .tf files; the one you run in / ones it calls.</dd>
+      <dt>Workspace</dt><dd>Named extra state for the same configuration and backend.</dd>
+      <dt><code>moved</code> / <code>import</code></dt><dd>Declarative address refactoring / adopting existing objects into state.</dd>
+    </dl>
+
+    <h2>Self-check</h2>
+    <details class="q"><summary>1. What three things does <code>terraform plan</code> compare or consult, and which one does it update first?</summary><div class="a">Configuration, state, and the real objects via provider APIs. It first refreshes its view of state from the real objects, then diffs against configuration to propose actions.</div></details>
+    <details class="q"><summary>2. Why commit <code>.terraform.lock.hcl</code> but never <code>terraform.tfstate</code>?</summary><div class="a">The lock file pins exact provider versions/checksums so everyone and CI use the same plugins — it's reviewable and contains no secrets. State contains real attribute values including secrets and must be shared via a locked, access-controlled backend, not git.</div></details>
+    <details class="q"><summary>3. A plan shows <code>-/+</code> on <code>google_storage_bucket.tf_state</code> with <code># forces replacement</code> next to <code>location</code>. What would happen if you applied, and what protects you?</summary><div class="a">Terraform would try to destroy the bucket (with all state versions) and create a new one — data loss. <code>prevent_destroy = true</code> makes the plan error instead; <code>force_destroy = false</code> makes deletion of a non-empty bucket fail. The right fix is to revert the location change.</div></details>
+    <details class="q"><summary>4. Difference between <code>sensitive = true</code> and <code>ephemeral = true</code> on a variable?</summary><div class="a"><code>sensitive</code> only redacts the value in CLI output; it's still stored in state. <code>ephemeral</code> omits the value from state and plan files (with restrictions on where it can be referenced).</div></details>
+    <details class="q"><summary>5. You renamed a resource and the plan says "1 to add, 1 to destroy". What do you do?</summary><div class="a">Add a <code>moved</code> block (<code>from</code> = old address, <code>to</code> = new address); re-plan should show "has moved to" with nothing to add or destroy. (Alternative: <code>terraform state mv</code>, but it's imperative and invisible in review.)</div></details>
+    <details class="q"><summary>6. Why can removing the first item from a list used with <code>count</code> recreate everything?</summary><div class="a"><code>count</code> instances are identified by index. Removing item 0 shifts every later item down one index, so each index's arguments change (often forcing replacement) and the last index is destroyed. <code>for_each</code> identifies instances by key, so only the removed key is destroyed.</div></details>
+    <details class="q"><summary>7. Two engineers apply against the GCS backend at once. What happens?</summary><div class="a">The first acquires the state lock; the second gets "Error acquiring the state lock" (or waits up to <code>-lock-timeout</code>). Without locking, both would write state and could corrupt it or create duplicates.</div></details>
+    <details class="q"><summary>8. Why might you use separate directories instead of workspaces for dev and prod?</summary><div class="a">Workspaces share configuration, backend and credentials; HashiCorp says they're not appropriate when deployments need separate credentials and access controls. Separate directories make the environment explicit in paths and reviews and let prod use different projects/credentials.</div></details>
+    <details class="q"><summary>9. Where is the line between Terraform and Helm for reliability-api on GKE?</summary><div class="a">Terraform: project services, network, GKE cluster/node pools, Artifact Registry, IAM, Workload Identity, state bucket. Helm: the reliability-api Deployment/Service/ConfigMap/HPA and the monitoring stack. One owner per object; Terraform may read in-cluster facts via data sources.</div></details>
+    <details class="q"><summary>10. Someone ran <code>kubectl edit</code> on a Terraform-managed ConfigMap during an incident. List the steps to resolve the drift safely.</summary><div class="a">Run <code>terraform plan -refresh-only</code> to see exactly what changed. Decide with the incident owner whether the change should stay. If yes, update the configuration (PR) until plan is clean (optionally <code>apply -refresh-only</code> to record state). If no, apply the normal plan to revert it. Never blindly apply and silently undo an emergency fix.</div></details>
+    <details class="q"><summary>11. What does <code>terraform apply tfplan</code> do differently from <code>terraform apply</code>?</summary><div class="a">It executes the previously saved plan without re-planning and without prompting. Plain <code>apply</code> computes a fresh plan and asks for approval. Saved plans guarantee you apply exactly what was reviewed.</div></details>
+
+    <h2>Sources</h2>
+    <ul class="sources">
+      <li><a href="https://developer.hashicorp.com/terraform/intro">What is Terraform? — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/providers/requirements">Provider requirements (required_providers, version constraints) — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/files/dependency-lock">Dependency lock file — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/resources/behavior">Resource behavior and dependencies — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/values/variables">Input variables — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/values/outputs">Output values — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/state">State — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/state/locking">State locking — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/state/workspaces">Workspaces — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/backend">Backend block configuration — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/backend/gcs">Backend type: gcs — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/cli/commands/plan">terraform plan (plan output symbols, -out, -detailed-exitcode, -refresh-only) — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/cli/commands/apply">terraform apply — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/cli/commands/fmt">terraform fmt</a> · <a href="https://developer.hashicorp.com/terraform/cli/commands/validate">terraform validate</a> — developer.hashicorp.com</li>
+      <li><a href="https://developer.hashicorp.com/terraform/cli/commands/state/list">terraform state list</a> · <a href="https://developer.hashicorp.com/terraform/cli/commands/state/mv">terraform state mv</a> — developer.hashicorp.com</li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/modules/develop/refactoring">Refactoring with moved blocks — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/import">Import existing resources (import blocks) — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle">lifecycle meta-argument — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/meta-arguments/count">count</a> · <a href="https://developer.hashicorp.com/terraform/language/meta-arguments/for_each">for_each</a> — developer.hashicorp.com</li>
+      <li><a href="https://developer.hashicorp.com/terraform/language/modules">Modules overview — developer.hashicorp.com</a></li>
+      <li><a href="https://developer.hashicorp.com/terraform/tutorials/state/resource-drift">Manage resource drift (tutorial) — developer.hashicorp.com</a></li>
+      <li><a href="https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs">Kubernetes provider docs (config_path/config_context, KUBECONFIG note, namespace_v1, config_map_v1, service_v1 data source) — registry.terraform.io</a></li>
+      <li><a href="https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/storage_bucket">google_storage_bucket — registry.terraform.io</a></li>
+      <li><a href="https://registry.terraform.io/providers/hashicorp/random/latest/docs">Random provider (random_pet, random_id) — registry.terraform.io</a></li>
+      <li><a href="https://github.com/hashicorp/terraform/blob/main/internal/command/jsonformat/plan.go">Terraform source: plan renderer (exact legend/header wording for +/- and &lt;=)</a></li>
+      <li><a href="https://github.com/hashicorp/setup-terraform">hashicorp/setup-terraform README (v4)</a></li>
+    </ul>
+
+    <nav class="pager">
+      <a class="prev" href="09-cicd-github-actions.html"><small>◀ Previous</small>Module 09 · CI/CD with GitHub Actions</a>
+      <a class="next" href="11-gke-cloud.html"><small>Next ▶</small>Module 11 · Google Cloud &amp; GKE</a>
+    </nav>
+  </article></main>
+</div>
+<script>
+(function () {
+  /* ---------- variable precedence resolver ---------- */
+  var VP = [
+    { id: "def", label: "default in variable block", val: "info", on: true },
+    { id: "env", label: "TF_VAR_log_level (env)", val: "warning", on: false },
+    { id: "tfv", label: "terraform.tfvars", val: "error", on: false },
+    { id: "tfj", label: "terraform.tfvars.json", val: "info", on: false },
+    { id: "aut", label: "dev.auto.tfvars", val: "debug", on: false },
+    { id: "cli", label: "-var log_level=… (CLI)", val: "debug", on: false }
+  ];
+  var vpList = document.getElementById("vp-list"), vpOut = document.getElementById("vp-out");
+  if (vpList) {
+    VP.forEach(function (s, i) {
+      var d = document.createElement("div"); d.className = "card";
+      d.innerHTML = '<label style="margin:0"><input type="checkbox" data-i="' + i + '"' + (s.on ? " checked" : "") + "> " + (i + 1) + ". " + s.label + "</label>" +
+        '<select data-v="' + i + '"><option>debug</option><option>info</option><option>warning</option><option>error</option></select>';
+      vpList.appendChild(d);
+      d.querySelector("select").value = s.val;
+    });
+    function vpRender() {
+      var winner = null, lines = [];
+      VP.forEach(function (s, i) {
+        s.on = vpList.querySelector('[data-i="' + i + '"]').checked;
+        s.val = vpList.querySelector('[data-v="' + i + '"]').value;
+        if (s.on) { winner = s; lines.push("  " + (i + 1) + ". " + s.label + " = \"" + s.val + "\""); }
+      });
+      if (!winner) { vpOut.textContent = "No value from any source and no default:\nTerraform prompts interactively (or errors in CI with -input=false)."; return; }
+      vpOut.textContent = "Sources that set log_level (lowest → highest precedence):\n" + lines.join("\n") +
+        "\n\nvar.log_level = \"" + winner.val + "\"   ← from " + winner.label;
+    }
+    vpList.addEventListener("change", vpRender); vpRender();
+  }
+
+  /* ---------- plan-reading drill ---------- */
+  var PLANS = [
+    { a: "+", plan: "  # kubernetes_namespace_v1.lab will be created\n  ? resource \"kubernetes_namespace_v1\" \"lab\" {\n      + id = (known after apply)\n      + metadata {\n          + name = \"reliability-tf\"\n          ...",
+      why: "Create: the address is in configuration but not in state. Check: is it the right cluster/project? Any cost?" },
+    { a: "~", plan: "  # kubernetes_config_map_v1.app will be updated in-place\n  ? resource \"kubernetes_config_map_v1\" \"app\" {\n      ~ data = {\n          ~ \"LOG_LEVEL\" = \"info\" -> \"debug\"\n            # (4 unchanged elements hidden)\n        }",
+      why: "Update in-place: the API can change data without re-creating the object. Pods that read the ConfigMap via env vars only see it after restart (Module 05)." },
+    { a: "-/+", plan: "  # kubernetes_config_map_v1.app must be replaced\n  ? resource \"kubernetes_config_map_v1\" \"app\" {\n      ~ id = \"reliability-tf/reliability-api-config\" -> (known after apply)\n      ~ metadata {\n          ~ name = \"reliability-api-config\" -> \"reliability-api-settings\" # forces replacement",
+      why: "Replace (destroy then create): metadata.name cannot be updated. Between destroy and create the ConfigMap does not exist: Pods starting then would fail. Look for '# forces replacement' to find the cause." },
+    { a: "-", plan: "  # kubernetes_namespace_v1.env[\"dev\"] will be destroyed\n  # (because key [\"dev\"] is not in for_each map)\n  ? resource \"kubernetes_namespace_v1\" \"env\" {\n      - id = \"reliability-dev\" -> null\n      ...",
+      why: "Destroy: the key left the for_each set. Deleting a namespace deletes everything inside it. Was that intended?" },
+    { a: "+/-", plan: "  # kubernetes_config_map_v1.app must be replaced\n  ? resource \"kubernetes_config_map_v1\" \"app\" {\n      ~ metadata {\n          ~ name = \"reliability-api-config-quick-otter\" -> \"reliability-api-config-brave-lynx\" # forces replacement\n    (resource has lifecycle { create_before_destroy = true })",
+      why: "Create replacement, then destroy: create_before_destroy reverses the order, so there is no gap. It only works because the name is unique (random_pet suffix); a fixed name would collide." },
+    { a: "<=", plan: "  # data.kubernetes_service_v1.api will be read during apply\n  # (depends on a resource or a module with changes pending)\n ?= data \"kubernetes_service_v1\" \"api\" {\n      + spec = (known after apply)\n      ...",
+      why: "Read (data source): normally read at plan time; deferred to apply when its inputs are unknown or it depends on pending changes. Values derived from it show (known after apply)." }
+  ];
+  var SYMS = ["+", "-", "~", "-/+", "+/-", "<="];
+  var pi = 0, prPlan = document.getElementById("pr-plan"), prBtns = document.getElementById("pr-btns"),
+      prFb = document.getElementById("pr-fb"), prCount = document.getElementById("pr-count");
+  if (prPlan) {
+    SYMS.forEach(function (s) {
+      var b = document.createElement("button"); b.className = "btn"; b.textContent = s;
+      b.addEventListener("click", function () {
+        var p = PLANS[pi], ok = s === p.a;
+        prFb.innerHTML = (ok ? '<span class="fb-ok">Correct: ' : '<span class="fb-bad">Not quite — it is ') + p.a + "</span> " + p.why.replace(/</g, "&lt;");
+        prPlan.textContent = p.plan.replace(/\?=? resource|\?= data/, function (m) { return m.indexOf("data") >= 0 ? " " + p.a + " data" : p.a + " resource"; });
+      });
+      prBtns.appendChild(b);
+    });
+    function prRender() {
+      prPlan.textContent = PLANS[pi].plan; prFb.textContent = "";
+      prCount.textContent = (pi + 1) + " / " + PLANS.length;
+    }
+    document.getElementById("pr-prev").addEventListener("click", function () { pi = (pi + PLANS.length - 1) % PLANS.length; prRender(); });
+    document.getElementById("pr-next").addEventListener("click", function () { pi = (pi + 1) % PLANS.length; prRender(); });
+    prRender();
+  }
+
+  /* ---------- count vs for_each simulator ---------- */
+  var ORDER = ["dev", "qa", "staging", "prod"], APPLIED = ["dev", "staging", "prod"];
+  var boxes = document.getElementById("cf-boxes"), outC = document.getElementById("cf-count"), outE = document.getElementById("cf-each");
+  if (boxes) {
+    ORDER.forEach(function (e) {
+      var l = document.createElement("label"); l.style.margin = "0";
+      l.innerHTML = '<input type="checkbox" value="' + e + '"' + (APPLIED.indexOf(e) >= 0 ? " checked" : "") + "> " + e;
+      boxes.appendChild(l);
+    });
+    function cfRender() {
+      var want = ORDER.filter(function (e) { return boxes.querySelector('input[value="' + e + '"]').checked; });
+      var c = ["var.envs = " + JSON.stringify(want), ""], add = 0, chg = 0, del = 0, n = Math.max(want.length, APPLIED.length);
+      for (var i = 0; i < n; i++) {
+        var o = APPLIED[i], w = want[i];
+        if (o && w && o === w) c.push("    ns[" + i + "]  no change (" + w + ")");
+        else if (o && w) { c.push("-/+ ns[" + i + "]  reliability-" + o + " -> reliability-" + w + "  # forces replacement"); add++; del++; }
+        else if (o) { c.push("-   ns[" + i + "]  (because index [" + i + "] is out of range for count)"); del++; }
+        else { c.push("+   ns[" + i + "]  reliability-" + w); add++; }
+      }
+      c.push("", "Plan: " + add + " to add, " + chg + " to change, " + del + " to destroy.");
+      var e = ["for_each = " + JSON.stringify(want), ""], a2 = 0, d2 = 0;
+      ORDER.forEach(function (k) {
+        var was = APPLIED.indexOf(k) >= 0, is = want.indexOf(k) >= 0;
+        if (was && is) e.push("    ns[\"" + k + "\"]  no change");
+        else if (was) { e.push("-   ns[\"" + k + "\"]  (because key [\"" + k + "\"] is not in for_each map)"); d2++; }
+        else if (is) { e.push("+   ns[\"" + k + "\"]"); a2++; }
+      });
+      e.push("", "Plan: " + a2 + " to add, 0 to change, " + d2 + " to destroy.");
+      outC.textContent = c.join("\n"); outE.textContent = e.join("\n");
+    }
+    boxes.addEventListener("change", cfRender); cfRender();
+  }
+})();
+</script>
+</body>
+</html>
