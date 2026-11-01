@@ -47,6 +47,11 @@
       <p>A few things to know: <strong>files persist</strong> between Codespace sessions (the filesystem is not reset unless you rebuild the container); <strong>Docker images reset</strong> on a full rebuild (keep your Dockerfiles in the repo so you can re-pull or rebuild instantly); and <strong>forwarded ports</strong> are available in the browser so you can reach your containers without extra tooling.</p>
     </div>
 
+    <div class="callout tip">
+      <span class="label">The Running Project Codebase: labs/reliability-api</span>
+      <p>All labs run against a real, fully-implemented application located directly in this repo at <code>labs/reliability-api/</code>. It contains <code>app/main.py</code> (FastAPI), unit tests (<code>tests/test_main.py</code>), multi-stage and naive Dockerfiles, and <code>compose.yaml</code>. You can build, test, break, and inspect it locally in real time.</p>
+    </div>
+
     <h2>All Labs</h2>
     <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));">
 

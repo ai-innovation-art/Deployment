@@ -54,6 +54,34 @@ Server: Docker Engine - Community
   Storage Driver:   overlay2</span></code></pre>
 
     <!-- ============================================================ -->
+    <h2>0.1 The Test Application: labs/reliability-api</h2>
+    <p>Throughout these labs and experiments, we run the canonical <code>reliability-api</code> application included directly in this repository under <code>labs/reliability-api/</code>. It exposes endpoints designed specifically to demonstrate and trigger container mechanisms.</p>
+
+    <div class="table-wrap"><table>
+      <tr><th>File</th><th>Purpose</th></tr>
+      <tr><td><code>app/main.py</code></td><td>FastAPI service with <code>/health</code>, <code>/ready</code>, <code>/work</code>, <code>/leak</code>, and <code>/metrics</code></td></tr>
+      <tr><td><code>Dockerfile</code></td><td>Multi-stage, pinned, non-root (UID 10001), <code>HEALTHCHECK</code>, exec-form <code>CMD</code></td></tr>
+      <tr><td><code>Dockerfile.naive</code></td><td>Single-stage unoptimized version (used to contrast build cache and image size)</td></tr>
+      <tr><td><code>requirements.txt</code></td><td>FastAPI, Uvicorn, Prometheus client, Pytest, HTTPX</td></tr>
+      <tr><td><code>tests/test_main.py</code></td><td>Unit tests verifying all endpoints and warm-up logic</td></tr>
+      <tr><td><code>compose.yaml</code></td><td>Docker Compose stack running the API alongside a background curl load generator</td></tr>
+    </table></div>
+
+    <pre data-title="Step 1: Inspect the application files"><code>cd labs/reliability-api
+ls -la
+<span class="c"># Verify app/, tests/, Dockerfile, requirements.txt are present</span></code></pre>
+
+    <pre data-title="Step 2: Run the test suite locally (optional, before building)"><code><span class="c"># Install and run pytest to verify endpoints logic</span>
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pytest -v tests/
+<span class="c"># Expected: 6 passed in ~0.5s</span></code></pre>
+
+    <pre data-title="Step 3: Initial build of the container image"><code>docker build -t reliability-api:0.1.0 .
+<span class="c"># Verify the built image</span>
+docker image ls reliability-api:0.1.0</code></pre>
+
+    <!-- ============================================================ -->
     <h2>1. Images</h2>
 
     <h3>Pulling images</h3>
@@ -906,86 +934,246 @@ docker compose build --no-cache</code></pre>
 <span class="c"># ONBUILD COPY . /app  — runs when THIS image is used as a base by another Dockerfile (rare)</span></code></pre>
 
     <!-- ============================================================ -->
-    <h2>8. Common Failure Cases</h2>
+    <h2>8. Hands-On Experiments: Run, Tweak, Break &amp; Diagnose</h2>
+    <p>This section is designed for real-time terminal experimentation on <code>reliability-api</code>. For each scenario: run the baseline command, observe the normal output, tweak one parameter or inject a failure, observe what breaks, and run the diagnostic commands to inspect the exact failure evidence.</p>
 
+    <!-- Experiment 1 -->
     <section class="lab">
-      <header>Works inside, fails outside — missing -p</header>
+      <header>Experiment 1 · Startup Warm-up Delay: Health vs. Readiness</header>
       <div class="body">
-        <p>You run the container, the app starts fine, but <code>curl http://localhost:8000/health</code> from the host returns "connection refused".</p>
-        <ol class="steps">
-          <li>Reproduce: <code>docker run -d --name no-port reliability-api:0.1.0</code> (no <code>-p</code>)</li>
-          <li>From the host: <code>curl http://localhost:8000/health</code> → <code>curl: (7) Failed to connect to localhost port 8000: Connection refused</code></li>
-          <li>Verify the app is actually running inside: <code>docker exec no-port wget -qO- http://localhost:8000/health</code> → <code>{"status":"ok"}</code></li>
-          <li>Fix: <code>docker run -d -p 8000:8000 reliability-api:0.1.0</code></li>
-          <li>Clean up: <code>docker rm -f no-port</code></li>
-        </ol>
-        <p><strong>Root cause:</strong> EXPOSE documents the port but doesn't publish it. Without <code>-p</code>, the port is only reachable from inside Docker networks.</p>
+        <p><strong>Goal:</strong> Observe how readiness differs from liveness, why 503 warm-up windows matter, and how load balancers can send traffic to an unready pod if misconfigured.</p>
+        
+        <p><strong>Step 1 (Baseline — Instant ready):</strong> Run the container with default <code>READY_DELAY_SECONDS=0</code>:</p>
+        <pre data-title="Run baseline container"><code>docker run -d --name exp1 -p 8000:8000 reliability-api:0.1.0</code></pre>
+        <p><strong>What you observe:</strong> Both health and ready endpoints return HTTP 200 immediately:</p>
+        <pre data-title="Observe instant 200"><code>curl -i http://localhost:8000/health
+<span class="o">HTTP/1.1 200 OK
+{"status":"ok"}</span>
+
+curl -i http://localhost:8000/ready
+<span class="o">HTTP/1.1 200 OK
+{"ready":true}</span></code></pre>
+
+        <p><strong>Step 2 (Tweak parameter — Add 15s warm-up delay):</strong> Remove container and pass <code>-e READY_DELAY_SECONDS=15</code>:</p>
+        <pre data-title="Stop and re-run with 15s delay"><code>docker rm -f exp1
+docker run -d --name exp1 -p 8000:8000 -e READY_DELAY_SECONDS=15 reliability-api:0.1.0</code></pre>
+
+        <p><strong>Step 3 (Observe the divergence):</strong> Poll both endpoints in a loop for the first 18 seconds:</p>
+        <pre data-title="Poll loop in bash"><code>for i in $(seq 1 6); do
+  printf '%s  ready=%s  health=%s\n' "$(date +%T)" \
+    "$(curl -s -o /dev/null -w '%{http_code}' localhost:8000/ready)" \
+    "$(curl -s -o /dev/null -w '%{http_code}' localhost:8000/health)"
+  sleep 3
+done</code></pre>
+        <p><strong>What you observe:</strong> During the warm-up window, <code>/health</code> is 200 but <code>/ready</code> is 503!</p>
+        <pre data-title="Observation output"><code><span class="o">11:05:01  ready=503  health=200
+11:05:04  ready=503  health=200
+11:05:07  ready=503  health=200
+11:05:10  ready=503  health=200
+11:05:13  ready=503  health=200
+11:05:16  ready=200  health=200</span></code></pre>
+
+        <p><strong>Step 4 (The Failure Case &amp; Diagnosis):</strong></p>
+        <p>If an orchestrator routes traffic based only on <code>/health</code> (or process running state), clients receive HTTP 503 errors while the app is still warming up. Inspect the 503 body:</p>
+        <pre data-title="Inspect 503 response"><code>curl -s http://localhost:8000/ready
+<span class="o">{"ready":false,"warming_up_seconds_remaining":6.42}</span></code></pre>
+        <p><strong>Clean up:</strong> <code>docker rm -f exp1</code></p>
       </div>
     </section>
 
+    <!-- Experiment 2 -->
     <section class="lab">
-      <header>App starts but nothing reaches it — bound to 127.0.0.1 inside</header>
+      <header>Experiment 2 · PID 1 Signals: Exec Form vs. Shell Form (The 10-Second Delay)</header>
       <div class="body">
-        <p>You add <code>-p 8000:8000</code>, Docker shows the port as mapped, but requests still fail.</p>
-        <ol class="steps">
-          <li>Reproduce: <code>docker run -d -p 8000:8000 --name loopback python:3.12-slim python -m http.server 8000</code> → actually works because Python's http.server binds to <code>0.0.0.0</code> by default, but the failure happens when an app explicitly binds to <code>127.0.0.1</code>.</li>
-          <li>Simulate: <code>docker run -d -p 8000:8000 --name loopback-bad python:3.12-slim python -c "import http.server, socketserver; socketserver.TCPServer(('127.0.0.1', 8000), http.server.SimpleHTTPRequestHandler).serve_forever()"</code></li>
-          <li><code>curl http://localhost:8000</code> → connection refused, even though <code>-p 8000:8000</code> is set.</li>
-          <li><strong>Root cause:</strong> The app is listening on <code>127.0.0.1:8000</code> <em>inside the container</em>. Docker's port mapping arrives on <code>0.0.0.0:8000</code> of the container's network interface, not on loopback. Traffic never reaches <code>127.0.0.1</code>.</li>
-          <li><strong>Fix:</strong> Configure the app to bind to <code>0.0.0.0</code> (all interfaces) inside the container. For uvicorn: <code>--host 0.0.0.0</code>.</li>
-          <li>Clean up: <code>docker rm -f loopback-bad</code></li>
-        </ol>
+        <p><strong>Goal:</strong> Understand why shell form in <code>CMD</code> causes ungraceful SIGKILL shutdowns, 10-second delays, and exit code 137.</p>
+
+        <p><strong>Step 1 (Baseline — Exec form):</strong> Run the default image (uses <code>CMD ["uvicorn", ...]</code>):</p>
+        <pre data-title="Run exec form container"><code>docker run -d --name exp2_fast reliability-api:0.1.0</code></pre>
+        <p>Verify PID 1 inside the container:</p>
+        <pre data-title="Check PID 1"><code>docker exec exp2_fast cat /proc/1/cmdline | tr '\0' ' '
+<span class="o">/opt/venv/bin/python /opt/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000</span></code></pre>
+        <p>Stop the container and time it:</p>
+        <pre data-title="Time docker stop"><code>time docker stop exp2_fast</code></pre>
+        <p><strong>What you observe:</strong> Stops cleanly in under 1 second:</p>
+        <pre data-title="Output"><code><span class="o">real    0m0.6s
+exit=0 (or 143)</span></code></pre>
+
+        <p><strong>Step 2 (Tweak parameter — Override with Shell Form):</strong> Start the container with <code>sh -c "uvicorn ...; echo done"</code> so <code>/bin/sh</code> becomes PID 1:</p>
+        <pre data-title="Run shell form container"><code>docker run -d --name exp2_slow reliability-api:0.1.0 \
+  sh -c 'uvicorn app.main:app --host 0.0.0.0 --port 8000; echo done'</code></pre>
+        <p>Verify who is PID 1 now:</p>
+        <pre data-title="Check PID 1"><code>docker exec exp2_slow cat /proc/1/cmdline | tr '\0' ' '
+<span class="o">sh -c uvicorn app.main:app --host 0.0.0.0 --port 8000; echo done</span></code></pre>
+        <p>Notice that <code>/bin/sh</code> is PID 1, and <code>uvicorn</code> is only a child process.</p>
+
+        <p><strong>Step 3 (Trigger Failure — The 10-Second Hang):</strong> Stop the container and time it:</p>
+        <pre data-title="Time docker stop on shell form"><code>time docker stop exp2_slow</code></pre>
+        <p><strong>What you observe (Failure):</strong> The command freezes for 10 full seconds before exiting!</p>
+        <pre data-title="Output"><code><span class="o">real    0m10.3s</span></code></pre>
+
+        <p><strong>Step 4 (Diagnosis Playbook):</strong> Inspect the container's exit code:</p>
+        <pre data-title="Diagnose exit code"><code>docker inspect -f 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' exp2_slow
+<span class="o">exit=137 oom=false</span></code></pre>
+        <p><strong>Root cause:</strong> Under Linux <code>pid_namespaces(7)</code>, PID 1 ignores any signal for which it has not registered a handler. <code>/bin/sh</code> does not forward SIGTERM to Uvicorn. Docker waits its default 10-second timeout, gives up, and sends SIGKILL (exit 128 + 9 = 137). In Kubernetes, this causes 30s delays per pod on rolling updates!</p>
+
+        <p><strong>Step 5 (Fix without editing Dockerfile — The --init flag):</strong></p>
+        <pre data-title="Run with --init"><code>docker run -d --init --name exp2_fixed reliability-api:0.1.0 \
+  sh -c 'uvicorn app.main:app --host 0.0.0.0 --port 8000; echo done'
+time docker stop exp2_fixed
+<span class="o">real    0m0.4s</span></code></pre>
+        <p><code>--init</code> inserts <code>tini</code> as PID 1, which forwards SIGTERM down to Uvicorn.</p>
+        <p><strong>Clean up:</strong> <code>docker rm -f exp2_fast exp2_slow exp2_fixed 2>/dev/null</code></p>
       </div>
     </section>
 
+    <!-- Experiment 3 -->
     <section class="lab">
-      <header>OOMKill — Exit 137</header>
+      <header>Experiment 3 · Memory Limits, Heap Leak &amp; OOMKill (Exit 137)</header>
       <div class="body">
-        <ol class="steps">
-          <li>Run with a tiny memory limit: <code>docker run -d --name oom-demo --memory 10m python:3.12-slim python -c "x = ' ' * (50 * 1024 * 1024)"</code></li>
-          <li>Check status: <code>docker ps -a --filter name=oom-demo</code> → status: <code>Exited (137)</code></li>
-          <li>Confirm OOMKill: <code>docker inspect --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}' oom-demo</code> → <code>OOMKilled=true ExitCode=137</code></li>
-          <li><strong>Root cause:</strong> Exit 137 = 128 + 9 (SIGKILL signal number). The kernel's OOM killer sends SIGKILL when the container exceeds its memory limit.</li>
-          <li><strong>Fix:</strong> Increase <code>--memory</code> limit, or reduce the application's memory usage.</li>
-          <li>Clean up: <code>docker rm oom-demo</code></li>
-        </ol>
+        <p><strong>Goal:</strong> Trigger an Out-Of-Memory (OOM) kill, distinguish it from a normal kill, and inspect the evidence.</p>
+
+        <p><strong>Step 1 (Baseline — Normal Memory Limit):</strong> Run container with 256 MiB limit:</p>
+        <pre data-title="Run with 256M limit"><code>docker run -d --name exp3 -p 8000:8000 --memory 256m reliability-api:0.1.0</code></pre>
+        <p>Allocate 30 MB using the test endpoint:</p>
+        <pre data-title="Call /leak?mb=30"><code>curl -s "http://localhost:8000/leak?mb=30"
+<span class="o">{"allocated_now_mb":30,"total_held_mb":30}</span></code></pre>
+        <p>Check live resource consumption:</p>
+        <pre data-title="Check stats snapshot"><code>docker stats --no-stream exp3
+<span class="o">NAME    CPU %    MEM USAGE / LIMIT     MEM %
+exp3    0.00%    48.5MiB / 256MiB      18.94%</span></code></pre>
+        <p>Everything runs normally within the 256 MiB boundary.</p>
+
+        <p><strong>Step 2 (Tweak parameter — Constrain to 64 MiB and disable swap):</strong></p>
+        <pre data-title="Re-run with tight 64m limit"><code>docker rm -f exp3
+docker run -d --name exp3_oom -p 8000:8000 --memory 64m --memory-swap 64m reliability-api:0.1.0</code></pre>
+
+        <p><strong>Step 3 (Trigger Failure — Force Heap Allocation beyond Limit):</strong> Call <code>/leak?mb=80</code> to request 80 MB (exceeding the 64 MB ceiling):</p>
+        <pre data-title="Trigger OOM"><code>curl "http://localhost:8000/leak?mb=80"</code></pre>
+        <p><strong>What you observe (Failure):</strong> The connection immediately drops without a response:</p>
+        <pre data-title="Curl failure output"><code><span class="o">curl: (52) Empty reply from server</span></code></pre>
+        <p>Check running containers: <code>docker ps</code> → <code>exp3_oom</code> is no longer running!</p>
+
+        <p><strong>Step 4 (Diagnosis Playbook):</strong> How do you confirm it was killed by OOM and not a Python traceback?</p>
+        <pre data-title="Diagnose OOMKill evidence"><code># 1. Check exit state
+docker ps -a --filter name=exp3_oom --format "table {{.Names}}\t{{.Status}}"
+<span class="o">NAMES       STATUS
+exp3_oom    Exited (137) 5 seconds ago</span>
+
+# 2. Inspect kernel OOM flag
+docker inspect -f 'ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}' exp3_oom
+<span class="o">ExitCode=137 OOMKilled=true</span></code></pre>
+        <p>Notice: <code>OOMKilled=true</code> proves the Linux kernel cgroup killer sent SIGKILL. Look at the logs: <code>docker logs exp3_oom</code>. No Python exception or traceback appears because the process was killed instantly at the syscall level.</p>
+        <p><strong>Clean up:</strong> <code>docker rm -f exp3_oom</code></p>
       </div>
     </section>
 
+    <!-- Experiment 4 -->
     <section class="lab">
-      <header>Slow docker stop (10 seconds) — shell as PID 1</header>
+      <header>Experiment 4 · CPU Throttling vs. Crashing (Soft Throttle vs Hard Ceiling)</header>
       <div class="body">
-        <p>See the <a href="#s-9-stop-kill-pause-unpause">stop / kill / pause / unpause</a> section above for the full experiment. Summary:</p>
-        <ol class="steps">
-          <li>Shell-form CMD → <code>/bin/sh</code> is PID 1 → SIGTERM goes to sh → sh doesn't forward to child → Docker waits 10s → SIGKILL.</li>
-          <li>Exec-form CMD → your binary IS PID 1 → SIGTERM received → clean shutdown in &lt;1s.</li>
-          <li>Fix: use exec form in Dockerfile, or use <code>--init</code> to insert tini.</li>
-        </ol>
+        <p><strong>Goal:</strong> Prove that exceeding CPU quota never kills a process (unlike memory). It only throttles execution bandwidth.</p>
+
+        <p><strong>Step 1 (Baseline — Unconstrained CPU):</strong> Run container and measure latency of 200 ms of CPU-intensive computation:</p>
+        <pre data-title="Run container"><code>docker run -d --name exp4 -p 8000:8000 reliability-api:0.1.0</code></pre>
+        <pre data-title="Measure baseline latency"><code>curl -s -o /dev/null -w 'wall_time=%{time_total}s\n' 'http://localhost:8000/work?ms=200'
+<span class="o">wall_time=0.21s</span></code></pre>
+
+        <p><strong>Step 2 (Tweak parameter — Constrain to 0.5 CPU core):</strong> Re-run with <code>--cpus 0.5</code>:</p>
+        <pre data-title="Re-run with 0.5 CPU limit"><code>docker rm -f exp4
+docker run -d --name exp4 -p 8000:8000 --cpus 0.5 reliability-api:0.1.0</code></pre>
+
+        <p><strong>Step 3 (Observe Throttling):</strong> Call the same 200 ms CPU burn:</p>
+        <pre data-title="Measure throttled latency"><code>curl -s -o /dev/null -w 'wall_time=%{time_total}s\n' 'http://localhost:8000/work?ms=200'
+<span class="o">wall_time=0.41s</span></code></pre>
+        <p><strong>What you observe:</strong> Wall time doubled to ~0.41s!</p>
+
+        <p><strong>Step 4 (Diagnosis Playbook):</strong></p>
+        <pre data-title="Inspect container health"><code>docker ps --filter name=exp4
+<span class="o">Up 20 seconds</span></code></pre>
+        <p>The container did <strong>not</strong> crash. In Linux cgroups, <code>--cpus 0.5</code> sets a quota of 50,000 µs per 100,000 µs CFS period. The process gets suspended when its quota runs out and resumed in the next period. Memory limit = fatal kill; CPU limit = latency stretch.</p>
+        <p><strong>Clean up:</strong> <code>docker rm -f exp4</code></p>
       </div>
     </section>
 
+    <!-- Experiment 5 -->
     <section class="lab">
-      <header>Permission denied — non-root container (expected behavior)</header>
+      <header>Experiment 5 · Network Isolation &amp; Embedded DNS (Why Default Bridge Fails)</header>
       <div class="body">
-        <ol class="steps">
-          <li>Run as a non-root user and try to bind port 80 (privileged port, requires root): <code>docker run --rm --user 1000 python:3.12-slim python -m http.server 80</code> → <code>PermissionError: [Errno 13] Permission denied</code></li>
-          <li><strong>Root cause:</strong> Ports below 1024 require the <code>CAP_NET_BIND_SERVICE</code> capability. Non-root users don't have it by default.</li>
-          <li>Fix options: (a) use a port ≥ 1024 inside the container and map it with <code>-p 80:8000</code>, or (b) add the capability: <code>--cap-add NET_BIND_SERVICE</code>.</li>
-          <li>This is <em>expected and correct behavior</em> — non-root containers are more secure.</li>
-        </ol>
+        <p><strong>Goal:</strong> Understand why container name DNS resolution fails on the default bridge and works on user-defined networks.</p>
+
+        <p><strong>Step 1 (The Failure on Default Bridge):</strong> Start a container on the default bridge (no <code>--network</code> flag):</p>
+        <pre data-title="Start server on default bridge"><code>docker run -d --name srv_default reliability-api:0.1.0</code></pre>
+        <p>Try to reach it by name from a client container:</p>
+        <pre data-title="Client attempts to reach srv_default by name"><code>docker run --rm curlimages/curl curl -s http://srv_default:8000/health</code></pre>
+        <p><strong>What you observe (Failure):</strong></p>
+        <pre data-title="DNS failure output"><code><span class="o">curl: (6) Could not resolve host: srv_default</span></code></pre>
+        <p>On the default bridge network, Docker does <strong>not</strong> provide container name DNS resolution.</p>
+
+        <p><strong>Step 2 (Tweak parameter — Create User-Defined Bridge):</strong></p>
+        <pre data-title="Create custom bridge network"><code>docker network create lab-net</code></pre>
+
+        <p><strong>Step 3 (Run on Custom Network):</strong> Start the server attached to <code>lab-net</code>:</p>
+        <pre data-title="Start server on lab-net"><code>docker run -d --name srv_custom --network lab-net reliability-api:0.1.0</code></pre>
+        <p>Now query from a client attached to <code>lab-net</code>:</p>
+        <pre data-title="Query via DNS"><code>docker run --rm --network lab-net curlimages/curl curl -s http://srv_custom:8000/health
+<span class="o">{"status":"ok"}</span></code></pre>
+        <p><strong>What you observe (Success):</strong> It resolves instantly by container name! Notice also: <strong>no <code>-p</code> flag was required</strong>. Container-to-container traffic inside the same Docker network flows directly.</p>
+
+        <p><strong>Step 4 (Diagnosis Playbook — Inspect Embedded DNS):</strong> Check where DNS queries go inside a user-defined network:</p>
+        <pre data-title="Inspect resolv.conf"><code>docker run --rm --network lab-net alpine cat /etc/resolv.conf
+<span class="o">nameserver 127.0.0.11
+options ndots:0</span></code></pre>
+        <p><code>127.0.0.11</code> is Docker's internal embedded DNS server. It resolves container names to their internal IP addresses.</p>
+        <p><strong>Clean up:</strong> <code>docker rm -f srv_default srv_custom && docker network rm lab-net</code></p>
       </div>
     </section>
 
+    <!-- Experiment 6 -->
     <section class="lab">
-      <header>Image delete with running container</header>
+      <header>Experiment 6 · Build Cache Cascade: Optimized vs. Naive Dockerfile</header>
       <div class="body">
-        <ol class="steps">
-          <li>Run a container: <code>docker run -d --name img-del-test nginx:alpine</code></li>
-          <li>Try to remove the image: <code>docker rmi nginx:alpine</code> → <code>Error response from daemon: conflict: unable to remove repository reference "nginx:alpine" … container img-del-test is using its referenced image</code></li>
-          <li>Force-remove the image: <code>docker rmi -f nginx:alpine</code> → the tag is removed, the container keeps running (image data still referenced by the container).</li>
-          <li>Verify container still works: <code>docker exec img-del-test nginx -v</code> → still works!</li>
-          <li>The bytes are freed only after: <code>docker rm -f img-del-test</code></li>
-        </ol>
+        <p><strong>Goal:</strong> Experience firsthand why instruction order decides whether a code edit takes 0.5s or 35s to build.</p>
+
+        <p><strong>Step 1 (Baseline — Optimized Multi-Stage Dockerfile):</strong> Build the image from <code>labs/reliability-api/</code>:</p>
+        <pre data-title="Initial build"><code>cd labs/reliability-api
+docker build -t cache-good:1.0 .</code></pre>
+        <p>Now simulate editing application code by adding a comment to <code>app/main.py</code>:</p>
+        <pre data-title="Edit code"><code>echo "# test comment" >> app/main.py
+docker build --progress=plain -t cache-good:1.0 . 2>&1 | grep -E 'CACHED|DONE'</code></pre>
+        <p><strong>What you observe:</strong> The builder stage and its slow <code>pip install</code> step stay <code>CACHED</code>! Only the single <code>COPY app/ ./app/</code> step re-runs. Build finishes in &lt; 1 second.</p>
+
+        <p><strong>Step 2 (The Naive Mistake — Dockerfile.naive):</strong> Inspect <code>Dockerfile.naive</code> where <code>COPY . .</code> comes before <code>RUN pip install</code>:</p>
+        <pre data-title="Build naive image"><code>docker build -f Dockerfile.naive -t cache-bad:1.0 .</code></pre>
+        <p>Now make the exact same 1-line edit to <code>app/main.py</code>:</p>
+        <pre data-title="Edit code again and rebuild naive"><code>echo "# test comment 2" >> app/main.py
+time docker build -f Dockerfile.naive -t cache-bad:1.0 .</code></pre>
+        <p><strong>What you observe (The Pain):</strong></p>
+        <pre data-title="Output"><code><span class="o">Step 4/5 : RUN pip install -r requirements.txt
+---> Running in e4f1a2...
+Collecting fastapi...
+real    0m28.4s</span></code></pre>
+        <p><strong>Diagnosis:</strong> Because <code>COPY . .</code> copied <code>app/main.py</code> <em>before</em> <code>pip install</code>, Docker detected a checksum change on that layer and invalidated every layer below it. Always copy dependency manifests first, install, and copy source code last.</p>
+      </div>
+    </section>
+
+    <!-- Experiment 7 -->
+    <section class="lab">
+      <header>Experiment 7 · Non-Root Security &amp; Code Immutability</header>
+      <div class="body">
+        <p><strong>Goal:</strong> Verify that the running application runs as non-root (UID 10001) and cannot alter its own source code on disk.</p>
+
+        <p><strong>Step 1 (Verify Non-Root Identity):</strong> Run container and inspect UID:</p>
+        <pre data-title="Run and check user ID"><code>docker run -d --name exp7 reliability-api:0.1.0
+docker exec exp7 id
+<span class="o">uid=10001(app) gid=10001(app) groups=10001(app)</span></code></pre>
+        <p>UID 10001 guarantees the process is unprivileged both inside the container and to the host kernel.</p>
+
+        <p><strong>Step 2 (Tamper Simulation — Try modifying code):</strong> Attempt to modify or create a file in the app directory:</p>
+        <pre data-title="Attempt file write"><code>docker exec exp7 touch /app/app/malicious.py</code></pre>
+        <p><strong>What you observe (Security in Action):</strong></p>
+        <pre data-title="Output"><code><span class="o">touch: cannot touch '/app/app/malicious.py': Permission denied</span></code></pre>
+        <p><strong>Diagnosis:</strong> The Dockerfile copied <code>app/</code> while running as <code>root</code> before switching to <code>USER 10001:10001</code>. The source files are owned by UID 0 (root) and read-only to user <code>app</code>. If an attacker gains remote execution inside the application, they cannot modify the running codebase or plant persistent backdoors.</p>
+        <p><strong>Clean up:</strong> <code>docker rm -f exp7</code></p>
       </div>
     </section>
 

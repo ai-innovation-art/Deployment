@@ -1,0 +1,23 @@
+# VCS and local environments
+.git
+.gitignore
+.venv
+venv/
+
+# Python byproducts
+**/__pycache__
+**/*.pyc
+.pytest_cache/
+
+# Secrets and local config — never send to builder
+.env
+*.env
+*.pem
+*.key
+
+# Tests and documentation
+tests/
+README.md
+Dockerfile*
+.dockerignore
+compose*.yaml

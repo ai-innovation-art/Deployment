@@ -1,0 +1,25 @@
+services:
+  reliability-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: reliability-api:0.1.0
+    container_name: reliability-api
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      LOG_LEVEL: info
+      READY_DELAY_SECONDS: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  loadgen:
+    image: curlimages/curl:latest
+    container_name: loadgen
+    depends_on:
+      reliability-api:
+        condition: service_healthy
+    entrypoint: ["sh", "-c", "while true; do curl -s 'http://reliability-api:8000/work?ms=50'; echo; sleep 1; done"]
