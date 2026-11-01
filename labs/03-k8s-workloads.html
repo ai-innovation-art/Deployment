@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 03 · Kubernetes Architecture &amp; Workloads — DevOps Lab</title>
+<link rel="stylesheet" href="../notes-animated/assets/style.css">
+<script src="../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../index.html">DevOps Lab</a>
+  <span class="crumb">Labs · Module 03 &amp; 04 · Kubernetes Architecture &amp; Workloads</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+    <h1>Lab 03 · Kubernetes Architecture &amp; Workloads</h1>
+    <p class="lede">Hands-on lab guide for Modules 03 &amp; 04 — you will build a multi-node kind cluster, run <code>reliability-api</code> as a bare Pod then a Deployment, trigger self-healing, tune health probes, set resource requests and limits, perform rolling updates and rollbacks, and master namespaces, labels and selectors. Every experiment is designed to break things on purpose and teach you how to read the wreckage.</p>
+    <div class="meta">
+      <span class="pill accent">Prereq: Lab 02 — Docker</span>
+      <span class="pill">≈ 5–7 h lab</span>
+      <span class="pill">kind v0.33 · kubectl v1.31+</span>
+      <span class="verified">✓ Checked against kubernetes.io · Nov 2026</span>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>0. Prerequisites &amp; Local Cluster Setup</h2>
+
+    <p>All Kubernetes labs run on a <strong>kind</strong> (Kubernetes IN Docker) cluster. kind creates real Kubernetes nodes as Docker containers on your machine — no cloud account required. You need Docker running and two CLI tools: <code>kind</code> and <code>kubectl</code>.</p>
+
+    <div class="callout note">
+      <span class="label">Why kind?</span>
+      <p>kind uses the same real kubelet, kube-apiserver, CoreDNS and kube-proxy as production clusters. Your YAML, probes and Services behave identically. A cluster takes ~60 seconds to create and costs nothing. You can afford to break it — and that's the point.</p>
+    </div>
+
+    <h3>Install kind &amp; kubectl</h3>
+
+    <pre data-title="Install kind (Linux/macOS via Homebrew or direct binary)"><code><span class="c"># macOS / Linux via Homebrew</span>
+brew install kind kubectl
+
+<span class="c"># Linux — direct binary (AMD64)</span>
+curl -Lo kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+chmod +x kind && sudo mv kind /usr/local/bin/kind
+
+<span class="c"># Windows — via Winget or Chocolatey</span>
+winget install Kubernetes.kind
+winget install Kubernetes.kubectl
+
+<span class="c"># Verify both tools are installed</span>
+kind version
+kubectl version --client</code></pre>
+
+    <h3>Load the reliability-api image into kind</h3>
+
+    <div class="callout warn">
+      <span class="label">imagePullPolicy trap</span>
+      <p>kind nodes have their own <strong>separate</strong> container image store (containerd inside each node container). <code>docker build</code> places the image in the Docker daemon — not inside kind. You must explicitly load the image, then use <code>imagePullPolicy: IfNotPresent</code> so the kubelet uses the loaded image instead of trying to pull from Docker Hub.</p>
+    </div>
+
+    <pre data-title="Pull or load the reliability-api image into kind"><code><span class="c"># Option A: pull from Docker Hub (requires internet)</span>
+docker pull kumawatsunil/reliability-api:0.1.0
+
+<span class="c"># Option B: build locally from the repo</span>
+cd labs/reliability-api
+docker build -t kumawatsunil/reliability-api:0.1.0 .
+
+<span class="c"># Load the image into EVERY kind node (run after cluster is created)</span>
+kind load docker-image kumawatsunil/reliability-api:0.1.0 --name reliability-lab</code></pre>
+
+    <h3>Create the multi-node cluster</h3>
+
+    <pre data-title="labs/k8s-reliability/kind-config.yaml"><code><span class="k">kind</span>: <span class="s">Cluster</span>
+<span class="k">apiVersion</span>: <span class="s">kind.x-k8s.io/v1alpha4</span>
+<span class="k">name</span>: <span class="s">reliability-lab</span>
+<span class="k">nodes</span>:
+  - <span class="k">role</span>: <span class="s">control-plane</span>
+    <span class="k">extraPortMappings</span>:
+      - <span class="k">containerPort</span>: <span class="s">80</span>
+        <span class="k">hostPort</span>: <span class="s">80</span>
+        <span class="k">protocol</span>: <span class="s">TCP</span>
+      - <span class="k">containerPort</span>: <span class="s">443</span>
+        <span class="k">hostPort</span>: <span class="s">443</span>
+        <span class="k">protocol</span>: <span class="s">TCP</span>
+  - <span class="k">role</span>: <span class="s">worker</span>
+  - <span class="k">role</span>: <span class="s">worker</span></code></pre>
+
+    <pre data-title="Create the cluster"><code><span class="c"># Create — takes ~60 seconds</span>
+kind create cluster --config labs/k8s-reliability/kind-config.yaml
+
+<span class="c"># Verify three nodes are Ready</span>
+kubectl get nodes -o wide
+
+<span class="c"># Expected: 1 control-plane + 2 workers, STATUS=Ready</span>
+<span class="o">NAME                            STATUS   ROLES           AGE   VERSION
+reliability-lab-control-plane   Ready    control-plane   90s   v1.31.0
+reliability-lab-worker          Ready    &lt;none&gt;          75s   v1.31.0
+reliability-lab-worker2         Ready    &lt;none&gt;          75s   v1.31.0</span>
+
+<span class="c"># Load the app image into every node</span>
+kind load docker-image kumawatsunil/reliability-api:0.1.0 --name reliability-lab</code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 0 · Cluster Setup</strong></header>
+      <ol class="steps">
+        <li>Install <code>kind</code> and <code>kubectl</code> for your OS.</li>
+        <li>Run <code>kind create cluster --config labs/k8s-reliability/kind-config.yaml</code>.</li>
+        <li>Run <code>kubectl get nodes -o wide</code> — confirm STATUS=<code>Ready</code> for all 3 nodes.</li>
+        <li>Run <code>kind load docker-image kumawatsunil/reliability-api:0.1.0 --name reliability-lab</code>.</li>
+        <li><strong>Trial &amp; Error:</strong> Try applying a manifest <em>before</em> loading the image (set <code>imagePullPolicy: Always</code>). The pod will go <code>ErrImagePull</code>. Fix by loading the image and setting <code>imagePullPolicy: IfNotPresent</code>.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>1. Control Plane Architecture</h2>
+
+    <p>A Kubernetes cluster is divided into two tiers: the <strong>control plane</strong> (the brain) and the <strong>worker nodes</strong> (the muscle). Every action you take with <code>kubectl</code> goes to the control plane, which then figures out what to tell the nodes.</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Component</th><th>Runs on</th><th>Responsibility</th><th>What breaks when it's down</th></tr></thead>
+      <tbody>
+        <tr><td><code>kube-apiserver</code></td><td>Control plane</td><td>The single front door for all operations. All reads and writes go through it (kubectl, controllers, kubelet). Validates and persists objects to etcd.</td><td>Nothing can be created, deleted or updated. Running pods continue running.</td></tr>
+        <tr><td><code>etcd</code></td><td>Control plane</td><td>Distributed key-value store — the only persistent store for cluster state. Every object (Pod, Deployment, ConfigMap…) lives here.</td><td>Total cluster amnesia. If you lose etcd without a backup, you lose the cluster.</td></tr>
+        <tr><td><code>kube-scheduler</code></td><td>Control plane</td><td>Watches for newly-created Pods with no node assigned. Picks a node (filter → score) and writes the decision to the Pod's <code>spec.nodeName</code> via the API server.</td><td>New pods get stuck in <code>Pending</code> forever. Running pods are unaffected.</td></tr>
+        <tr><td><code>kube-controller-manager</code></td><td>Control plane</td><td>Runs all the built-in controllers (ReplicaSet, Deployment, Node, Endpoints…). Each controller watches desired state vs actual state and reconciles.</td><td>Self-healing stops. Deleted pods are not replaced. ReplicaSets drift from desired count.</td></tr>
+        <tr><td><code>kubelet</code></td><td>Every node</td><td>The node agent. Watches for Pods assigned to its node. Starts and stops containers via the CRI (containerd). Runs health probes. Reports status back to API server.</td><td>Pods on that node stop being managed. New pods can't start on it.</td></tr>
+        <tr><td><code>kube-proxy</code></td><td>Every node</td><td>Maintains iptables/IPVS rules on each node so Service virtual IPs are reachable and traffic is load-balanced to ready pods.</td><td>Service routing breaks on that node. ClusterIP services become unreachable.</td></tr>
+        <tr><td><code>CoreDNS</code></td><td>Control plane (pod)</td><td>Cluster DNS server. Resolves <code>service.namespace.svc.cluster.local</code> names to ClusterIP addresses.</td><td>DNS-based service discovery fails. Pod-to-pod IP still works.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>The reconciliation loop</h3>
+    <p>Every controller in Kubernetes runs the same fundamental loop: <strong>observe → diff → act</strong>. The ReplicaSet controller, for example, reads the desired replica count from the spec, counts how many pods matching its selector currently exist, and creates or deletes pods until the counts match. This loop runs continuously — so even if you make a change by hand, the controller will revert it.</p>
+
+    <pre data-title="Peek at the control plane components live"><code><span class="c"># Control plane pods live in the kube-system namespace</span>
+kubectl get pods -n kube-system
+
+<span class="o">NAME                                                    READY   STATUS    RESTARTS
+coredns-7db6d8ff4d-4j2gp                                1/1     Running   0
+coredns-7db6d8ff4d-bx7wt                                1/1     Running   0
+etcd-reliability-lab-control-plane                      1/1     Running   0
+kube-apiserver-reliability-lab-control-plane            1/1     Running   0
+kube-controller-manager-reliability-lab-control-plane   1/1     Running   0
+kube-proxy-bj5xn                                        1/1     Running   0
+kube-scheduler-reliability-lab-control-plane            1/1     Running   0</span>
+
+<span class="c"># Check the scheduler's logs — every placement decision is logged here</span>
+kubectl logs -n kube-system kube-scheduler-reliability-lab-control-plane | tail -20
+
+<span class="c"># Inspect node details — capacity, conditions, OS info</span>
+kubectl describe node reliability-lab-worker</code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 1 · Control Plane</strong></header>
+      <ol class="steps">
+        <li>Run <code>kubectl get pods -n kube-system</code> — identify all six control-plane components.</li>
+        <li>Run <code>kubectl describe node reliability-lab-worker</code> and find the <em>Allocatable</em> CPU and memory.</li>
+        <li><strong>Trial &amp; Error (read-only):</strong> Check what <code>kubectl get componentstatuses</code> returns (deprecated in newer k8s but still informative).</li>
+        <li>Run <code>kubectl get events -n kube-system --sort-by='.lastTimestamp'</code> — find the Scheduled event for the CoreDNS pod. Which node was it placed on?</li>
+        <li>Check etcd health: <code>kubectl exec -n kube-system etcd-reliability-lab-control-plane -- etcdctl endpoint health --endpoints=https://127.0.0.1:2379 --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/etcd/server.crt --key /etc/kubernetes/pki/etcd/server.key</code></li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>2. First Pod</h2>
+
+    <p>A <strong>Pod</strong> is the smallest deployable unit in Kubernetes. It wraps one or more containers that share a network namespace (same IP address, same <code>localhost</code>) and optionally share volumes. Kubernetes schedules, starts, and monitors Pods — but a bare Pod has no self-healing; if it dies, it stays dead.</p>
+
+    <pre data-title="labs/k8s-reliability/01-pod.yaml"><code><span class="k">apiVersion</span>: <span class="s">v1</span>
+<span class="k">kind</span>: <span class="s">Pod</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">reliability-api-pod</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+  <span class="k">labels</span>:
+    <span class="k">app.kubernetes.io/name</span>: <span class="s">reliability-api</span>
+    <span class="k">env</span>: <span class="s">lab</span>
+<span class="k">spec</span>:
+  <span class="k">containers</span>:
+    - <span class="k">name</span>: <span class="s">reliability-api</span>
+      <span class="k">image</span>: <span class="s">kumawatsunil/reliability-api:0.1.0</span>
+      <span class="k">imagePullPolicy</span>: <span class="s">IfNotPresent</span>  <span class="c"># use the image we loaded into kind</span>
+      <span class="k">ports</span>:
+        - <span class="k">containerPort</span>: <span class="s">8000</span>
+      <span class="k">env</span>:
+        - <span class="k">name</span>: <span class="s">LOG_LEVEL</span>
+          <span class="k">value</span>: <span class="s">"info"</span>
+        - <span class="k">name</span>: <span class="s">READY_DELAY_SECONDS</span>
+          <span class="k">value</span>: <span class="s">"5"</span>
+      <span class="k">resources</span>:
+        <span class="k">requests</span>:
+          <span class="k">cpu</span>: <span class="s">"100m"</span>
+          <span class="k">memory</span>: <span class="s">"128Mi"</span>
+        <span class="k">limits</span>:
+          <span class="k">memory</span>: <span class="s">"256Mi"</span></code></pre>
+
+    <pre data-title="Apply, inspect, and debug the Pod"><code><span class="c"># Apply the pod manifest</span>
+kubectl apply -f labs/k8s-reliability/01-pod.yaml
+
+<span class="c"># Watch the pod until it's Running</span>
+kubectl get pods -w
+
+<span class="o">NAME                  READY   STATUS    RESTARTS   AGE
+reliability-api-pod   0/1     Pending   0          2s
+reliability-api-pod   0/1     ContainerCreating   0   4s
+reliability-api-pod   1/1     Running   0          12s</span>
+
+<span class="c"># Describe — most useful debugging command you will ever use</span>
+kubectl describe pod reliability-api-pod
+
+<span class="c"># Read the application logs</span>
+kubectl logs reliability-api-pod
+kubectl logs reliability-api-pod -f   <span class="c"># follow</span>
+
+<span class="c"># Execute a shell command inside the running container</span>
+kubectl exec -it reliability-api-pod -- sh
+
+<span class="c"># Inside the container — hit the health and ready endpoints</span>
+<span class="c"># wget is available; curl is usually not in minimal images</span>
+wget -qO- http://localhost:8000/health
+wget -qO- http://localhost:8000/ready
+exit
+
+<span class="c"># Port-forward to access the pod from your laptop</span>
+kubectl port-forward pod/reliability-api-pod 8080:8000 &amp;
+curl http://localhost:8080/health</code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 2 · First Pod</strong></header>
+      <ol class="steps">
+        <li>Apply <code>01-pod.yaml</code> and watch it reach <code>Running</code> state.</li>
+        <li>Run <code>kubectl describe pod reliability-api-pod</code> — find the <em>Events</em> section. What events fired? What node was it scheduled to?</li>
+        <li>Run <code>kubectl logs reliability-api-pod</code> — read the startup log lines from uvicorn.</li>
+        <li>Exec into the pod with <code>kubectl exec -it reliability-api-pod -- sh</code> and run <code>wget -qO- localhost:8000/health</code>.</li>
+        <li>Port-forward and hit <code>/ready</code> — is it ready? If not, wait the <code>READY_DELAY_SECONDS</code> delay and try again.</li>
+        <li><strong>Trial &amp; Error:</strong> Change the image to <code>kumawatsunil/reliability-api:does-not-exist</code> (with <code>imagePullPolicy: Always</code>), apply, and observe the <code>ErrImagePull</code> → <code>ImagePullBackOff</code> progression. Fix it and re-apply.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>3. Why Raw Pods Are Dangerous</h2>
+
+    <p>A bare Pod has <strong>no owner</strong>. When it dies — whether because the process crashed, the node rebooted, or you deleted it by accident — Kubernetes does nothing. There is no controller watching it. This section proves it, then shows how a ReplicaSet fixes it.</p>
+
+    <div class="callout warn">
+      <span class="label">Never run bare Pods in production</span>
+      <p>Bare Pods are fine for one-off debugging. For anything that needs to stay running, use a Deployment (which manages a ReplicaSet, which manages Pods). The ownership chain is <em>Deployment → ReplicaSet → Pod</em>.</p>
+    </div>
+
+    <pre data-title="Prove that a bare Pod does NOT self-heal"><code><span class="c"># Delete the pod manually — simulates a crash</span>
+kubectl delete pod reliability-api-pod
+
+<span class="c"># Check — the pod is gone and NOT replaced</span>
+kubectl get pods
+<span class="o">No resources found in default namespace.</span>
+
+<span class="c"># There is no ReplicaSet watching it — nothing to bring it back</span>
+kubectl get replicasets
+<span class="o">No resources found in default namespace.</span></code></pre>
+
+    <pre data-title="A ReplicaSet ensures exactly N pods always exist"><code><span class="c"># Create a standalone ReplicaSet (for understanding only — normally Deployments manage these)</span>
+kubectl create deployment rs-demo --image=kumawatsunil/reliability-api:0.1.0 --replicas=2 --dry-run=client -o yaml \
+  | sed 's/kind: Deployment/kind: ReplicaSet/' \
+  | kubectl apply -f -
+
+<span class="c"># Or just apply the full deployment — it creates a ReplicaSet automatically</span>
+kubectl apply -f labs/k8s-reliability/02-deployment.yaml
+
+<span class="c"># Watch the pods appear</span>
+kubectl get pods -w
+
+<span class="c"># Find the ReplicaSet the Deployment created</span>
+kubectl get replicasets
+<span class="o">NAME                        DESIRED   CURRENT   READY   AGE
+reliability-api-7d4b95cbc   3         3         3       45s</span>
+
+<span class="c"># Delete one pod — watch the ReplicaSet immediately create a replacement</span>
+POD=$(kubectl get pods -l app.kubernetes.io/name=reliability-api -o name | head -1)
+kubectl delete $POD
+kubectl get pods -w   <span class="c"># A new pod appears within seconds</span></code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 3 · Self-Healing Proof</strong></header>
+      <ol class="steps">
+        <li>Apply <code>01-pod.yaml</code>. Delete it with <code>kubectl delete pod reliability-api-pod</code>. Confirm it is gone and NOT replaced.</li>
+        <li>Apply <code>02-deployment.yaml</code>. Identify the ReplicaSet with <code>kubectl get rs</code>.</li>
+        <li>Delete one pod. Watch <code>kubectl get pods -w</code> in a second terminal. How long does it take for the replacement to reach <code>Running</code>?</li>
+        <li><strong>Trial &amp; Error:</strong> Try to delete the ReplicaSet directly: <code>kubectl delete rs &lt;name&gt;</code>. What happens? The Deployment controller immediately recreates it.</li>
+        <li>Read the ReplicaSet events: <code>kubectl describe rs</code> — find the <em>SuccessfulCreate</em> events showing the controller made new pods.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>4. Deployments</h2>
+
+    <p>A <strong>Deployment</strong> adds a versioning layer on top of a ReplicaSet. When you update the pod template (e.g., new image version), the Deployment creates a <em>new</em> ReplicaSet and gradually shifts traffic to it while scaling down the old one. It also remembers the history, so you can roll back to any previous revision.</p>
+
+    <pre data-title="Explore the Deployment"><code><span class="c"># Apply the deployment (if not already applied)</span>
+kubectl apply -f labs/k8s-reliability/02-deployment.yaml
+
+<span class="c"># List deployments — shows READY count vs desired</span>
+kubectl get deployments
+<span class="o">NAME              READY   UP-TO-DATE   AVAILABLE   AGE
+reliability-api   3/3     3            3           2m</span>
+
+<span class="c"># Get the full status with rollout history</span>
+kubectl rollout status deployment/reliability-api
+<span class="o">deployment "reliability-api" successfully rolled out</span>
+
+<span class="c"># Scale up to 5 replicas</span>
+kubectl scale deployment reliability-api --replicas=5
+kubectl get pods -w   <span class="c"># 2 new pods start immediately</span>
+
+<span class="c"># Scale back down</span>
+kubectl scale deployment reliability-api --replicas=3
+
+<span class="c"># Prove self-healing at the Deployment level</span>
+<span class="c"># Delete ALL pods — the Deployment will recreate all 3</span>
+kubectl delete pods -l app.kubernetes.io/name=reliability-api
+kubectl get pods -w   <span class="c"># Watch 3 new pods appear</span></code></pre>
+
+    <pre data-title="Annotated Deployment YAML — key fields explained"><code><span class="k">spec</span>:
+  <span class="k">replicas</span>: <span class="s">3</span>
+  <span class="k">selector</span>:            <span class="c"># immutable — must match pod template labels</span>
+    <span class="k">matchLabels</span>:
+      <span class="k">app.kubernetes.io/name</span>: <span class="s">reliability-api</span>
+  <span class="k">strategy</span>:
+    <span class="k">type</span>: <span class="s">RollingUpdate</span>
+    <span class="k">rollingUpdate</span>:
+      <span class="k">maxSurge</span>: <span class="s">1</span>         <span class="c"># allow 4 pods total (3+1) during rollout</span>
+      <span class="k">maxUnavailable</span>: <span class="s">0</span>   <span class="c"># never drop below 3 ready pods</span></code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 4 · Deployments</strong></header>
+      <ol class="steps">
+        <li>Apply <code>02-deployment.yaml</code>. Confirm 3/3 READY.</li>
+        <li>Scale to 5: <code>kubectl scale deployment reliability-api --replicas=5</code>. Watch new pods appear on both workers.</li>
+        <li>Delete all pods at once: <code>kubectl delete pods -l app.kubernetes.io/name=reliability-api</code>. Watch them all come back. Time it.</li>
+        <li>Run <code>kubectl get pods -o wide</code> — are pods spread across both workers? (topologySpreadConstraints in the manifest enforces this.)</li>
+        <li><strong>Trial &amp; Error:</strong> Try to edit the Deployment selector: <code>kubectl edit deployment reliability-api</code> and change a selector label. Kubernetes should reject this with a validation error.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>5. Health Probes</h2>
+
+    <p>Kubernetes has three probe types, each answering a different question and taking a different action on failure:</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Probe</th><th>Question</th><th>On failure (after <code>failureThreshold</code>)</th><th>reliability-api endpoint</th></tr></thead>
+      <tbody>
+        <tr><td><strong>startupProbe</strong></td><td>Has the app finished starting?</td><td>Kill and restart container. While pending, <em>liveness and readiness are blocked</em>.</td><td><code>/health</code></td></tr>
+        <tr><td><strong>livenessProbe</strong></td><td>Is the process stuck in a broken state?</td><td>Kill and restart the container (same Pod, RESTARTS counter +1).</td><td><code>/health</code></td></tr>
+        <tr><td><strong>readinessProbe</strong></td><td>Should this Pod receive traffic now?</td><td>Mark Pod <code>Ready=False</code> → remove its IP from Service endpoints. <strong>No restart.</strong></td><td><code>/ready</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <pre data-title="Probe configuration in 02-deployment.yaml"><code><span class="k">startupProbe</span>:           <span class="c"># gates the other two probes until success</span>
+  <span class="k">httpGet</span>:
+    <span class="k">path</span>: <span class="s">/health</span>
+    <span class="k">port</span>: <span class="s">8000</span>
+  <span class="k">failureThreshold</span>: <span class="s">30</span>  <span class="c"># 30 × 3s = 90 seconds to start</span>
+  <span class="k">periodSeconds</span>: <span class="s">3</span>
+<span class="k">livenessProbe</span>:
+  <span class="k">httpGet</span>:
+    <span class="k">path</span>: <span class="s">/health</span>
+    <span class="k">port</span>: <span class="s">8000</span>
+  <span class="k">periodSeconds</span>: <span class="s">10</span>
+  <span class="k">failureThreshold</span>: <span class="s">3</span>   <span class="c"># restart after 3 × 10s = 30s of failure</span>
+  <span class="k">timeoutSeconds</span>: <span class="s">2</span>
+<span class="k">readinessProbe</span>:
+  <span class="k">httpGet</span>:
+    <span class="k">path</span>: <span class="s">/ready</span>
+    <span class="k">port</span>: <span class="s">8000</span>
+  <span class="k">periodSeconds</span>: <span class="s">5</span>
+  <span class="k">failureThreshold</span>: <span class="s">3</span>   <span class="c"># unready after 3 × 5s = 15s of failure</span>
+  <span class="k">successThreshold</span>: <span class="s">1</span>   <span class="c"># back in rotation after 1 success</span></code></pre>
+
+    <h3>Live demo: readiness probe failure</h3>
+
+    <pre data-title="Watch a pod get removed from Service endpoints during readiness failure"><code><span class="c"># Terminal 1 — watch pod ready status</span>
+kubectl get pods -w
+
+<span class="c"># Terminal 2 — patch the deployment to set a long READY_DELAY</span>
+kubectl set env deployment/reliability-api READY_DELAY_SECONDS=60
+
+<span class="c"># Terminal 2 — watch endpoints (pod IPs in Service backend)</span>
+kubectl get endpoints reliability-api -w
+
+<span class="c"># During the rollout, new pods will show READY=0/1 and their IPs</span>
+<span class="c"># will NOT appear in the endpoints list until /ready returns 200</span>
+
+<span class="c"># Reset to normal</span>
+kubectl set env deployment/reliability-api READY_DELAY_SECONDS=5</code></pre>
+
+    <div class="callout tip">
+      <span class="label">Liveness ≠ Readiness</span>
+      <p>Use <strong>readiness</strong> when the pod is temporarily unable to serve (warming up, flushing queue). Use <strong>liveness</strong> when the pod is <em>permanently</em> broken and only a restart helps. <strong>Never use liveness for things that could cause cascading restarts</strong> under load (e.g., a shared dependency being slow). Prefer readiness in those cases.</p>
+    </div>
+
+    <section class="lab">
+      <header><strong>Lab 5 · Health Probes</strong></header>
+      <ol class="steps">
+        <li>Apply <code>02-deployment.yaml</code> and watch pods go from <code>0/1</code> to <code>1/1</code> READY. How long does the readiness delay take?</li>
+        <li>In a second terminal, watch endpoints: <code>kubectl get endpoints reliability-api -w</code>.</li>
+        <li>Run <code>kubectl set env deployment/reliability-api READY_DELAY_SECONDS=30</code>. Watch the rolling update — observe pods appear in endpoints only after they become ready.</li>
+        <li><strong>Trial &amp; Error (break liveness):</strong> Edit the Deployment and change the liveness probe path to <code>/does-not-exist</code>. Apply. Watch the pod RESTARTS counter climb. Read the events with <code>kubectl describe pod</code>. Fix it.</li>
+        <li>Reset: <code>kubectl set env deployment/reliability-api READY_DELAY_SECONDS=5</code>.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>6. Resource Requests &amp; Limits</h2>
+
+    <p>Resource management in Kubernetes has two knobs per container:</p>
+    <ul>
+      <li><strong>Requests</strong> — the amount the scheduler <em>reserves</em> on a node when placing the pod. The node must have this much available or the pod stays <code>Pending</code>.</li>
+      <li><strong>Limits</strong> — the hard ceiling the Linux kernel enforces via cgroups. Exceeding the memory limit causes an <strong>OOMKill</strong> (exit code 137). Exceeding the CPU limit causes <strong>throttling</strong> (the process slows, not killed).</li>
+    </ul>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Resource</th><th>Unit</th><th>Request effect</th><th>Limit effect</th></tr></thead>
+      <tbody>
+        <tr><td>CPU</td><td><code>m</code> (millicores), <code>1</code> = 1 core</td><td>Scheduler checks allocatable CPU</td><td>CFS throttle — process pauses when quota exhausted</td></tr>
+        <tr><td>Memory</td><td><code>Mi</code>, <code>Gi</code>, bytes</td><td>Scheduler checks allocatable memory</td><td>cgroup OOM kill → container exits with code 137</td></tr>
+      </tbody>
+    </table></div>
+
+    <pre data-title="Resource configuration in 02-deployment.yaml"><code><span class="k">resources</span>:
+  <span class="k">requests</span>:
+    <span class="k">cpu</span>: <span class="s">"100m"</span>      <span class="c"># 0.1 vCPU — reserved for scheduling</span>
+    <span class="k">memory</span>: <span class="s">"128Mi"</span>  <span class="c"># 128 MiB — reserved for scheduling</span>
+  <span class="k">limits</span>:
+    <span class="k">memory</span>: <span class="s">"256Mi"</span>  <span class="c"># OOMKilled if exceeded</span>
+    <span class="c"># No CPU limit set — avoids throttling spikes under load</span></code></pre>
+
+    <h3>QoS Classes</h3>
+    <p>Based on requests and limits, Kubernetes assigns a Quality of Service class to each pod, which determines eviction priority under node pressure:</p>
+    <ul>
+      <li><strong>Guaranteed</strong> — requests == limits for all containers. Never evicted (unless they exceed their own limits).</li>
+      <li><strong>Burstable</strong> — at least one container has a request or limit. Our deployment is Burstable.</li>
+      <li><strong>BestEffort</strong> — no requests or limits at all. Evicted first.</li>
+    </ul>
+
+    <pre data-title="Live demo: trigger an OOMKill"><code><span class="c"># Temporarily set a very low memory limit to trigger OOMKill</span>
+kubectl set resources deployment/reliability-api --limits=memory=10Mi
+
+<span class="c"># The containers will be OOMKilled as soon as they start</span>
+kubectl get pods -w
+<span class="o">NAME                               READY   STATUS      RESTARTS   AGE
+reliability-api-849d6f4f4-2xvtk    0/1     OOMKilled   1          8s</span>
+
+<span class="c"># Read the failure reason</span>
+kubectl describe pod &lt;pod-name&gt;
+<span class="c"># Look for: Last State: Terminated  Reason: OOMKilled  Exit Code: 137</span>
+
+<span class="c"># Fix: restore sane limits</span>
+kubectl set resources deployment/reliability-api --limits=memory=256Mi --requests=cpu=100m,memory=128Mi</code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 6 · Resources</strong></header>
+      <ol class="steps">
+        <li>Check QoS class: <code>kubectl get pod &lt;name&gt; -o jsonpath='{.status.qosClass}'</code>. Should be <code>Burstable</code>.</li>
+        <li>Trigger OOMKill: <code>kubectl set resources deployment/reliability-api --limits=memory=10Mi</code>. Watch pods in state <code>OOMKilled</code>.</li>
+        <li>Describe one pod and find the exit code 137 in <em>Last State</em>.</li>
+        <li>Restore limits: <code>kubectl set resources deployment/reliability-api --limits=memory=256Mi --requests=cpu=100m,memory=128Mi</code>.</li>
+        <li><strong>Trial &amp; Error:</strong> Set CPU request to <code>1000m</code> (1 full core) per pod × 3 replicas = 3 cores. If your kind nodes can't provide 3 cores, some pods stay <code>Pending</code>. Observe and fix.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>7. Rolling Updates &amp; Rollbacks</h2>
+
+    <p>A <strong>rolling update</strong> replaces pods one batch at a time — new pods come up, prove they are healthy (pass readiness probe), then old pods are terminated. The <code>maxSurge</code> and <code>maxUnavailable</code> parameters control the speed and safety of the transition.</p>
+
+    <pre data-title="Perform a rolling update"><code><span class="c"># Update the image to a new tag (simulate v0.2.0 — use same image for lab)</span>
+kubectl set image deployment/reliability-api \
+  reliability-api=kumawatsunil/reliability-api:0.1.0
+
+<span class="c"># Or edit the deployment YAML and apply</span>
+kubectl apply -f labs/k8s-reliability/02-deployment.yaml
+
+<span class="c"># Watch the rollout in real time (best command for this)</span>
+kubectl rollout status deployment/reliability-api
+<span class="o">Waiting for deployment "reliability-api" rollout to finish: 1 out of 3 new replicas have been updated...
+Waiting for deployment "reliability-api" rollout to finish: 2 out of 3 new replicas have been updated...
+deployment "reliability-api" successfully rolled out</span>
+
+<span class="c"># Inspect rollout history — shows each revision</span>
+kubectl rollout history deployment/reliability-api
+<span class="o">REVISION  CHANGE-CAUSE
+1         &lt;none&gt;
+2         &lt;none&gt;</span>
+
+<span class="c"># Add a change-cause annotation before applying</span>
+kubectl annotate deployment reliability-api \
+  kubernetes.io/change-cause="update to v0.2.0" --overwrite
+
+<span class="c"># Roll back to the previous revision</span>
+kubectl rollout undo deployment/reliability-api
+
+<span class="c"># Roll back to a specific revision</span>
+kubectl rollout undo deployment/reliability-api --to-revision=1</code></pre>
+
+    <div class="callout tip">
+      <span class="label">Rollout only happens on pod template changes</span>
+      <p>Changing <code>spec.replicas</code> or <code>spec.strategy</code> does NOT trigger a rollout. Only changes inside <code>spec.template</code> (image, env vars, resource limits, probe config) cause the Deployment to create a new ReplicaSet.</p>
+    </div>
+
+    <section class="lab">
+      <header><strong>Lab 7 · Rolling Updates &amp; Rollbacks</strong></header>
+      <ol class="steps">
+        <li>Before updating, open a second terminal and run: <code>kubectl get pods -w</code>.</li>
+        <li>Trigger a rollout: <code>kubectl set env deployment/reliability-api APP_VERSION=v2</code>.</li>
+        <li>Watch <code>kubectl rollout status deployment/reliability-api</code> complete.</li>
+        <li>Check the new ReplicaSet: <code>kubectl get rs</code> — you'll see two, the old one scaled to 0.</li>
+        <li>Roll back: <code>kubectl rollout undo deployment/reliability-api</code>. Verify with <code>kubectl rollout history</code>.</li>
+        <li><strong>Trial &amp; Error:</strong> Set a bad image tag, apply, and pause mid-rollout. Observe some pods on old version, some failing on new. Run <code>kubectl rollout undo</code> to recover.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>8. Namespaces</h2>
+
+    <p><strong>Namespaces</strong> are virtual clusters inside a physical Kubernetes cluster. They provide scope for names (two Pods can have the same name in different namespaces), and are used to separate teams, environments, or applications. RBAC policies and resource quotas are usually applied at namespace level.</p>
+
+    <pre data-title="Create and use namespaces"><code><span class="c"># List existing namespaces</span>
+kubectl get namespaces
+<span class="o">NAME              STATUS   AGE
+default           Active   5m
+kube-node-lease   Active   5m
+kube-public       Active   5m
+kube-system       Active   5m</span>
+
+<span class="c"># Create a new namespace</span>
+kubectl create namespace reliability-lab
+kubectl get ns reliability-lab
+
+<span class="c"># Deploy the application into a specific namespace</span>
+kubectl apply -f labs/k8s-reliability/02-deployment.yaml -n reliability-lab
+
+<span class="c"># Cross-namespace DNS — from any pod you can reach services in other namespaces</span>
+<span class="c"># Format: &lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</span>
+
+<span class="c"># Set a default namespace for your current context (avoids -n flag every time)</span>
+kubectl config set-context --current --namespace=reliability-lab
+kubectl get pods   <span class="c"># now defaults to reliability-lab</span>
+
+<span class="c"># Reset to default namespace</span>
+kubectl config set-context --current --namespace=default</code></pre>
+
+    <pre data-title="Resource quotas — limit consumption per namespace"><code><span class="k">apiVersion</span>: <span class="s">v1</span>
+<span class="k">kind</span>: <span class="s">ResourceQuota</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">lab-quota</span>
+  <span class="k">namespace</span>: <span class="s">reliability-lab</span>
+<span class="k">spec</span>:
+  <span class="k">hard</span>:
+    <span class="k">pods</span>: <span class="s">"10"</span>
+    <span class="k">requests.cpu</span>: <span class="s">"2"</span>
+    <span class="k">requests.memory</span>: <span class="s">2Gi</span>
+    <span class="k">limits.memory</span>: <span class="s">4Gi</span></code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 8 · Namespaces</strong></header>
+      <ol class="steps">
+        <li>Create namespace <code>reliability-lab</code>: <code>kubectl create namespace reliability-lab</code>.</li>
+        <li>Deploy the app there: <code>kubectl apply -f labs/k8s-reliability/02-deployment.yaml -n reliability-lab</code>.</li>
+        <li>Change your default context: <code>kubectl config set-context --current --namespace=reliability-lab</code>.</li>
+        <li>Verify <code>kubectl get pods</code> now shows the pods in <code>reliability-lab</code>.</li>
+        <li><strong>Trial &amp; Error:</strong> Try <code>kubectl get pods -n kube-system</code> from the <code>reliability-lab</code> namespace context. You can still cross namespaces with the <code>-n</code> flag.</li>
+        <li>Reset context to default: <code>kubectl config set-context --current --namespace=default</code>.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>9. Labels, Selectors &amp; Annotations</h2>
+
+    <p><strong>Labels</strong> are key-value pairs attached to any Kubernetes object. They are the primary mechanism for grouping, selecting, and targeting objects. <strong>Selectors</strong> find objects by label. <strong>Annotations</strong> store arbitrary non-identifying metadata (build IDs, URLs, descriptions) — they cannot be used in selectors.</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Feature</th><th>Labels</th><th>Annotations</th></tr></thead>
+      <tbody>
+        <tr><td>Queryable by selector</td><td>✅ Yes</td><td>❌ No</td></tr>
+        <tr><td>Used by Deployment/Service to find pods</td><td>✅ Yes</td><td>❌ No</td></tr>
+        <tr><td>Character restrictions</td><td>63 chars, alphanumeric, <code>-_.</code></td><td>Arbitrary strings</td></tr>
+        <tr><td>Typical use</td><td><code>app=api</code>, <code>env=prod</code>, <code>version=v2</code></td><td>CI build URL, git SHA, owner team, runbook URL</td></tr>
+      </tbody>
+    </table></div>
+
+    <pre data-title="Working with labels and selectors"><code><span class="c"># List pods filtered by label selector</span>
+kubectl get pods -l app.kubernetes.io/name=reliability-api
+
+<span class="c"># Add a label to a running pod (does not trigger rollout)</span>
+kubectl label pod &lt;pod-name&gt; track=canary
+
+<span class="c"># Remove a label</span>
+kubectl label pod &lt;pod-name&gt; track-
+
+<span class="c"># Show labels as columns</span>
+kubectl get pods --show-labels
+
+<span class="c"># Selector with multiple conditions (AND logic)</span>
+kubectl get pods -l 'app.kubernetes.io/name=reliability-api,env=lab'
+
+<span class="c"># Set-based selector (In, NotIn, Exists, DoesNotExist)</span>
+kubectl get pods -l 'env in (lab,staging)'
+
+<span class="c"># Annotations — for human-readable metadata and tooling</span>
+kubectl annotate deployment reliability-api \
+  "team=platform" \
+  "docs=https://wiki.example.com/reliability-api" \
+  "kubernetes.io/change-cause=bump to v0.2.0"</code></pre>
+
+    <h3>Canary pattern with labels</h3>
+    <pre data-title="Running a canary pod alongside stable pods"><code><span class="c"># Apply canary pod with same app label so it receives 1/4 of Service traffic</span>
+kubectl run reliability-canary \
+  --image=kumawatsunil/reliability-api:0.1.0 \
+  --labels="app.kubernetes.io/name=reliability-api,track=canary" \
+  --env="LOG_LEVEL=debug"
+
+<span class="c"># The ClusterIP service selector matches both stable pods AND the canary</span>
+kubectl get endpoints reliability-api
+<span class="c"># 4 IPs: 3 stable + 1 canary</span>
+
+<span class="c"># Remove canary from Service rotation without deleting it</span>
+kubectl label pod reliability-canary app.kubernetes.io/name-   <span class="c"># removes the label</span>
+
+<span class="c"># Clean up</span>
+kubectl delete pod reliability-canary</code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 9 · Labels &amp; Selectors</strong></header>
+      <ol class="steps">
+        <li>Run <code>kubectl get pods --show-labels</code> — verify the labels from <code>02-deployment.yaml</code> are present.</li>
+        <li>Filter pods by label: <code>kubectl get pods -l app.kubernetes.io/name=reliability-api</code>.</li>
+        <li>Launch a canary pod with the same <code>app.kubernetes.io/name</code> label. Check <code>kubectl get endpoints</code> — does it get traffic?</li>
+        <li>Remove the canary from the Service by deleting its selector label. Verify it disappears from endpoints.</li>
+        <li><strong>Trial &amp; Error:</strong> Change the selector in a Service to a label that no pods have. Run <code>kubectl get endpoints</code> — the <em>Endpoints</em> field should be empty (<code>&lt;none&gt;</code>). This is the #1 cause of "service unreachable" bugs in production.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>Cleanup</h2>
+
+    <pre data-title="Tear down the lab resources"><code><span class="c"># Delete all resources created in this lab</span>
+kubectl delete -f labs/k8s-reliability/01-pod.yaml --ignore-not-found
+kubectl delete -f labs/k8s-reliability/02-deployment.yaml --ignore-not-found
+kubectl delete namespace reliability-lab --ignore-not-found
+
+<span class="c"># Or: delete the entire kind cluster</span>
+kind delete cluster --name reliability-lab
+
+<span class="c"># Verify cluster is gone</span>
+kind get clusters</code></pre>
+
+    <div class="callout note">
+      <span class="label">Next up</span>
+      <p>You've mastered Pods, Deployments, health probes, rolling updates, namespaces, and label selectors. Head to <a href="04-k8s-networking-helm.html">Lab 04 · Kubernetes Networking, Config &amp; Helm</a> to wire up Services, DNS, Ingress, ConfigMaps, Secrets, Persistent Storage and package everything with Helm.</p>
+    </div>
+
+  </article></main>
+</div>
+</body>
+</html>

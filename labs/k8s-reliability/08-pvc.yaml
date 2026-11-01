@@ -1,0 +1,20 @@
+# PersistentVolumeClaim — requests durable storage from the cluster.
+# The StorageClass "standard" is the default in kind (backed by hostPath on the node).
+# Data written to /data inside the pod survives pod deletion and rescheduling
+# (as long as it is rescheduled on the same node for hostPath).
+#
+# For production: use a cloud-backed StorageClass (e.g. gp3, premium-rwo).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: api-data
+  namespace: default
+  labels:
+    app.kubernetes.io/name: reliability-api
+spec:
+  accessModes:
+    - ReadWriteOnce       # one node at a time (sufficient for a single-writer workload)
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi

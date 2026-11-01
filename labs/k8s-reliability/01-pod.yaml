@@ -1,0 +1,46 @@
+# Bare Pod — for demonstration only.
+# Raw Pods are NOT self-healing. If you delete this pod, it is gone.
+# Use a Deployment (02-deployment.yaml) for anything that matters.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reliability-api-pod
+  namespace: default
+  labels:
+    app.kubernetes.io/name: reliability-api
+    app.kubernetes.io/version: "0.1.0"
+    env: lab
+spec:
+  containers:
+    - name: reliability-api
+      image: kumawatsunil/reliability-api:0.1.0
+      imagePullPolicy: IfNotPresent   # use locally loaded image in kind
+      ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+      env:
+        - name: LOG_LEVEL
+          value: "info"
+        - name: READY_DELAY_SECONDS
+          value: "5"
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          memory: "256Mi"
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 10
+        periodSeconds: 10
+        failureThreshold: 3
+      readinessProbe:
+        httpGet:
+          path: /ready
+          port: 8000
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        failureThreshold: 3

@@ -394,8 +394,8 @@ docker ps -a --filter exited=137</code></pre>
     <pre data-title="stop vs kill vs pause"><code><span class="c"># Graceful stop: sends SIGTERM to PID 1, waits stop-timeout (default 10s), then SIGKILL</span>
 docker stop reliability-api
 
-<span class="c"># Stop with a custom timeout (seconds)</span>
-docker stop --time 30 reliability-api
+<span class="c"># Stop with a custom timeout (seconds) — Note: --timeout replaces deprecated --time</span>
+docker stop --timeout 30 reliability-api
 
 <span class="c"># Immediate kill: sends SIGKILL immediately — no grace period</span>
 docker kill reliability-api
@@ -776,12 +776,15 @@ docker network ls
 <span class="c"># Inspect a network (shows connected containers, subnet, gateway)</span>
 docker network inspect lab-net
 
-<span class="c"># Run containers on the user-defined network</span>
+<span class="c"># Run containers on the user-defined network (Postgres requires POSTGRES_PASSWORD)</span>
 docker run -d --name api --network lab-net reliability-api:0.1.0
-docker run -d --name db  --network lab-net postgres:16-alpine
+docker run -d --name db  --network lab-net -e POSTGRES_PASSWORD=secret postgres:16-alpine
 
 <span class="c"># Containers on the same user-defined bridge can reach each other by NAME</span>
-docker exec api curl http://db:5432
+<span class="c"># Using Python inside api (since production slim images intentionally omit curl):</span>
+docker exec api python -c 'import socket; s = socket.create_connection(("db", 5432)); print("Connected to DB!")'
+<span class="c"># Or via ephemeral Alpine debug container with netcat:</span>
+docker run --rm --network lab-net alpine nc -zv db 5432
 <span class="c"># Docker's embedded DNS resolves "db" → db container's IP automatically</span>
 
 <span class="c"># Connect a running container to an additional network</span>
@@ -789,6 +792,30 @@ docker network connect lab-net another-container
 
 <span class="c"># Disconnect a container from a network</span>
 docker network disconnect lab-net another-container</code></pre>
+
+    <div class="callout warn">
+      <span class="label">Name Collision Ambiguity: docker inspect vs docker &lt;object&gt; inspect</span>
+      <p>If you create a network named <code>lab-net</code> and a volume also named <code>lab-net</code>, typing the legacy <code>docker inspect lab-net</code> is ambiguous! Docker's internal search priority is: <strong>Container &rarr; Image &rarr; Network &rarr; Volume</strong>. Because Network comes before Volume, <code>docker inspect</code> will always inspect the network, making the volume completely inaccessible via the generic command. Always use modern typed commands: <code>docker network inspect &lt;name&gt;</code> and <code>docker volume inspect &lt;name&gt;</code>.</p>
+    </div>
+
+    <section class="lab">
+      <header>🚨 Trial &amp; Error Drill: Name Collision Ambiguity (Network vs Volume)</header>
+      <div class="body">
+        <ol class="steps">
+          <li>Create a network: <code>docker network create lab-net</code></li>
+          <li>Create a volume with the identical name: <code>docker volume create lab-net</code></li>
+          <li>Run generic inspect: <code>docker inspect lab-net</code> &rarr; Docker resolves to the <strong>Network</strong> JSON (ignoring the volume due to search precedence).</li>
+          <li>Explicitly inspect each typed object to resolve ambiguity:
+            <pre data-title="Modern typed inspect commands"><code><span class="c"># Specifically inspect the Network (shows Subnet and Gateway):</span>
+docker network inspect lab-net
+
+<span class="c"># Specifically inspect the Volume (shows host Mountpoint):</span>
+docker volume inspect lab-net</code></pre>
+          </li>
+          <li>Clean up: <code>docker network rm lab-net &amp;&amp; docker volume rm lab-net</code></li>
+        </ol>
+      </div>
+    </section>
 
     <section class="lab">
       <header>DNS by container name — user-defined bridge vs default bridge</header>
@@ -1323,7 +1350,81 @@ docker builder prune --filter until=48h</code></pre>
     </div>
 
     <!-- ============================================================ -->
-    <h2>10. Old vs New Syntax</h2>
+    <h2>10. Container Security &amp; Privilege Boundaries (Root vs Non-Root)</h2>
+
+    <p>In Linux, containers share the host kernel. A process running as <code>root</code> (UID 0) inside a container shares the root user identity with the host, meaning container breakout vulnerabilities or code injection can compromise the entire underlying operating system.</p>
+
+    <div class="callout warn">
+      <span class="label">The Danger of UID 0 in Production</span>
+      <p>If an attacker achieves Remote Code Execution (RCE) in an application running as root, they can overwrite system configurations (<code>/etc/hosts</code>), install malicious toolkits with <code>apt</code>, or tamper with mounted host volumes.</p>
+    </div>
+
+    <section class="lab">
+      <header>Security Drill: Root vs Non-Root Exploit Test</header>
+      <div class="body">
+        <p><strong>Goal:</strong> Prove that an unprivileged user (UID 10001) is blocked from modifying critical operating system files, while a naive root container permits tampering.</p>
+
+        <p><strong>Step 1: Exploit the naive root container:</strong></p>
+        <pre data-title="DNS tampering on root container"><code>docker run --rm reliability-api:naive sh -c "echo '1.2.3.4 evil-hacker.com' >> /etc/hosts && cat /etc/hosts"</code></pre>
+        <p><strong>Result:</strong> Succeeded! The malicious entry <code>1.2.3.4 evil-hacker.com</code> is successfully appended to <code>/etc/hosts</code>.</p>
+
+        <p><strong>Step 2: Attempt the exact same attack on the production non-root container:</strong></p>
+        <pre data-title="DNS tampering blocked on non-root container"><code>docker run --rm kumawatsunil/reliability-api sh -c "echo '1.2.3.4 evil-hacker.com' >> /etc/hosts"</code></pre>
+        <p><strong>Result:</strong> <code>sh: 1: cannot create /etc/hosts: Permission denied</code> — The Linux kernel rejects the write operation because user <code>app</code> (UID 10001) has read-only access to system files.</p>
+
+        <p><strong>Step 3: Why choose UID 10001?</strong></p>
+        <div class="table-wrap"><table>
+          <tr><th>UID Range</th><th>Designation</th><th>Significance in Containers</th></tr>
+          <tr><td><code>0</code></td><td><code>root</code></td><td>Superuser. Full kernel administration. Strictly forbidden in production.</td></tr>
+          <tr><td><code>1 – 999</code></td><td>System Daemons</td><td>Reserved by Linux OS packages (<code>sshd</code>, <code>systemd</code>, <code>www-data</code>).</td></tr>
+          <tr><td><code>1000</code></td><td>Primary Host User</td><td>Default human account on Ubuntu / Codespaces. Collides with host volume mounts.</td></tr>
+          <tr><td><code>10001+</code></td><td>Application Sandbox</td><td><strong>Gold standard:</strong> No host collision, CIS Benchmark &amp; Kubernetes <code>MustRunAsNonRoot</code> compliant.</td></tr>
+        </table></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>11. Local Kubernetes Testing with Kind (Offline Image Loading)</h2>
+
+    <p><strong>Kind (Kubernetes in Docker)</strong> runs local Kubernetes clusters by containerizing control plane and worker nodes inside Docker. Because Kind nodes run an isolated internal <code>containerd</code> runtime, images built in your host Docker daemon are not automatically visible to Kubernetes.</p>
+
+    <div class="callout note">
+      <span class="label">The Problem: ImagePullBackOff</span>
+      <p>When Kubernetes deploys a pod, it defaults to reaching out to public registries (Docker Hub, GHCR). To run local development builds without pushing them over the internet, you must inject the image into the cluster node with <code>kind load docker-image</code> and set <code>imagePullPolicy: Never</code>.</p>
+    </div>
+
+    <section class="lab">
+      <header>Local Kubernetes Cluster &amp; Offline Image Workflow</header>
+      <div class="body">
+        <p><strong>Step 1: Install Kind (Linux AMD64):</strong></p>
+        <pre data-title="Install Kind"><code>curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.25.0/kind-linux-amd64
+chmod +x ./kind
+sudo mv ./kind /usr/local/bin/kind
+kind --version</code></pre>
+
+        <p><strong>Step 2: Create a local Kubernetes cluster:</strong></p>
+        <pre data-title="Create cluster"><code>kind create cluster --name reliability-lab
+kubectl get nodes</code></pre>
+
+        <p><strong>Step 3: Bridge the host image into the Kind node:</strong></p>
+        <pre data-title="Load image into Kind node"><code><span class="c"># Ensure local image has matching tag</span>
+docker tag kumawatsunil/reliability-api:latest reliability-api:0.1.0
+
+<span class="c"># Inject image into Kind containerd runtime</span>
+kind load docker-image reliability-api:0.1.0 --name reliability-lab</code></pre>
+
+        <p><strong>Step 4: Verify image inside the node using <code>crictl</code>:</strong></p>
+        <pre data-title="Inspect containerd cache inside Kind"><code>docker exec -it reliability-lab-control-plane crictl images | grep reliability-api</code></pre>
+
+        <p><strong>Step 5: Run your Pod with offline pull policy:</strong></p>
+        <pre data-title="Deploy Pod with offline policy"><code>kubectl run my-first-pod --image=reliability-api:0.1.0 --image-pull-policy=Never
+kubectl get pods</code></pre>
+        <p><strong>Clean up:</strong> <code>kubectl delete pod my-first-pod</code> (or <code>kind delete cluster --name reliability-lab</code>)</p>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>12. Old vs New Syntax</h2>
 
     <div class="table-wrap"><table>
       <tr><th>Old (shorthand)</th><th>New (<code>docker &lt;object&gt; &lt;verb&gt;</code>)</th></tr>
@@ -1358,7 +1459,7 @@ docker builder prune --filter until=48h</code></pre>
     </table></div>
 
     <!-- ============================================================ -->
-    <h2>11. Quick Reference Cheat Sheet</h2>
+    <h2>13. Quick Reference Cheat Sheet</h2>
 
     <pre data-title="Docker cheat sheet — most-used commands"><code><span class="c">## IMAGES</span>
 docker pull nginx:alpine                          <span class="c"># pull an image</span>

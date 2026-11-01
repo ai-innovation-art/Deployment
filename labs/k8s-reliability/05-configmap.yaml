@@ -1,0 +1,17 @@
+# ConfigMap — externalises runtime configuration from the container image.
+# Mount as environment variables (see 02-deployment.yaml env.valueFrom.configMapKeyRef)
+# or as files (volumeMounts + volumes).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reliability-api-config
+  namespace: default
+  labels:
+    app.kubernetes.io/name: reliability-api
+data:
+  LOG_LEVEL: "info"
+  READY_DELAY_SECONDS: "5"
+  # Add any non-secret tuning knobs here.
+  # Changes to a ConfigMap mounted as a volume are reflected in the pod
+  # within ~60 seconds WITHOUT a restart (inotify-based reload required in app).
+  # Changes to env-var-based ConfigMaps only take effect on pod restart.

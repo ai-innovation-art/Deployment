@@ -1,0 +1,45 @@
+# RBAC — ServiceAccount + Role + RoleBinding for reliability-api.
+# Principle of least privilege: the app only gets what it needs.
+# Test with: kubectl auth can-i list pods --as=system:serviceaccount:default:reliability-api-sa
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reliability-api-sa
+  namespace: default
+  labels:
+    app.kubernetes.io/name: reliability-api
+automountServiceAccountToken: false   # opt-in to mounting; reduces attack surface
+---
+# Role — namespace-scoped permissions (use ClusterRole for cluster-wide resources)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: reliability-api-role
+  namespace: default
+  labels:
+    app.kubernetes.io/name: reliability-api
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]   # read-only pod visibility for self-inspection
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]                     # read own ConfigMap
+---
+# RoleBinding — binds the Role to the ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: reliability-api-rolebinding
+  namespace: default
+  labels:
+    app.kubernetes.io/name: reliability-api
+subjects:
+  - kind: ServiceAccount
+    name: reliability-api-sa
+    namespace: default
+roleRef:
+  kind: Role
+  name: reliability-api-role
+  apiGroup: rbac.authorization.k8s.io

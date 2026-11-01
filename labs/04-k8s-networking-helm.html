@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 04 · Kubernetes Networking, Config &amp; Helm — DevOps Lab</title>
+<link rel="stylesheet" href="../notes-animated/assets/style.css">
+<script src="../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../index.html">DevOps Lab</a>
+  <span class="crumb">Labs · Module 05 &amp; 06 · Networking, Config, Storage &amp; Helm</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+    <h1>Lab 04 · Kubernetes Networking, Config &amp; Helm</h1>
+    <p class="lede">Hands-on lab guide for Modules 05 &amp; 06 — wire <code>reliability-api</code> into a ClusterIP Service, expose it via NodePort and Ingress, inject config from ConfigMaps and Secrets, persist data with PersistentVolumeClaims, lock down identity with RBAC, and finally package and deploy the whole stack as a Helm chart. You'll break each layer deliberately and fix it.</p>
+    <div class="meta">
+      <span class="pill accent">Prereq: Lab 03 — Kubernetes Architecture &amp; Workloads</span>
+      <span class="pill">≈ 5–7 h lab</span>
+      <span class="pill">kind v0.33 · kubectl v1.31+ · Helm v3.16+</span>
+      <span class="verified">✓ Checked against kubernetes.io · Nov 2026</span>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>0. Prerequisites</h2>
+
+    <p>This lab assumes the <code>reliability-lab</code> kind cluster from Lab 03 is running. If you deleted it, recreate it:</p>
+
+    <pre data-title="Recreate the cluster (if needed)"><code><span class="c"># Check if cluster exists</span>
+kind get clusters
+<span class="o">reliability-lab</span>
+
+<span class="c"># If missing, recreate and reload the image</span>
+kind create cluster --config labs/k8s-reliability/kind-config.yaml
+kind load docker-image kumawatsunil/reliability-api:0.1.0 --name reliability-lab
+
+<span class="c"># Apply the Deployment from Lab 03</span>
+kubectl apply -f labs/k8s-reliability/02-deployment.yaml
+kubectl rollout status deployment/reliability-api</code></pre>
+
+    <div class="callout note">
+      <span class="label">Where we are</span>
+      <p>From Lab 03 you have: <code>Deployment/reliability-api</code> with 3 replicas in the <code>default</code> namespace, Pods with liveness and readiness probes, resource requests and limits set. In this lab we add: Service (ClusterIP + NodePort), DNS, Ingress, ConfigMap, Secret, PVC, RBAC, and finally a Helm chart.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>1. Services</h2>
+
+    <p>A Kubernetes <strong>Service</strong> provides a stable network identity (IP + DNS name) for a set of Pods. Pod IPs are ephemeral — they change every time a pod is created. A Service selects pods by label and maintains an <strong>EndpointSlice</strong> of their current IPs. kube-proxy programs iptables/IPVS rules on every node so traffic to the Service's ClusterIP is forwarded to a ready Pod.</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Service Type</th><th>Reachable from</th><th>Typical use</th></tr></thead>
+      <tbody>
+        <tr><td><code>ClusterIP</code> (default)</td><td>Inside cluster only</td><td>Internal microservice communication</td></tr>
+        <tr><td><code>NodePort</code></td><td>Any node IP + static port (30000–32767)</td><td>Direct external access, simple dev testing</td></tr>
+        <tr><td><code>LoadBalancer</code></td><td>Cloud load balancer IP</td><td>Production external traffic (cloud providers)</td></tr>
+        <tr><td><code>ExternalName</code></td><td>DNS CNAME alias</td><td>Routing to external services via DNS</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>ClusterIP Service</h3>
+
+    <pre data-title="labs/k8s-reliability/03-service-clusterip.yaml"><code><span class="k">apiVersion</span>: <span class="s">v1</span>
+<span class="k">kind</span>: <span class="s">Service</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">reliability-api</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+<span class="k">spec</span>:
+  <span class="k">type</span>: <span class="s">ClusterIP</span>          <span class="c"># default; virtual IP only inside cluster</span>
+  <span class="k">selector</span>:
+    <span class="k">app.kubernetes.io/name</span>: <span class="s">reliability-api</span>  <span class="c"># must match pod labels</span>
+  <span class="k">ports</span>:
+    - <span class="k">name</span>: <span class="s">http</span>
+      <span class="k">protocol</span>: <span class="s">TCP</span>
+      <span class="k">port</span>: <span class="s">80</span>         <span class="c"># port clients use</span>
+      <span class="k">targetPort</span>: <span class="s">8000</span> <span class="c"># port the container listens on</span></code></pre>
+
+    <pre data-title="Apply and inspect the Service"><code><span class="c"># Apply the ClusterIP service</span>
+kubectl apply -f labs/k8s-reliability/03-service-clusterip.yaml
+
+<span class="c"># Check the service — note the CLUSTER-IP assigned</span>
+kubectl get service reliability-api
+<span class="o">NAME              TYPE        CLUSTER-IP    EXTERNAL-IP   PORT(S)   AGE
+reliability-api   ClusterIP   10.96.45.23   &lt;none&gt;        80/TCP    10s</span>
+
+<span class="c"># Check that pod IPs appear as endpoints (only READY pods)</span>
+kubectl get endpoints reliability-api
+<span class="o">NAME              ENDPOINTS                                         AGE
+reliability-api   10.244.1.5:8000,10.244.1.6:8000,10.244.2.3:8000   25s</span>
+
+<span class="c"># Test the service from a debug pod inside the cluster</span>
+kubectl run debug --image=busybox:1.36 --restart=Never -it --rm -- \
+  wget -qO- http://reliability-api.default.svc.cluster.local/health</code></pre>
+
+    <div class="callout warn">
+      <span class="label">Selector mismatch — the #1 Service bug</span>
+      <p>If <code>kubectl get endpoints</code> shows <code>&lt;none&gt;</code>, your Service selector does not match any pod labels. Compare <code>kubectl get svc -o yaml</code> selector with <code>kubectl get pods --show-labels</code>. They must match exactly, including namespace.</p>
+    </div>
+
+    <h3>NodePort Service</h3>
+
+    <pre data-title="labs/k8s-reliability/04-service-nodeport.yaml"><code><span class="k">apiVersion</span>: <span class="s">v1</span>
+<span class="k">kind</span>: <span class="s">Service</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">reliability-api-nodeport</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+<span class="k">spec</span>:
+  <span class="k">type</span>: <span class="s">NodePort</span>
+  <span class="k">selector</span>:
+    <span class="k">app.kubernetes.io/name</span>: <span class="s">reliability-api</span>
+  <span class="k">ports</span>:
+    - <span class="k">name</span>: <span class="s">http</span>
+      <span class="k">port</span>: <span class="s">80</span>
+      <span class="k">targetPort</span>: <span class="s">8000</span>
+      <span class="k">nodePort</span>: <span class="s">30800</span>   <span class="c"># static port on every node (30000–32767)</span></code></pre>
+
+    <pre data-title="Test the NodePort service"><code><span class="c"># Apply the NodePort service</span>
+kubectl apply -f labs/k8s-reliability/04-service-nodeport.yaml
+
+<span class="c"># In kind, get the control-plane container's IP</span>
+CONTROL_PLANE_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' reliability-lab-control-plane)
+echo $CONTROL_PLANE_IP
+
+<span class="c"># Hit the NodePort from your host machine</span>
+curl http://$CONTROL_PLANE_IP:30800/health
+
+<span class="c"># Alternatively, use kubectl port-forward (works for any service type)</span>
+kubectl port-forward service/reliability-api 8080:80 &amp;
+curl http://localhost:8080/health
+<span class="o">{"status":"ok","uptime_seconds":120}</span></code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 1 · Services</strong></header>
+      <ol class="steps">
+        <li>Apply <code>03-service-clusterip.yaml</code>. Verify <code>kubectl get endpoints</code> shows 3 pod IPs.</li>
+        <li>Launch a debug pod: <code>kubectl run debug --image=busybox:1.36 --restart=Never -it --rm -- wget -qO- http://reliability-api/health</code>. The short name resolves within the same namespace.</li>
+        <li>Apply <code>04-service-nodeport.yaml</code>. Hit port <code>30800</code> on the kind control-plane container IP.</li>
+        <li>Use <code>kubectl port-forward svc/reliability-api 8080:80</code> and hit <code>localhost:8080/health</code> from your host.</li>
+        <li><strong>Trial &amp; Error:</strong> Delete the ClusterIP service and try reaching the pod by pod IP only. Then apply the service again and compare stability.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>2. DNS &amp; Service Discovery</h2>
+
+    <p>Every Kubernetes cluster runs <strong>CoreDNS</strong> as an in-cluster DNS server. It resolves service names to ClusterIP addresses. The full DNS name of a Service follows a strict pattern:</p>
+
+    <pre data-title="Kubernetes DNS name schema"><code><span class="c"># Full qualified DNS name</span>
+<span class="s">&lt;service-name&gt;.&lt;namespace&gt;.svc.cluster.local</span>
+
+<span class="c"># Example for our service in namespace 'default':</span>
+<span class="s">reliability-api.default.svc.cluster.local</span>
+
+<span class="c"># Short names that also work — resolved by the pod's search domain</span>
+<span class="c"># From a pod IN THE SAME namespace:</span>
+<span class="s">reliability-api</span>                                  <span class="c"># works</span>
+<span class="s">reliability-api.default</span>                          <span class="c"># works</span>
+<span class="s">reliability-api.default.svc</span>                      <span class="c"># works</span>
+<span class="s">reliability-api.default.svc.cluster.local</span>        <span class="c"># works (FQDN)</span>
+
+<span class="c"># From a pod IN A DIFFERENT namespace (e.g., monitoring):</span>
+<span class="c"># Short name 'reliability-api' WON'T resolve — must use full namespace</span>
+<span class="s">reliability-api.default.svc.cluster.local</span>        <span class="c"># works</span>
+<span class="s">reliability-api.default</span>                          <span class="c"># works</span></code></pre>
+
+    <pre data-title="Investigate DNS from inside the cluster"><code><span class="c"># Launch a debug pod with DNS tools</span>
+kubectl run dnsutils --image=registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3 \
+  --restart=Never -it --rm -- bash
+
+<span class="c"># Inside the pod:</span>
+<span class="c"># Lookup the service — should return the ClusterIP</span>
+nslookup reliability-api
+<span class="o">Server:   10.96.0.10
+Address:  10.96.0.10#53
+
+Name:     reliability-api.default.svc.cluster.local
+Address:  10.96.45.23</span>
+
+<span class="c"># View the pod's DNS search list</span>
+cat /etc/resolv.conf
+<span class="o">nameserver 10.96.0.10
+search default.svc.cluster.local svc.cluster.local cluster.local</span>
+
+<span class="c"># Cross-namespace lookup (from 'default', reach 'kube-system' CoreDNS)</span>
+nslookup kube-dns.kube-system.svc.cluster.local
+
+<span class="c"># Reach the API using the full DNS name</span>
+wget -qO- http://reliability-api.default.svc.cluster.local/health
+exit</code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 2 · DNS</strong></header>
+      <ol class="steps">
+        <li>Launch a <code>busybox</code> debug pod and run <code>nslookup reliability-api</code> — note the resolved ClusterIP.</li>
+        <li>Check <code>cat /etc/resolv.conf</code> — identify the search domains that make short names work.</li>
+        <li>Create a second namespace: <code>kubectl create ns other</code>. Launch a pod there. Try resolving <code>reliability-api</code> (short name) — it should fail. Try <code>reliability-api.default</code> — it should succeed.</li>
+        <li><strong>Trial &amp; Error:</strong> Delete the ClusterIP service and run <code>nslookup reliability-api</code> again. DNS fails with NXDOMAIN. Recreate the service and verify DNS returns.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>3. Ingress</h2>
+
+    <p>An <strong>Ingress</strong> routes external HTTP/HTTPS traffic into Services based on hostnames and URL paths. It requires an <strong>Ingress Controller</strong> — a dedicated pod that watches Ingress objects and configures a reverse proxy (nginx, Traefik, HAProxy…). kind ships without one by default.</p>
+
+    <pre data-title="Install the nginx Ingress controller for kind"><code><span class="c"># Apply the kind-specific nginx ingress controller manifest</span>
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+<span class="c"># Wait for the controller pod to be ready (~60 seconds)</span>
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=120s
+
+<span class="c"># Verify it's running</span>
+kubectl get pods -n ingress-nginx
+<span class="o">NAME                                        READY   STATUS    RESTARTS
+ingress-nginx-controller-5bc4c7d4d8-xmmpq   1/1     Running   0</span></code></pre>
+
+    <pre data-title="labs/k8s-reliability/07-ingress.yaml"><code><span class="k">apiVersion</span>: <span class="s">networking.k8s.io/v1</span>
+<span class="k">kind</span>: <span class="s">Ingress</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">reliability-api-ingress</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+  <span class="k">annotations</span>:
+    <span class="k">nginx.ingress.kubernetes.io/rewrite-target</span>: <span class="s">/$2</span>
+    <span class="k">nginx.ingress.kubernetes.io/use-regex</span>: <span class="s">"true"</span>
+<span class="k">spec</span>:
+  <span class="k">ingressClassName</span>: <span class="s">nginx</span>
+  <span class="k">rules</span>:
+    - <span class="k">http</span>:
+        <span class="k">paths</span>:
+          - <span class="k">path</span>: <span class="s">/api(/|$)(.*)</span>
+            <span class="k">pathType</span>: <span class="s">ImplementationSpecific</span>
+            <span class="k">backend</span>:
+              <span class="k">service</span>:
+                <span class="k">name</span>: <span class="s">reliability-api</span>
+                <span class="k">port</span>:
+                  <span class="k">number</span>: <span class="s">80</span></code></pre>
+
+    <pre data-title="Apply and test the Ingress"><code><span class="c"># Apply the Ingress rule</span>
+kubectl apply -f labs/k8s-reliability/07-ingress.yaml
+
+<span class="c"># Verify the Ingress got an address (requires kind extraPortMappings on port 80)</span>
+kubectl get ingress
+<span class="o">NAME                       CLASS   HOSTS   ADDRESS     PORTS   AGE
+reliability-api-ingress    nginx   *       localhost   80      15s</span>
+
+<span class="c"># Test path-based routing from your host</span>
+<span class="c"># The /api prefix is stripped by the rewrite-target annotation</span>
+curl http://localhost/api/health
+<span class="o">{"status":"ok","uptime_seconds":300}</span>
+
+curl http://localhost/api/ready
+<span class="o">{"status":"ready"}</span></code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 3 · Ingress</strong></header>
+      <ol class="steps">
+        <li>Install the nginx ingress controller with the <code>kubectl apply</code> command above. Wait for it to be Ready.</li>
+        <li>Apply <code>07-ingress.yaml</code>. Run <code>kubectl get ingress</code> and verify ADDRESS shows <code>localhost</code>.</li>
+        <li>Hit <code>curl http://localhost/api/health</code> from your host machine.</li>
+        <li>Add a second path to the Ingress for <code>/metrics</code> pointing to port 80. Apply and test.</li>
+        <li><strong>Trial &amp; Error:</strong> Change the <code>ingressClassName</code> to <code>nginx-wrong</code>. The Ingress will be ignored. Check <code>kubectl describe ingress</code> — no events from the controller. Fix it.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>4. ConfigMaps</h2>
+
+    <p>A <strong>ConfigMap</strong> decouples configuration from the container image. It stores key-value pairs that can be injected into pods as <strong>environment variables</strong>, <strong>command-line arguments</strong>, or <strong>mounted files</strong>. ConfigMaps are not encrypted — don't store passwords or tokens there.</p>
+
+    <pre data-title="labs/k8s-reliability/05-configmap.yaml"><code><span class="k">apiVersion</span>: <span class="s">v1</span>
+<span class="k">kind</span>: <span class="s">ConfigMap</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">reliability-api-config</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+<span class="k">data</span>:
+  <span class="k">LOG_LEVEL</span>: <span class="s">"info"</span>
+  <span class="k">READY_DELAY_SECONDS</span>: <span class="s">"5"</span></code></pre>
+
+    <pre data-title="Three ways to consume a ConfigMap in a pod"><code><span class="c"># Method 1: inject ALL keys as env vars (envFrom)</span>
+<span class="k">envFrom</span>:
+  - <span class="k">configMapRef</span>:
+      <span class="k">name</span>: <span class="s">reliability-api-config</span>
+
+<span class="c"># Method 2: inject ONE key as a named env var (env + valueFrom)</span>
+<span class="k">env</span>:
+  - <span class="k">name</span>: <span class="s">LOG_LEVEL</span>
+    <span class="k">valueFrom</span>:
+      <span class="k">configMapKeyRef</span>:
+        <span class="k">name</span>: <span class="s">reliability-api-config</span>
+        <span class="k">key</span>: <span class="s">LOG_LEVEL</span>
+
+<span class="c"># Method 3: mount the entire ConfigMap as files in a directory</span>
+<span class="k">volumes</span>:
+  - <span class="k">name</span>: <span class="s">config-vol</span>
+    <span class="k">configMap</span>:
+      <span class="k">name</span>: <span class="s">reliability-api-config</span>
+<span class="k">volumeMounts</span>:
+  - <span class="k">name</span>: <span class="s">config-vol</span>
+    <span class="k">mountPath</span>: <span class="s">/etc/config</span>
+    <span class="k">readOnly</span>: <span class="s">true</span>
+<span class="c"># Result: /etc/config/LOG_LEVEL and /etc/config/READY_DELAY_SECONDS files</span></code></pre>
+
+    <pre data-title="Apply and verify ConfigMap injection"><code><span class="c"># Create the ConfigMap</span>
+kubectl apply -f labs/k8s-reliability/05-configmap.yaml
+
+<span class="c"># Alternatively, create from literal values imperatively</span>
+kubectl create configmap reliability-api-config \
+  --from-literal=LOG_LEVEL=info \
+  --from-literal=READY_DELAY_SECONDS=5 \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+<span class="c"># Inspect the ConfigMap</span>
+kubectl get configmap reliability-api-config -o yaml
+
+<span class="c"># Verify env vars are set in a running pod</span>
+kubectl exec -it deployment/reliability-api -- env | grep -E 'LOG_LEVEL|READY_DELAY'
+<span class="o">LOG_LEVEL=info
+READY_DELAY_SECONDS=5</span>
+
+<span class="c"># Update a ConfigMap value (env vars need pod restart; volume files update automatically)</span>
+kubectl patch configmap reliability-api-config \
+  --patch '{"data":{"LOG_LEVEL":"debug"}}'
+kubectl rollout restart deployment/reliability-api</code></pre>
+
+    <div class="callout tip">
+      <span class="label">Volume mount vs env var</span>
+      <p>When a ConfigMap is mounted as a volume, Kubernetes updates the files within ~60 seconds <em>without restarting the pod</em> — but your application must watch and reload the file (inotify or polling). Env vars only update on pod restart. Prefer volume mounts for config that changes frequently.</p>
+    </div>
+
+    <section class="lab">
+      <header><strong>Lab 4 · ConfigMaps</strong></header>
+      <ol class="steps">
+        <li>Apply <code>05-configmap.yaml</code> and inspect it: <code>kubectl get configmap reliability-api-config -o yaml</code>.</li>
+        <li>Patch the Deployment to use <code>envFrom</code> to consume the entire ConfigMap. Apply and verify with <code>kubectl exec</code>.</li>
+        <li>Change <code>READY_DELAY_SECONDS</code> to <code>30</code> in the ConfigMap. Restart the Deployment and watch the pods take 30s to become ready.</li>
+        <li><strong>Trial &amp; Error:</strong> Reference a ConfigMap key that doesn't exist in a pod env. The pod will fail to start with an error in events: <code>Error: couldn't find key MISSING_KEY in ConfigMap</code>. Fix it.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>5. Secrets</h2>
+
+    <p>A <strong>Secret</strong> stores sensitive data like passwords, API keys, and TLS certificates. The values are base64-encoded (not encrypted) in etcd by default. Base64 is trivially reversible — it is encoding, not encryption. Real protection comes from <strong>RBAC</strong> (limiting who can <code>get</code> secrets) and <strong>encryption-at-rest</strong> (enabled by cluster operators).</p>
+
+    <div class="callout warn">
+      <span class="label">Secrets are not encrypted by default</span>
+      <p>Anyone with <code>kubectl get secret</code> permission and <code>base64 -d</code> can read your secret. Always: restrict access with RBAC, enable encryption at rest in production, and use a dedicated secrets manager (Vault, AWS Secrets Manager, External Secrets Operator) for real credentials.</p>
+    </div>
+
+    <pre data-title="labs/k8s-reliability/06-secret.yaml"><code><span class="k">apiVersion</span>: <span class="s">v1</span>
+<span class="k">kind</span>: <span class="s">Secret</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">reliability-api-secret</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+<span class="k">type</span>: <span class="s">Opaque</span>
+<span class="k">data</span>:
+  <span class="c"># echo -n "postgresql://admin:changeme@postgres:5432/reliability" | base64</span>
+  <span class="k">DATABASE_URL</span>: <span class="s">cG9zdGdyZXNxbDovL2FkbWluOmNoYW5nZW1lQHBvc3RncmVzOjU0MzIvcmVsaWFiaWxpdHk=</span>
+  <span class="k">API_KEY</span>: <span class="s">czNjcjN0LWFwaS1rZXktcmVwbGFjZS1tZQ==</span></code></pre>
+
+    <pre data-title="Create, read, and use a Secret"><code><span class="c"># Apply the secret</span>
+kubectl apply -f labs/k8s-reliability/06-secret.yaml
+
+<span class="c"># Inspect (values are base64 encoded in the output)</span>
+kubectl get secret reliability-api-secret -o yaml
+
+<span class="c"># Decode a specific key</span>
+kubectl get secret reliability-api-secret \
+  -o jsonpath='{.data.DATABASE_URL}' | base64 -d
+<span class="o">postgresql://admin:changeme@postgres:5432/reliability</span>
+
+<span class="c"># Imperative create — Kubernetes handles the base64 encoding for you</span>
+kubectl create secret generic reliability-api-secret \
+  --from-literal=DATABASE_URL="postgresql://admin:changeme@postgres:5432/reliability" \
+  --from-literal=API_KEY="s3cr3t-api-key-replace-me" \
+  --dry-run=client -o yaml
+
+<span class="c"># Inject into pod as env var — same pattern as ConfigMap</span>
+<span class="c"># In deployment spec.containers:</span>
+<span class="k">env</span>:
+  - <span class="k">name</span>: <span class="s">DATABASE_URL</span>
+    <span class="k">valueFrom</span>:
+      <span class="k">secretKeyRef</span>:
+        <span class="k">name</span>: <span class="s">reliability-api-secret</span>
+        <span class="k">key</span>: <span class="s">DATABASE_URL</span></code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 5 · Secrets</strong></header>
+      <ol class="steps">
+        <li>Apply <code>06-secret.yaml</code>. Decode the <code>DATABASE_URL</code> with <code>kubectl get secret ... -o jsonpath | base64 -d</code>.</li>
+        <li>Create a secret imperatively: <code>kubectl create secret generic my-api-key --from-literal=API_KEY=abc123</code>.</li>
+        <li>Add the secret as an env var in the Deployment. Exec into the pod and <code>echo $API_KEY</code>.</li>
+        <li><strong>Trial &amp; Error:</strong> Deliberately misspell the secret key in <code>secretKeyRef</code>. Apply and observe the pod failing to start. Read the events in <code>kubectl describe pod</code>. Fix the key name.</li>
+        <li>Check what happens when you <code>kubectl get secret</code> from a namespace where the secret doesn't exist.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>6. Persistent Volumes &amp; PVCs</h2>
+
+    <p>Container storage is <strong>ephemeral</strong> by default — when a pod is deleted, all data written inside the container filesystem is lost. For durable storage, Kubernetes uses a three-layer abstraction:</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Object</th><th>Who creates it</th><th>What it represents</th></tr></thead>
+      <tbody>
+        <tr><td><strong>PersistentVolume (PV)</strong></td><td>Cluster admin (or dynamically by StorageClass)</td><td>A piece of storage in the cluster (NFS mount, cloud disk, hostPath). Exists independently of pods.</td></tr>
+        <tr><td><strong>PersistentVolumeClaim (PVC)</strong></td><td>Developer (you)</td><td>A request for storage: "I need 1 Gi with ReadWriteOnce access." The cluster binds it to a matching PV.</td></tr>
+        <tr><td><strong>StorageClass</strong></td><td>Cluster admin</td><td>A provisioner recipe. When a PVC names a StorageClass, the cluster creates a PV on-demand (dynamic provisioning).</td></tr>
+      </tbody>
+    </table></div>
+
+    <pre data-title="labs/k8s-reliability/08-pvc.yaml"><code><span class="k">apiVersion</span>: <span class="s">v1</span>
+<span class="k">kind</span>: <span class="s">PersistentVolumeClaim</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">api-data</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+<span class="k">spec</span>:
+  <span class="k">accessModes</span>:
+    - <span class="s">ReadWriteOnce</span>   <span class="c"># one node at a time (RWO)</span>
+  <span class="k">storageClassName</span>: <span class="s">standard</span>  <span class="c"># kind's default hostPath provisioner</span>
+  <span class="k">resources</span>:
+    <span class="k">requests</span>:
+      <span class="k">storage</span>: <span class="s">1Gi</span></code></pre>
+
+    <pre data-title="Apply the PVC and mount it in a pod"><code><span class="c"># Apply the PVC — kind's 'standard' StorageClass provisions it automatically</span>
+kubectl apply -f labs/k8s-reliability/08-pvc.yaml
+
+<span class="c"># Check that the PVC is bound to a PV</span>
+kubectl get pvc
+<span class="o">NAME       STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+api-data   Bound    pvc-3d8b1a2c-4f5e-11ef-bc9a-0242ac110002   1Gi       RWO            standard       10s</span>
+
+kubectl get pv
+<span class="o">NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM              STORAGECLASS
+pvc-3d8b1a2c-4f5e-11ef-bc9a-0242ac110002   1Gi        RWO            Delete           Bound    default/api-data   standard</span>
+
+<span class="c"># Add this to your deployment pod spec to mount the PVC:</span>
+<span class="k">volumes</span>:
+  - <span class="k">name</span>: <span class="s">api-data</span>
+    <span class="k">persistentVolumeClaim</span>:
+      <span class="k">claimName</span>: <span class="s">api-data</span>
+<span class="c"># In the container spec:</span>
+<span class="k">volumeMounts</span>:
+  - <span class="k">name</span>: <span class="s">api-data</span>
+    <span class="k">mountPath</span>: <span class="s">/data</span>
+
+<span class="c"># Prove data survives pod deletion</span>
+POD=$(kubectl get pods -l app.kubernetes.io/name=reliability-api -o name | head -1)
+kubectl exec $POD -- sh -c 'echo "hello-persistence" > /data/test.txt'
+kubectl delete $POD
+<span class="c"># Wait for replacement pod to start</span>
+NEW_POD=$(kubectl get pods -l app.kubernetes.io/name=reliability-api -o name | head -1)
+kubectl exec $NEW_POD -- cat /data/test.txt
+<span class="o">hello-persistence</span>   <span class="c"># Data survived!</span></code></pre>
+
+    <div class="callout warn">
+      <span class="label">RWO in kind</span>
+      <p>kind's <code>standard</code> StorageClass uses <code>hostPath</code> on the node. With <code>ReadWriteOnce</code>, only pods on the <em>same node</em> as the PV can mount it. If the pod is rescheduled to a different node, it stays <code>Pending</code>. This is a known kind limitation — production clusters use <code>ReadWriteMany</code> NFS/EFS or cloud-native storage.</p>
+    </div>
+
+    <section class="lab">
+      <header><strong>Lab 6 · Persistent Volumes</strong></header>
+      <ol class="steps">
+        <li>Apply <code>08-pvc.yaml</code>. Confirm STATUS is <code>Bound</code> with <code>kubectl get pvc</code>.</li>
+        <li>Add the PVC volume mount to the Deployment. Apply and exec into a pod.</li>
+        <li>Write a file: <code>kubectl exec &lt;pod&gt; -- sh -c 'echo test > /data/test.txt'</code>.</li>
+        <li>Delete the pod. Wait for replacement. Read <code>/data/test.txt</code> from the new pod — verify it persists.</li>
+        <li><strong>Trial &amp; Error:</strong> Try to create a PVC with <code>storageClassName: does-not-exist</code>. The PVC stays in <code>Pending</code> indefinitely. Delete and fix the StorageClass name.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>7. RBAC</h2>
+
+    <p><strong>Role-Based Access Control (RBAC)</strong> controls who can do what to which Kubernetes resources. It uses four objects:</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Object</th><th>Scope</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>ServiceAccount</code></td><td>Namespace</td><td>Identity for a pod (like a user account for a workload)</td></tr>
+        <tr><td><code>Role</code></td><td>Namespace</td><td>Set of permissions on namespace-scoped resources</td></tr>
+        <tr><td><code>ClusterRole</code></td><td>Cluster</td><td>Set of permissions on cluster-scoped or cross-namespace resources</td></tr>
+        <tr><td><code>RoleBinding</code> / <code>ClusterRoleBinding</code></td><td>Namespace / Cluster</td><td>Attaches a Role to a subject (user, group, ServiceAccount)</td></tr>
+      </tbody>
+    </table></div>
+
+    <pre data-title="labs/k8s-reliability/09-rbac.yaml"><code><span class="c">---</span>
+<span class="k">apiVersion</span>: <span class="s">v1</span>
+<span class="k">kind</span>: <span class="s">ServiceAccount</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">reliability-api-sa</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+<span class="k">automountServiceAccountToken</span>: <span class="s">false</span>  <span class="c"># least privilege: opt-in mounting</span>
+<span class="c">---</span>
+<span class="k">apiVersion</span>: <span class="s">rbac.authorization.k8s.io/v1</span>
+<span class="k">kind</span>: <span class="s">Role</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">reliability-api-role</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+<span class="k">rules</span>:
+  - <span class="k">apiGroups</span>: <span class="s">[""]</span>
+    <span class="k">resources</span>: <span class="s">["pods"]</span>
+    <span class="k">verbs</span>: <span class="s">["get", "list", "watch"]</span>   <span class="c"># read-only</span>
+  - <span class="k">apiGroups</span>: <span class="s">[""]</span>
+    <span class="k">resources</span>: <span class="s">["configmaps"]</span>
+    <span class="k">verbs</span>: <span class="s">["get"]</span>
+<span class="c">---</span>
+<span class="k">apiVersion</span>: <span class="s">rbac.authorization.k8s.io/v1</span>
+<span class="k">kind</span>: <span class="s">RoleBinding</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: <span class="s">reliability-api-rolebinding</span>
+  <span class="k">namespace</span>: <span class="s">default</span>
+<span class="k">subjects</span>:
+  - <span class="k">kind</span>: <span class="s">ServiceAccount</span>
+    <span class="k">name</span>: <span class="s">reliability-api-sa</span>
+    <span class="k">namespace</span>: <span class="s">default</span>
+<span class="k">roleRef</span>:
+  <span class="k">kind</span>: <span class="s">Role</span>
+  <span class="k">name</span>: <span class="s">reliability-api-role</span>
+  <span class="k">apiGroup</span>: <span class="s">rbac.authorization.k8s.io</span></code></pre>
+
+    <pre data-title="Apply and verify RBAC permissions"><code><span class="c"># Apply all three RBAC objects</span>
+kubectl apply -f labs/k8s-reliability/09-rbac.yaml
+
+<span class="c"># Verify what the ServiceAccount can do</span>
+kubectl auth can-i list pods \
+  --as=system:serviceaccount:default:reliability-api-sa
+<span class="o">yes</span>
+
+kubectl auth can-i delete pods \
+  --as=system:serviceaccount:default:reliability-api-sa
+<span class="o">no</span>
+
+kubectl auth can-i get secrets \
+  --as=system:serviceaccount:default:reliability-api-sa
+<span class="o">no</span>
+
+<span class="c"># Assign the ServiceAccount to the Deployment</span>
+kubectl patch deployment reliability-api \
+  -p '{"spec":{"template":{"spec":{"serviceAccountName":"reliability-api-sa"}}}}'</code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 7 · RBAC</strong></header>
+      <ol class="steps">
+        <li>Apply <code>09-rbac.yaml</code>. Verify with <code>kubectl auth can-i list pods --as=system:serviceaccount:default:reliability-api-sa</code>.</li>
+        <li>Verify the ServiceAccount cannot delete pods or read secrets.</li>
+        <li>Assign the ServiceAccount to the Deployment and re-deploy.</li>
+        <li><strong>Trial &amp; Error:</strong> Remove the <code>get</code> verb from the Role for configmaps. Check what fails. Re-add it. This simulates debugging a real "forbidden" error.</li>
+        <li>Inspect the auto-mounted token: <code>kubectl exec &lt;pod&gt; -- cat /var/run/secrets/kubernetes.io/serviceaccount/token</code> — this is the JWT used for API authentication.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>8. Helm Basics</h2>
+
+    <p><strong>Helm</strong> is the package manager for Kubernetes. It bundles manifests into a <strong>chart</strong> — a versioned, parameterizable package. A chart installed into a cluster is called a <strong>release</strong>. Helm tracks release history so you can upgrade, inspect and rollback.</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Helm concept</th><th>Analogy</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Chart</strong></td><td>apt package / npm module</td><td>A directory (or <code>.tgz</code>) of templates, values, and metadata</td></tr>
+        <tr><td><strong>Release</strong></td><td>Installed package instance</td><td>One deployment of a chart with specific values and a name</td></tr>
+        <tr><td><strong>Repository</strong></td><td>apt source / npm registry</td><td>A collection of chart packages, hosted at a URL</td></tr>
+        <tr><td><strong>values.yaml</strong></td><td>config file</td><td>Default parameter values for the chart templates</td></tr>
+        <tr><td><strong>Revision</strong></td><td>package version history</td><td>Each upgrade/rollback increments the release revision number</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3>Install Helm</h3>
+    <pre data-title="Install Helm v3"><code><span class="c"># macOS / Linux via Homebrew</span>
+brew install helm
+
+<span class="c"># Linux — script install</span>
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+<span class="c"># Windows via Winget</span>
+winget install Helm.Helm
+
+<span class="c"># Verify</span>
+helm version
+<span class="o">version.BuildInfo{Version:"v3.16.4",...}</span></code></pre>
+
+    <h3>Install an existing chart</h3>
+    <pre data-title="Use the nginx Ingress chart as a worked example"><code><span class="c"># Add the ingress-nginx repository</span>
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+<span class="o">Hang tight while we grab the latest from your chart repositories...
+...Successfully got an update from the "ingress-nginx" chart repository</span>
+
+<span class="c"># Search for available charts</span>
+helm search repo ingress-nginx
+helm search hub nginx | head -10   <span class="c"># search Artifact Hub</span>
+
+<span class="c"># Install a chart into a namespace</span>
+helm install my-ingress ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace \
+  --set controller.service.type=NodePort
+
+<span class="c"># List installed releases</span>
+helm list -A
+<span class="o">NAME         NAMESPACE      REVISION   STATUS     CHART
+my-ingress   ingress-nginx  1          deployed   ingress-nginx-4.11.3</span>
+
+<span class="c"># Upgrade a release (e.g., change a value)</span>
+helm upgrade my-ingress ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --set controller.replicaCount=2
+
+<span class="c"># Rollback to a previous revision</span>
+helm rollback my-ingress 1 --namespace ingress-nginx
+
+<span class="c"># View release history</span>
+helm history my-ingress -n ingress-nginx
+
+<span class="c"># Uninstall the release (removes all k8s objects the chart created)</span>
+helm uninstall my-ingress -n ingress-nginx</code></pre>
+
+    <section class="lab">
+      <header><strong>Lab 8 · Helm Basics</strong></header>
+      <ol class="steps">
+        <li>Install Helm and verify: <code>helm version</code>.</li>
+        <li>Add the <code>ingress-nginx</code> repo: <code>helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx</code>.</li>
+        <li>Install it: <code>helm install my-ingress ingress-nginx/ingress-nginx -n ingress-nginx --create-namespace</code>.</li>
+        <li>Run <code>helm list -A</code> and <code>helm history my-ingress -n ingress-nginx</code>.</li>
+        <li>Upgrade with <code>--set controller.replicaCount=2</code>. Verify the revision bumped to 2.</li>
+        <li>Rollback: <code>helm rollback my-ingress 1 -n ingress-nginx</code>. Confirm revision 3 shows rollback.</li>
+        <li>Uninstall: <code>helm uninstall my-ingress -n ingress-nginx</code>.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>9. Create Your Own Helm Chart</h2>
+
+    <p>Now package everything you built in this lab — Deployment, Service, ConfigMap, Secret, PVC, RBAC — into a Helm chart for <code>reliability-api</code>.</p>
+
+    <pre data-title="Scaffold a new chart"><code><span class="c"># Scaffold generates a starter chart structure</span>
+helm create reliability-chart
+tree reliability-chart/
+<span class="o">reliability-chart/
+├── Chart.yaml           # chart metadata
+├── values.yaml          # default values
+├── charts/              # dependency charts (empty)
+└── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── ingress.yaml
+    ├── serviceaccount.yaml
+    ├── hpa.yaml
+    ├── NOTES.txt
+    └── _helpers.tpl     # reusable template snippets</span>
+
+<span class="c"># Edit Chart.yaml to describe your chart</span></code></pre>
+
+    <pre data-title="reliability-chart/Chart.yaml"><code><span class="k">apiVersion</span>: <span class="s">v2</span>
+<span class="k">name</span>: <span class="s">reliability-chart</span>
+<span class="k">description</span>: <span class="s">Helm chart for reliability-api — DevOps learning lab</span>
+<span class="k">type</span>: <span class="s">application</span>
+<span class="k">version</span>: <span class="s">0.1.0</span>        <span class="c"># chart version — bump on chart changes</span>
+<span class="k">appVersion</span>: <span class="s">"0.1.0"</span>   <span class="c"># app version — informational</span></code></pre>
+
+    <pre data-title="reliability-chart/values.yaml (key defaults)"><code><span class="k">replicaCount</span>: <span class="s">3</span>
+
+<span class="k">image</span>:
+  <span class="k">repository</span>: <span class="s">kumawatsunil/reliability-api</span>
+  <span class="k">tag</span>: <span class="s">"0.1.0"</span>
+  <span class="k">pullPolicy</span>: <span class="s">IfNotPresent</span>
+
+<span class="k">service</span>:
+  <span class="k">type</span>: <span class="s">ClusterIP</span>
+  <span class="k">port</span>: <span class="s">80</span>
+
+<span class="k">ingress</span>:
+  <span class="k">enabled</span>: <span class="s">false</span>
+  <span class="k">className</span>: <span class="s">nginx</span>
+  <span class="k">hosts</span>:
+    - <span class="k">host</span>: <span class="s">reliability.local</span>
+      <span class="k">paths</span>:
+        - <span class="k">path</span>: <span class="s">/</span>
+          <span class="k">pathType</span>: <span class="s">Prefix</span>
+
+<span class="k">resources</span>:
+  <span class="k">requests</span>:
+    <span class="k">cpu</span>: <span class="s">100m</span>
+    <span class="k">memory</span>: <span class="s">128Mi</span>
+  <span class="k">limits</span>:
+    <span class="k">memory</span>: <span class="s">256Mi</span>
+
+<span class="k">config</span>:
+  <span class="k">logLevel</span>: <span class="s">info</span>
+  <span class="k">readyDelaySeconds</span>: <span class="s">"5"</span></code></pre>
+
+    <pre data-title="reliability-chart/templates/deployment.yaml (Helm-templated version)"><code><span class="k">apiVersion</span>: <span class="s">apps/v1</span>
+<span class="k">kind</span>: <span class="s">Deployment</span>
+<span class="k">metadata</span>:
+  <span class="k">name</span>: {{ <span class="s">include "reliability-chart.fullname" .</span> }}
+  <span class="k">labels</span>: {{ <span class="s">include "reliability-chart.labels" . | nindent 4</span> }}
+<span class="k">spec</span>:
+  <span class="k">replicas</span>: {{ <span class="s">.Values.replicaCount</span> }}
+  <span class="k">selector</span>:
+    <span class="k">matchLabels</span>: {{ <span class="s">include "reliability-chart.selectorLabels" . | nindent 6</span> }}
+  <span class="k">template</span>:
+    <span class="k">metadata</span>:
+      <span class="k">labels</span>: {{ <span class="s">include "reliability-chart.selectorLabels" . | nindent 8</span> }}
+    <span class="k">spec</span>:
+      <span class="k">containers</span>:
+        - <span class="k">name</span>: {{ <span class="s">.Chart.Name</span> }}
+          <span class="k">image</span>: <span class="s">"{{ .Values.image.repository }}:{{ .Values.image.tag }}"</span>
+          <span class="k">imagePullPolicy</span>: {{ <span class="s">.Values.image.pullPolicy</span> }}
+          <span class="k">env</span>:
+            - <span class="k">name</span>: <span class="s">LOG_LEVEL</span>
+              <span class="k">value</span>: {{ <span class="s">.Values.config.logLevel | quote</span> }}
+            - <span class="k">name</span>: <span class="s">READY_DELAY_SECONDS</span>
+              <span class="k">value</span>: {{ <span class="s">.Values.config.readyDelaySeconds | quote</span> }}
+          <span class="k">ports</span>:
+            - <span class="k">containerPort</span>: <span class="s">8000</span>
+          <span class="k">resources</span>: {{ <span class="s">toYaml .Values.resources | nindent 12</span> }}</code></pre>
+
+    <pre data-title="Render, lint, install and upgrade the chart"><code><span class="c"># Render templates locally (no cluster required — great for debugging)</span>
+helm template my-release ./reliability-chart
+
+<span class="c"># Lint — checks for common errors</span>
+helm lint ./reliability-chart
+
+<span class="c"># Install the release</span>
+helm install reliability-api ./reliability-chart \
+  --namespace reliability-lab \
+  --create-namespace
+
+<span class="c"># Verify resources were created</span>
+helm list -n reliability-lab
+kubectl get all -n reliability-lab
+
+<span class="c"># Override values at install time</span>
+helm install reliability-api ./reliability-chart \
+  --set replicaCount=5 \
+  --set config.logLevel=debug
+
+<span class="c"># Upgrade to a new configuration</span>
+helm upgrade reliability-api ./reliability-chart \
+  --set image.tag=0.2.0 \
+  --set replicaCount=3 \
+  -n reliability-lab
+
+<span class="c"># Check history</span>
+helm history reliability-api -n reliability-lab
+<span class="o">REVISION   UPDATED                    STATUS      CHART                  DESCRIPTION
+1          Sun Nov 01 15:30:00 2026   superseded  reliability-chart-0.1.0  Install complete
+2          Sun Nov 01 15:45:00 2026   deployed    reliability-chart-0.1.0  Upgrade complete</span>
+
+<span class="c"># Rollback to revision 1</span>
+helm rollback reliability-api 1 -n reliability-lab
+
+<span class="c"># Uninstall the release (removes all k8s objects it created)</span>
+helm uninstall reliability-api -n reliability-lab</code></pre>
+
+    <div class="callout tip">
+      <span class="label">helm template is your best debugging tool</span>
+      <p><code>helm template</code> renders the chart templates into raw YAML without touching the cluster. Use it to verify that your values are being substituted correctly before applying. Combine with <code>| kubectl apply --dry-run=client -f -</code> for a full validation pass.</p>
+    </div>
+
+    <section class="lab">
+      <header><strong>Lab 9 · Create Your Own Helm Chart</strong></header>
+      <ol class="steps">
+        <li>Run <code>helm create reliability-chart</code>. Explore the generated files.</li>
+        <li>Update <code>Chart.yaml</code> with your chart name and version.</li>
+        <li>Edit <code>values.yaml</code> to set the correct image repo and tag.</li>
+        <li>Run <code>helm template my-release ./reliability-chart</code> and verify the rendered YAML looks correct.</li>
+        <li>Run <code>helm lint ./reliability-chart</code> — fix any warnings.</li>
+        <li>Install: <code>helm install reliability-api ./reliability-chart -n reliability-lab --create-namespace</code>.</li>
+        <li>Upgrade with <code>--set replicaCount=5</code>. Verify 5 pods appear. Check <code>helm history</code>.</li>
+        <li>Rollback: <code>helm rollback reliability-api 1 -n reliability-lab</code>. Verify 3 pods again.</li>
+        <li><strong>Trial &amp; Error:</strong> Introduce a syntax error in a template (e.g., unclosed <code>{{</code>). Run <code>helm lint</code> — it should catch it. Fix it.</li>
+      </ol>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>Cleanup</h2>
+
+    <pre data-title="Full teardown of all lab resources"><code><span class="c"># Uninstall Helm release (if installed)</span>
+helm uninstall reliability-api -n reliability-lab 2>/dev/null || true
+
+<span class="c"># Delete all raw manifests</span>
+kubectl delete -f labs/k8s-reliability/ --ignore-not-found
+
+<span class="c"># Delete namespaces</span>
+kubectl delete namespace reliability-lab --ignore-not-found
+kubectl delete namespace ingress-nginx --ignore-not-found
+
+<span class="c"># Delete the entire kind cluster</span>
+kind delete cluster --name reliability-lab
+
+<span class="c"># Verify</span>
+kind get clusters
+<span class="o">No kind clusters found.</span></code></pre>
+
+    <div class="callout note">
+      <span class="label">What you built</span>
+      <p>In Labs 03 and 04 you deployed a production-grade application to Kubernetes from scratch: multi-node cluster → bare Pod → self-healing Deployment → health probes → resource management → rolling updates → namespaces → ClusterIP/NodePort Services → DNS discovery → Ingress → ConfigMaps → Secrets → PersistentVolumeClaims → RBAC → Helm chart. This is the complete DevOps stack for a Kubernetes-native service.</p>
+    </div>
+
+  </article></main>
+</div>
+</body>
+</html>

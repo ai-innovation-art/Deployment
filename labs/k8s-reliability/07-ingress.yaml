@@ -1,0 +1,36 @@
+# Nginx Ingress — HTTP path-based routing into the cluster.
+# Prerequisites:
+#   kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+#
+# After applying, test with:
+#   curl http://localhost/api/health     (routes to reliability-api /health)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: reliability-api-ingress
+  namespace: default
+  labels:
+    app.kubernetes.io/name: reliability-api
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2       # strip /api prefix
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ""    # empty = match any host (good for kind/localhost)
+      http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: reliability-api
+                port:
+                  number: 80
+          - path: /metrics
+            pathType: Exact
+            backend:
+              service:
+                name: reliability-api
+                port:
+                  number: 80

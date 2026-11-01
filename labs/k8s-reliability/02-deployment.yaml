@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reliability-api
+  namespace: default
+  labels:
+    app.kubernetes.io/name: reliability-api
+    app.kubernetes.io/version: "0.1.0"
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    description: "Reliability API — demonstrates Kubernetes workload patterns"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reliability-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1           # At most 4 pods total (3 + 1) during an update
+      maxUnavailable: 0     # Never drop below 3 ready pods
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reliability-api
+        app.kubernetes.io/version: "0.1.0"
+        env: lab
+    spec:
+      # Spread pods across nodes for resilience
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: reliability-api
+      containers:
+        - name: reliability-api
+          image: kumawatsunil/reliability-api:0.1.0
+          imagePullPolicy: IfNotPresent   # critical for kind: use loaded local image
+          ports:
+            - containerPort: 8000
+              name: http
+              protocol: TCP
+          env:
+            - name: LOG_LEVEL
+              value: "info"
+            - name: READY_DELAY_SECONDS
+              value: "5"       # Simulate slow startup for readiness probe demo
+          resources:
+            requests:
+              cpu: "100m"      # 0.1 CPU cores — used by scheduler for placement
+              memory: "128Mi"  # 128 MiB — guaranteed allocation
+            limits:
+              memory: "256Mi"  # OOMKilled at 256 MiB (exit code 137)
+              # No CPU limit: avoid throttling, let the CFS scheduler share freely
+          # startupProbe runs first — gates liveness and readiness until it succeeds.
+          # Gives the app up to 30 × 3s = 90 seconds to start.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 30
+            periodSeconds: 3
+          # livenessProbe — "Is the process stuck?" → restart container on failure.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 0   # startup probe guards us; no extra delay needed
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 2
+          # readinessProbe — "Should this pod receive traffic?" → remove from Service endpoints on failure.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+            timeoutSeconds: 2
+          # Graceful shutdown — give in-flight requests time to complete
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+      terminationGracePeriodSeconds: 30
