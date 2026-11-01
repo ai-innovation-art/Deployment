@@ -100,6 +100,17 @@ docker pull nginx@sha256:67682bda769fae1ccf5183192b8daf37b64cae99c6c3302650f6f8b
 <span class="c"># Pull for a specific platform (useful on Apple Silicon to test AMD64 images)</span>
 docker pull --platform linux/amd64 nginx:alpine</code></pre>
 
+    <section class="lab">
+      <header>🚨 Trial &amp; Error Drill: Image Pull Failures (Typo / Missing Tag)</header>
+      <div class="body">
+        <p><strong>Step 1:</strong> Try pulling a non-existent tag or mistyped repository name:</p>
+        <pre data-title="Attempt pulling invalid tag"><code>docker pull nginx:this-tag-does-not-exist</code></pre>
+        <p><strong>What you observe (The Error):</strong></p>
+        <pre data-title="Error output"><code><span class="o">Error response from daemon: manifest for nginx:this-tag-does-not-exist not found: manifest unknown: manifest unknown</span></code></pre>
+        <p><strong>How to diagnose &amp; resolve:</strong> Docker Hub tells you the manifest is unknown. Check the official tags on Docker Hub (or search via CLI: <code>docker search nginx</code>). Never rely on undocumented tags in production.</p>
+      </div>
+    </section>
+
     <h3>Listing images</h3>
     <pre data-title="docker images / docker image ls"><code><span class="c"># Default list: REPOSITORY  TAG  IMAGE ID  CREATED  SIZE</span>
 docker images
@@ -309,6 +320,41 @@ kind load docker-image reliability-api:0.1.0 --name reliability-lab
       <tr><td><code>--hostname</code></td><td>Set the container's hostname</td><td><code>--hostname api-node-1</code></td></tr>
     </table></div>
 
+    <section class="lab">
+      <header>🚨 Trial &amp; Error Drills: Common docker run Errors &amp; How to Diagnose Them</header>
+      <div class="body">
+        <p>Before moving to advanced projects, practice generating these classic container errors in your terminal. Seeing the exact error and resolving it builds instant troubleshooting muscle memory.</p>
+
+        <p><strong>Drill 1: Container Name Collision</strong></p>
+        <pre data-title="Step 1: Start first container"><code>docker run -d --name web_app nginx:alpine</code></pre>
+        <pre data-title="Step 2: Try reusing the same name"><code>docker run -d --name web_app nginx:alpine</code></pre>
+        <p><strong>What you observe (The Error):</strong></p>
+        <pre data-title="Error output"><code><span class="o">docker: Error response from daemon: Conflict. The container name "/web_app" is already in use by container "abc123...". You have to remove (or rename) that container to be able to reuse that name.</span></code></pre>
+        <p><strong>How to diagnose &amp; resolve:</strong> Check who owns the name with <code>docker ps -a --filter name=web_app</code>. Either remove the old container with <code>docker rm -f web_app</code> or assign a distinct name.</p>
+
+        <p><strong>Drill 2: Host Port Conflict (Address Already in Use)</strong></p>
+        <pre data-title="Step 1: Bind port 8080 to first container"><code>docker run -d -p 8080:80 --name web1 nginx:alpine</code></pre>
+        <pre data-title="Step 2: Attempt binding same port 8080 to second container"><code>docker run -d -p 8080:80 --name web2 nginx:alpine</code></pre>
+        <p><strong>What you observe (The Error):</strong></p>
+        <pre data-title="Error output"><code><span class="o">docker: Error response from daemon: driver failed programming external connectivity on endpoint web2: Bind for 0.0.0.0:8080 failed: port is already allocated.</span></code></pre>
+        <p><strong>How to diagnose &amp; resolve:</strong> Find which container holds the port with <code>docker ps --filter publish=8080</code>. Either stop it with <code>docker rm -f web1</code> or choose another host port like <code>-p 8081:80</code>.</p>
+
+        <p><strong>Drill 3: Read-Only Filesystem Violation</strong></p>
+        <pre data-title="Try writing inside a --read-only container"><code>docker run --rm --read-only alpine touch /tmp/test.txt</code></pre>
+        <p><strong>What you observe (The Error):</strong></p>
+        <pre data-title="Error output"><code><span class="o">touch: /tmp/test.txt: Read-only file system</span></code></pre>
+        <p><strong>How to diagnose &amp; resolve:</strong> The root filesystem is immutable. To provide writable scratch space for temporary files, mount a memory-backed tmpfs: <code>docker run --rm --read-only --tmpfs /tmp alpine touch /tmp/test.txt</code> (succeeds cleanly).</p>
+
+        <p><strong>Drill 4: Privileged Port Binding as Non-Root</strong></p>
+        <pre data-title="Try binding port 80 without root"><code>docker run --rm --user 1000 python:3.12-slim python -m http.server 80</code></pre>
+        <p><strong>What you observe (The Error):</strong></p>
+        <pre data-title="Error output"><code><span class="o">PermissionError: [Errno 13] Permission denied</span></code></pre>
+        <p><strong>How to diagnose &amp; resolve:</strong> Linux ports below 1024 require root or <code>CAP_NET_BIND_SERVICE</code>. Either run on an unprivileged port (e.g. 8000) and publish it to 80 via <code>-p 80:8000</code>, or add the capability explicitly: <code>--cap-add NET_BIND_SERVICE</code>.</p>
+
+        <p><strong>Clean up:</strong> <code>docker rm -f web_app web1 web2 2>/dev/null</code></p>
+      </div>
+    </section>
+
     <pre data-title="Canonical run for reliability-api"><code><span class="c"># Run the app, detached, with a name, published port, resource limits, and auto-restart</span>
 docker run -d \
   --name reliability-api \
@@ -410,10 +456,20 @@ docker container prune
 <span class="c"># One-liner: stop + remove all running containers (DANGEROUS in shared environments)</span>
 docker rm -f $(docker ps -q)</code></pre>
 
-    <div class="callout warn">
-      <span class="label">Removing a running container</span>
-      <p><code>docker rm</code> on a running container gives: <em>Error response from daemon: You cannot remove a running container … Stop the container before attempting removal or force remove</em>. Use <code>docker rm -f</code> to force, or <code>docker stop &amp;&amp; docker rm</code> for a clean shutdown.</p>
-    </div>
+    <section class="lab">
+      <header>🚨 Trial &amp; Error Drill: Removing a Running Container</header>
+      <div class="body">
+        <p><strong>Step 1:</strong> Start a long-running container:</p>
+        <pre data-title="Start container"><code>docker run -d --name c_locked alpine sleep 100</code></pre>
+        <p><strong>Step 2:</strong> Try to remove it directly:</p>
+        <pre data-title="Attempt removal without stopping"><code>docker rm c_locked</code></pre>
+        <p><strong>What you observe (The Error):</strong></p>
+        <pre data-title="Error output"><code><span class="o">Error response from daemon: You cannot remove a running container abc123... Stop the container before attempting removal or force remove</span></code></pre>
+        <p><strong>How to resolve:</strong></p>
+        <p>Option A (Graceful shutdown): <code>docker stop c_locked &amp;&amp; docker rm c_locked</code></p>
+        <p>Option B (Immediate forceful termination + removal): <code>docker rm -f c_locked</code></p>
+      </div>
+    </section>
 
     <h3>exec — run commands inside a running container</h3>
     <pre data-title="docker exec"><code><span class="c"># Open an interactive shell inside a running container</span>
@@ -430,6 +486,26 @@ docker exec -e DEBUG=1 reliability-api env | grep DEBUG
 
 <span class="c"># Change working directory for the exec session</span>
 docker exec -w /tmp reliability-api ls</code></pre>
+
+    <section class="lab">
+      <header>🚨 Trial &amp; Error Drills: Common docker exec Errors &amp; Fixes</header>
+      <div class="body">
+        <p><strong>Drill 1: Executing in a Stopped Container</strong></p>
+        <pre data-title="Create stopped container and attempt exec"><code>docker create --name c_dormant alpine
+docker exec -it c_dormant sh</code></pre>
+        <p><strong>What you observe (The Error):</strong></p>
+        <pre data-title="Error output"><code><span class="o">Error response from daemon: Container abc123... is not running</span></code></pre>
+        <p><strong>How to resolve:</strong> You cannot exec into a container unless PID 1 is actively running. Start it first: <code>docker start c_dormant &amp;&amp; docker exec -it c_dormant sh</code>.</p>
+
+        <p><strong>Drill 2: Executing a Missing Shell/Binary (bash in Alpine)</strong></p>
+        <pre data-title="Start Alpine container and try bash"><code>docker run -d --name c_alp alpine sleep 100
+docker exec -it c_alp bash</code></pre>
+        <p><strong>What you observe (The Error):</strong></p>
+        <pre data-title="Error output"><code><span class="o">OCI runtime exec failed: exec failed: unable to start container process: exec: "bash": executable file not found in $PATH: unknown</span></code></pre>
+        <p><strong>How to resolve:</strong> Minimal distributions like Alpine or distroless images do not ship with <code>/bin/bash</code>. Use POSIX <code>sh</code>: <code>docker exec -it c_alp sh</code>.</p>
+        <p><strong>Clean up:</strong> <code>docker rm -f c_dormant c_alp 2>/dev/null</code></p>
+      </div>
+    </section>
 
     <section class="lab">
       <header>exec experiments — verify container isolation</header>
@@ -609,6 +685,23 @@ docker run -d --name reliability-api -v api-data:/app/data reliability-api:0.1.0
       </div>
     </section>
 
+    <section class="lab">
+      <header>🚨 Trial &amp; Error Drill: Deleting a Volume in Use</header>
+      <div class="body">
+        <p><strong>Step 1:</strong> Create a volume and attach it to a running container:</p>
+        <pre data-title="Create and attach volume"><code>docker volume create locked_vol
+docker run -d --name c_vol -v locked_vol:/data alpine sleep 100</code></pre>
+        <p><strong>Step 2:</strong> Attempt to delete the volume while the container is attached:</p>
+        <pre data-title="Attempt deletion"><code>docker volume rm locked_vol</code></pre>
+        <p><strong>What you observe (The Error):</strong></p>
+        <pre data-title="Error output"><code><span class="o">Error response from daemon: remove locked_vol: volume is in use - [c_vol]</span></code></pre>
+        <p><strong>How to resolve:</strong> Docker prevents accidental data deletion. You must remove or stop and remove the referencing container first:</p>
+        <pre data-title="Resolution"><code>docker rm -f c_vol
+docker volume rm locked_vol
+<span class="o">locked_vol</span></code></pre>
+      </div>
+    </section>
+
     <h3>Bind mounts</h3>
     <pre data-title="Bind mounts"><code><span class="c"># Mount a host directory into the container — changes are bidirectional</span>
 docker run -d \
@@ -778,6 +871,28 @@ docker inspect --format '{{range .State.Health.Log}}{{.ExitCode}} {{.Output}}{{e
       <tr><td>Startup grace</td><td><code>--start-period</code></td><td><code>startupProbe</code> (separate probe that blocks others)</td></tr>
       <tr><td>Probe types</td><td>cmd only</td><td>exec, httpGet, tcpSocket, grpc</td></tr>
     </table></div>
+
+    <section class="lab">
+      <header>🚨 Trial &amp; Error Drill: Simulating an Unhealthy Container</header>
+      <div class="body">
+        <p><strong>Step 1:</strong> Start a container with an intentionally failing health check command (<code>false</code> returns exit code 1):</p>
+        <pre data-title="Run with failing healthcheck"><code>docker run -d --name c_unhealthy \
+  --health-cmd "false" \
+  --health-interval 2s \
+  --health-retries 2 \
+  alpine sleep 100</code></pre>
+        <p><strong>Step 2:</strong> Wait 5 seconds and check status:</p>
+        <pre data-title="Check container status"><code>docker ps --filter name=c_unhealthy --format "table {{.Names}}\t{{.Status}}"</code></pre>
+        <p><strong>What you observe:</strong></p>
+        <pre data-title="Status output"><code><span class="o">NAMES          STATUS
+c_unhealthy    Up 6 seconds (unhealthy)</span></code></pre>
+        <p><strong>Critical Observation:</strong> The container was <strong>NOT killed or restarted</strong>! Plain Docker marks it <code>unhealthy</code>, but leaves the process running. In Kubernetes, a failing liveness probe triggers an automatic container restart.</p>
+        <p><strong>Diagnosis:</strong> Inspect why the health check failed:</p>
+        <pre data-title="Inspect health check logs"><code>docker inspect --format '{{range .State.Health.Log}}exit={{.ExitCode}} {{.Output}}{{end}}' c_unhealthy
+<span class="o">exit=1</span></code></pre>
+        <p><strong>Clean up:</strong> <code>docker rm -f c_unhealthy</code></p>
+      </div>
+    </section>
 
     <!-- ============================================================ -->
     <h2>6. Docker Compose</h2>
