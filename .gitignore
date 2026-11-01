@@ -25,3 +25,7 @@ video-src/__pycache__/
 
 # Local scratch
 labs/scratch/
+
+# Video files
+*.mp4
+

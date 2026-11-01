@@ -1,0 +1,1134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 02 · Docker — DevOps Lab</title>
+<link rel="stylesheet" href="../notes-animated/assets/style.css">
+<script src="../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../index.html">DevOps Lab</a>
+  <span class="crumb">Labs · Module 02 · Docker</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+    <h1>Lab 02 · Docker</h1>
+    <p class="lede">Complete Docker practical reference — images, containers, volumes, networks, Dockerfile instructions, health checks, Compose, failure cases, and cleanup. Every command is runnable in GitHub Codespaces.</p>
+    <div class="meta">
+      <span class="pill accent">Prereq: Module 01 — Linux &amp; Networking</span>
+      <span class="pill">≈ 4–6 h lab</span>
+      <span class="pill">Docker pre-installed in Codespaces</span>
+      <span class="verified">✓ Checked against docs.docker.com · Oct 2026</span>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>0. Environment Setup (GitHub Codespaces)</h2>
+
+    <div class="callout note">
+      <span class="label">Docker in Codespaces</span>
+      <p>GitHub Codespaces ships with Docker pre-installed (Docker Engine inside a Devcontainer). You do <strong>not</strong> need to install anything. Open a terminal and the commands below work immediately. The Docker daemon runs as root; your <code>$USER</code> is added to the <code>docker</code> group so you can run <code>docker</code> without <code>sudo</code>.</p>
+    </div>
+
+    <pre data-title="Verify Docker is working"><code>docker version
+<span class="c"># Shows Client and Server (Engine) version. Both must appear — if Server is missing, the daemon is not running.</span>
+
+docker info
+<span class="c"># Shows storage driver, cgroup driver, total images/containers, registry config.</span>
+<span class="c"># Key things to check: Storage Driver (overlay2 is correct), Cgroup Driver (cgroupfs or systemd).</span></code></pre>
+
+    <pre data-title="Example output (yours will differ in version numbers)"><code><span class="o">Client: Docker Engine - Community
+ Version:           26.1.4
+ API version:       1.45
+
+Server: Docker Engine - Community
+ Engine:
+  Version:          26.1.4
+  API version:      1.45 (minimum version 1.24)
+  Storage Driver:   overlay2</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>1. Images</h2>
+
+    <h3>Pulling images</h3>
+    <pre data-title="docker pull — all variants"><code><span class="c"># Pull latest tag (implicit) from Docker Hub</span>
+docker pull nginx
+
+<span class="c"># Pull a specific tag</span>
+docker pull nginx:1.27-alpine
+
+<span class="c"># Pull from GitHub Container Registry (ghcr.io)</span>
+docker pull ghcr.io/your-org/reliability-api:latest
+
+<span class="c"># Pull by digest — immutable, no tag drift</span>
+docker pull nginx@sha256:67682bda769fae1ccf5183192b8daf37b64cae99c6c3302650f6f8bf5f0f95df
+
+<span class="c"># Pull for a specific platform (useful on Apple Silicon to test AMD64 images)</span>
+docker pull --platform linux/amd64 nginx:alpine</code></pre>
+
+    <h3>Listing images</h3>
+    <pre data-title="docker images / docker image ls"><code><span class="c"># Default list: REPOSITORY  TAG  IMAGE ID  CREATED  SIZE</span>
+docker images
+
+<span class="c"># New-style equivalent</span>
+docker image ls
+
+<span class="c"># Show all images including intermediate layers</span>
+docker image ls -a
+
+<span class="c"># Filter by reference (name pattern)</span>
+docker image ls --filter reference=nginx
+
+<span class="c"># Filter dangling images (untagged, leftover after rebuild)</span>
+docker image ls --filter dangling=true
+
+<span class="c"># Custom format: only names and sizes</span>
+docker image ls --format "{{.Repository}}:{{.Tag}}\t{{.Size}}"
+
+<span class="c"># JSON output (scriptable)</span>
+docker image ls --format json</code></pre>
+
+    <h3>Inspecting images</h3>
+    <pre data-title="docker inspect — Go templates"><code><span class="c"># Full JSON dump of an image</span>
+docker inspect nginx:alpine
+
+<span class="c"># Extract the default command (Cmd)</span>
+docker inspect --format '{{json .Config.Cmd}}' nginx:alpine
+
+<span class="c"># Extract all environment variables</span>
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' nginx:alpine
+
+<span class="c"># Extract exposed ports</span>
+docker inspect --format '{{json .Config.ExposedPorts}}' nginx:alpine
+
+<span class="c"># Count the number of layers</span>
+docker inspect --format '{{len .RootFS.Layers}}' nginx:alpine
+
+<span class="c"># Get the image digest</span>
+docker inspect --format '{{index .RepoDigests 0}}' nginx:alpine</code></pre>
+
+    <h3>Tagging</h3>
+    <pre data-title="docker tag"><code><span class="c"># Tag an existing image with a new name. This does NOT copy — it's just a new pointer to the same IMAGE ID.</span>
+docker tag nginx:alpine myregistry.io/myteam/nginx:1.27-alpine
+
+<span class="c"># Verify: both tags show the SAME IMAGE ID</span>
+docker image ls myregistry.io/myteam/nginx
+docker image ls nginx:alpine
+<span class="c"># → Both rows will have identical IMAGE ID — they share all layers.</span></code></pre>
+
+    <div class="callout note">
+      <span class="label">Tags are pointers, not copies</span>
+      <p>Running <code>docker tag</code> does <em>not</em> copy any data. It creates a new name (reference) pointing to the same image ID and its layers. Disk usage doesn't increase.</p>
+    </div>
+
+    <h3>Building images</h3>
+    <pre data-title="docker build — all important flags"><code><span class="c"># Basic build from current directory (Dockerfile must exist here)</span>
+docker build -t reliability-api:0.1.0 .
+
+<span class="c"># Specify a different Dockerfile location</span>
+docker build -f docker/Dockerfile.prod -t reliability-api:prod .
+
+<span class="c"># Pass a build argument (ARG in Dockerfile)</span>
+docker build --build-arg APP_VERSION=0.1.0 -t reliability-api:0.1.0 .
+
+<span class="c"># Disable the build cache entirely</span>
+docker build --no-cache -t reliability-api:fresh .
+
+<span class="c"># Always pull the FROM base image even if cached locally</span>
+docker build --pull -t reliability-api:0.1.0 .
+
+<span class="c"># Show full output (no progress bars — useful for CI logs)</span>
+docker build --progress=plain -t reliability-api:0.1.0 .
+
+<span class="c"># Target a specific build stage in a multi-stage Dockerfile</span>
+docker build --target builder -t reliability-api:builder-only .
+
+<span class="c"># Multi-platform build with buildx (cross-compile)</span>
+docker buildx build --platform linux/amd64,linux/arm64 -t reliability-api:0.1.0 --push .
+<span class="c"># Note: --push is required with buildx multi-platform (no local image is stored)</span></code></pre>
+
+    <section class="lab">
+      <header>Cache behavior experiment</header>
+      <div class="body">
+        <p>Understanding when Docker uses the cache prevents mysterious stale builds. Create this Dockerfile:</p>
+        <pre data-title="Dockerfile.cache-demo"><code><span class="k">FROM</span> python:3.12-slim
+<span class="k">WORKDIR</span> /app
+<span class="c"># Layer 1: copy only requirements → only invalidated when requirements change</span>
+<span class="k">COPY</span> requirements.txt .
+<span class="c"># Layer 2: install deps → only re-runs when requirements.txt changes</span>
+<span class="k">RUN</span> pip install --no-cache-dir -r requirements.txt
+<span class="c"># Layer 3: copy app code → invalidated on every code change, but does NOT re-run pip</span>
+<span class="k">COPY</span> app/ ./app/
+<span class="k">CMD</span> ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0"]</code></pre>
+        <ol class="steps">
+          <li>Build once: <code>docker build -f Dockerfile.cache-demo -t cache-demo:1 .</code> — all layers build fresh.</li>
+          <li>Build again without changes: <code>docker build -f Dockerfile.cache-demo -t cache-demo:2 .</code> — all layers say <code>CACHED</code>.</li>
+          <li>Touch a source file: <code>echo "# comment" &gt;&gt; app/main.py</code>, then rebuild. Only the <code>COPY app/</code> layer re-runs; <code>pip install</code> is still <code>CACHED</code>.</li>
+          <li>Change <code>requirements.txt</code> (add any package), rebuild. Both <code>pip install</code> AND <code>COPY app/</code> re-run — cache is invalidated from the changed layer downward.</li>
+        </ol>
+      </div>
+    </section>
+
+    <h3>Removing images</h3>
+    <pre data-title="docker rmi / docker image rm"><code><span class="c"># Remove by tag</span>
+docker rmi nginx:alpine
+
+<span class="c"># Remove by image ID (removes all tags pointing to it)</span>
+docker image rm abc123def456
+
+<span class="c"># Force remove even if a container (stopped) uses it</span>
+docker rmi -f nginx:alpine
+
+<span class="c"># Remove all dangling (untagged) images</span>
+docker image prune
+
+<span class="c"># Remove ALL unused images (not referenced by any container)</span>
+docker image prune -a</code></pre>
+
+    <div class="callout warn">
+      <span class="label">Edge case: removing an image a running container uses</span>
+      <p>If you try <code>docker rmi nginx:alpine</code> while a container is using it, Docker returns an error:</p>
+      <pre data-title="Error output"><code><span class="o">Error response from daemon: conflict: unable to remove repository reference "nginx:alpine" (must force) - container abc123 is using its referenced image def456</span></code></pre>
+      <p>If you run <code>docker rmi -f nginx:alpine</code>, Docker <strong>untags</strong> the image (removes the <code>nginx:alpine</code> label) but the underlying image bytes are <em>not</em> deleted — the running container holds a reference that keeps the data alive. The image disappears from <code>docker images</code> but continues to function for the container. The bytes are garbage-collected only when the last container using them is removed.</p>
+    </div>
+
+    <h3>Save and load images</h3>
+    <pre data-title="docker save / docker load"><code><span class="c"># Save an image to a tar file (useful for air-gapped transfer)</span>
+docker save reliability-api:0.1.0 -o reliability-api.tar
+
+<span class="c"># Save multiple images into one archive</span>
+docker save nginx:alpine python:3.12-slim -o base-images.tar
+
+<span class="c"># Load image(s) from a tar file</span>
+docker load -i reliability-api.tar
+
+<span class="c"># kind clusters require images to be explicitly loaded — they don't share the host Docker daemon's cache</span>
+kind load docker-image reliability-api:0.1.0 --name reliability-lab
+<span class="c"># Internally kind uses docker save | docker load into the kind node container.</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>2. Containers</h2>
+
+    <h3>Lifecycle state machine</h3>
+    <figure class="diagram">
+      <pre style="background:var(--surface);border:none;padding:0;font-size:13px;line-height:1.6"><code>
+  docker create          docker start          docker pause
+ ┌──────────┐          ┌──────────────┐       ┌────────────┐
+ │          │          │              │ ──────▶│  paused    │
+ │  created │ ────────▶│   running    │        └────────────┘
+ │          │          │   (PID 1     │ ◀──────  docker unpause
+ └──────────┘          │   alive)     │
+                        │              │ ──────▶ docker stop (SIGTERM → SIGKILL after timeout)
+          docker run    │              │ ──────▶ docker kill (SIGKILL immediately)
+          (create+start)└──────────────┘
+                                │
+                         process exits / killed
+                                │
+                                ▼
+                         ┌────────────┐         docker rm
+                         │   exited   │ ────────────────────▶ (removed)
+                         └────────────┘
+
+  docker run --rm  → exited state is skipped; container is auto-removed on exit
+      </code></pre>
+      <figcaption>Container lifecycle states and the Docker commands that drive each transition.</figcaption>
+    </figure>
+
+    <h3>create vs run</h3>
+    <dl class="defs">
+      <dt><code>docker create</code></dt>
+      <dd>Creates a container (allocates filesystem layer, assigns ID) but does <em>not</em> start it. PID 1 is not launched. Useful when you need the container ID before starting (e.g., to <code>docker cp</code> files into it first).</dd>
+      <dt><code>docker run</code></dt>
+      <dd><code>docker create</code> + <code>docker start</code> in one step. This is what you use 99% of the time.</dd>
+      <dt><code>docker start</code></dt>
+      <dd>Starts an existing (created or exited) container. PID 1 launches and the container enters <em>running</em> state.</dd>
+    </dl>
+
+    <h3>docker run flags</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Flag</th><th>Meaning</th><th>Example</th></tr>
+      <tr><td><code>-d</code></td><td>Detached — run in background, print container ID</td><td><code>docker run -d nginx</code></td></tr>
+      <tr><td><code>-it</code></td><td><code>-i</code> (stdin open) + <code>-t</code> (pseudo-TTY) — interactive shell</td><td><code>docker run -it ubuntu bash</code></td></tr>
+      <tr><td><code>--rm</code></td><td>Auto-remove container when it exits</td><td><code>docker run --rm alpine echo hi</code></td></tr>
+      <tr><td><code>--name</code></td><td>Give the container a human-readable name</td><td><code>docker run --name api reliability-api:0.1.0</code></td></tr>
+      <tr><td><code>-p HOST:CONTAINER</code></td><td>Publish a container port to the host</td><td><code>-p 8080:8000</code></td></tr>
+      <tr><td><code>-p HOST_IP:HOST:CONTAINER</code></td><td>Bind to a specific host interface</td><td><code>-p 127.0.0.1:8080:8000</code></td></tr>
+      <tr><td><code>-P</code> (capital)</td><td>Publish all EXPOSEd ports to random host ports</td><td><code>docker run -d -P nginx</code></td></tr>
+      <tr><td><code>-e KEY=VALUE</code></td><td>Set an environment variable</td><td><code>-e LOG_LEVEL=debug</code></td></tr>
+      <tr><td><code>--env-file</code></td><td>Load environment variables from a file</td><td><code>--env-file .env.local</code></td></tr>
+      <tr><td><code>--memory</code></td><td>Hard memory limit (OOMKill if exceeded)</td><td><code>--memory 256m</code></td></tr>
+      <tr><td><code>--cpus</code></td><td>CPU quota (fractional cores allowed)</td><td><code>--cpus 0.5</code></td></tr>
+      <tr><td><code>--restart</code></td><td>Restart policy: <code>no</code> (default), <code>on-failure</code>, <code>always</code>, <code>unless-stopped</code></td><td><code>--restart on-failure:3</code></td></tr>
+      <tr><td><code>--init</code></td><td>Use tini as PID 1 — proper signal forwarding and zombie reaping</td><td><code>docker run --init myapp</code></td></tr>
+      <tr><td><code>--stop-timeout</code></td><td>Seconds to wait for SIGTERM before sending SIGKILL (default: 10)</td><td><code>--stop-timeout 30</code></td></tr>
+      <tr><td><code>--read-only</code></td><td>Mount container's root filesystem read-only</td><td><code>--read-only --tmpfs /tmp</code></td></tr>
+      <tr><td><code>--tmpfs</code></td><td>Mount a tmpfs (RAM disk) inside the container</td><td><code>--tmpfs /run:size=64m</code></td></tr>
+      <tr><td><code>--cap-drop</code></td><td>Drop Linux capabilities (harden the container)</td><td><code>--cap-drop ALL --cap-add NET_BIND_SERVICE</code></td></tr>
+      <tr><td><code>--security-opt</code></td><td>Security options (seccomp, apparmor, no-new-privileges)</td><td><code>--security-opt no-new-privileges</code></td></tr>
+      <tr><td><code>--network</code></td><td>Connect to a network: <code>bridge</code>, <code>host</code>, <code>none</code>, or a named network</td><td><code>--network mynet</code></td></tr>
+      <tr><td><code>-v VOLUME:PATH</code></td><td>Named volume shorthand</td><td><code>-v mydata:/app/data</code></td></tr>
+      <tr><td><code>-v HOST_PATH:PATH</code></td><td>Bind mount shorthand</td><td><code>-v $(pwd)/src:/app/src</code></td></tr>
+      <tr><td><code>--mount</code></td><td>Explicit mount syntax (preferred for clarity)</td><td><code>--mount type=volume,src=mydata,dst=/data</code></td></tr>
+      <tr><td><code>--user</code></td><td>Run as a specific UID:GID</td><td><code>--user 1000:1000</code></td></tr>
+      <tr><td><code>--entrypoint</code></td><td>Override the image's ENTRYPOINT</td><td><code>--entrypoint /bin/sh</code></td></tr>
+      <tr><td><code>--workdir</code></td><td>Override working directory</td><td><code>--workdir /tmp</code></td></tr>
+      <tr><td><code>--hostname</code></td><td>Set the container's hostname</td><td><code>--hostname api-node-1</code></td></tr>
+    </table></div>
+
+    <pre data-title="Canonical run for reliability-api"><code><span class="c"># Run the app, detached, with a name, published port, resource limits, and auto-restart</span>
+docker run -d \
+  --name reliability-api \
+  -p 8000:8000 \
+  -e LOG_LEVEL=info \
+  -e READY_DELAY_SECONDS=2 \
+  --memory 256m \
+  --cpus 0.5 \
+  --restart unless-stopped \
+  --init \
+  reliability-api:0.1.0</code></pre>
+
+    <h3>Listing containers</h3>
+    <pre data-title="docker ps variants"><code><span class="c"># Running containers only</span>
+docker ps
+
+<span class="c"># All containers (running + stopped + created)</span>
+docker ps -a
+
+<span class="c"># IDs only (scriptable)</span>
+docker ps -q
+docker ps -aq   <span class="c"># all IDs including stopped</span>
+
+<span class="c"># Custom format</span>
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+<span class="c"># Filter by name pattern</span>
+docker ps --filter name=reliability
+
+<span class="c"># Filter by status</span>
+docker ps --filter status=exited
+
+<span class="c"># Filter by exit code (e.g., OOMKilled containers)</span>
+docker ps -a --filter exited=137</code></pre>
+
+    <h3>stop / kill / pause / unpause</h3>
+    <pre data-title="stop vs kill vs pause"><code><span class="c"># Graceful stop: sends SIGTERM to PID 1, waits stop-timeout (default 10s), then SIGKILL</span>
+docker stop reliability-api
+
+<span class="c"># Stop with a custom timeout (seconds)</span>
+docker stop --time 30 reliability-api
+
+<span class="c"># Immediate kill: sends SIGKILL immediately — no grace period</span>
+docker kill reliability-api
+
+<span class="c"># Send a specific signal</span>
+docker kill --signal SIGHUP reliability-api
+
+<span class="c"># Pause (SIGSTOP to all processes — they freeze but are NOT killed)</span>
+docker pause reliability-api
+
+<span class="c"># Resume a paused container</span>
+docker unpause reliability-api</code></pre>
+
+    <section class="lab">
+      <header>SIGTERM vs SIGKILL — the 10-second experiment</header>
+      <div class="body">
+        <p>This experiment shows why shell form as PID 1 causes the 10-second stop delay.</p>
+        <ol class="steps">
+          <li>Run a container with shell-form CMD (Docker wraps it in <code>/bin/sh -c</code>, making <em>sh</em> PID 1, not your app):
+            <pre data-title="Shell-form CMD (bad for signals)"><code>docker run -d --name slow-stop alpine \
+  sh -c 'echo "started"; sleep 3600'</code></pre>
+          </li>
+          <li>Time the stop: <code>time docker stop slow-stop</code>
+            <pre data-title="Expected output"><code><span class="o">slow-stop
+real    0m10.302s</span>   <span class="c"># 10+ seconds — sh doesn't forward SIGTERM to sleep</span></code></pre>
+          </li>
+          <li>Clean up: <code>docker rm slow-stop</code></li>
+          <li>Now run with exec-form CMD (your binary IS PID 1 and receives SIGTERM directly):
+            <pre data-title="Exec-form CMD (correct)"><code>docker run -d --name fast-stop alpine \
+  sleep 3600
+<span class="c"># alpine's sleep is PID 1 here; it receives SIGTERM and exits cleanly</span></code></pre>
+          </li>
+          <li>Time the stop: <code>time docker stop fast-stop</code>
+            <pre data-title="Expected output"><code><span class="o">fast-stop
+real    0m0.618s</span>   <span class="c"># ~0.6s — SIGTERM received and handled immediately</span></code></pre>
+          </li>
+          <li>Clean up: <code>docker rm fast-stop</code></li>
+        </ol>
+        <p>Key insight: always use <strong>exec form</strong> in Dockerfile CMD/ENTRYPOINT, or use <code>--init</code> at runtime to insert tini as PID 1.</p>
+      </div>
+    </section>
+
+    <h3>Removing containers</h3>
+    <pre data-title="docker rm"><code><span class="c"># Remove a stopped container</span>
+docker rm reliability-api
+
+<span class="c"># Attempt to remove a RUNNING container — this fails:</span>
+docker rm reliability-api
+<span class="c"># Error response from daemon: You cannot remove a running container abc123...</span>
+<span class="c"># You must stop it first: docker stop reliability-api &amp;&amp; docker rm reliability-api</span>
+
+<span class="c"># Force-remove a running container (sends SIGKILL then removes)</span>
+docker rm -f reliability-api
+
+<span class="c"># Remove all stopped containers</span>
+docker container prune
+
+<span class="c"># One-liner: stop + remove all running containers (DANGEROUS in shared environments)</span>
+docker rm -f $(docker ps -q)</code></pre>
+
+    <div class="callout warn">
+      <span class="label">Removing a running container</span>
+      <p><code>docker rm</code> on a running container gives: <em>Error response from daemon: You cannot remove a running container … Stop the container before attempting removal or force remove</em>. Use <code>docker rm -f</code> to force, or <code>docker stop &amp;&amp; docker rm</code> for a clean shutdown.</p>
+    </div>
+
+    <h3>exec — run commands inside a running container</h3>
+    <pre data-title="docker exec"><code><span class="c"># Open an interactive shell inside a running container</span>
+docker exec -it reliability-api /bin/bash
+
+<span class="c"># Run a one-off command</span>
+docker exec reliability-api cat /etc/os-release
+
+<span class="c"># Run as a specific user (e.g., root for debugging)</span>
+docker exec -u root -it reliability-api /bin/bash
+
+<span class="c"># Set an environment variable for the exec session</span>
+docker exec -e DEBUG=1 reliability-api env | grep DEBUG
+
+<span class="c"># Change working directory for the exec session</span>
+docker exec -w /tmp reliability-api ls</code></pre>
+
+    <section class="lab">
+      <header>exec experiments — verify container isolation</header>
+      <div class="body">
+        <ol class="steps">
+          <li><strong>Verify PID 1:</strong> <code>docker exec reliability-api ps aux</code> — PID 1 should be your app's process (or <code>tini</code> if <code>--init</code> was used), not a shell.</li>
+          <li><strong>Verify non-root:</strong> <code>docker exec reliability-api id</code> — should show a non-root UID if the Dockerfile sets <code>USER</code>.</li>
+          <li><strong>Verify code is immutable:</strong> <code>docker exec reliability-api touch /app/injected.txt</code> — should fail with "Read-only file system" if <code>--read-only</code> was set, or succeed but the file disappears when the container is removed (the writable layer is ephemeral).</li>
+          <li><strong>Verify filesystem isolation:</strong> <code>docker exec reliability-api ls /</code> — you see the container's root filesystem, not the host's.</li>
+        </ol>
+      </div>
+    </section>
+
+    <h3>attach — connect to PID 1's stdio</h3>
+    <pre data-title="docker attach"><code><span class="c"># Attach your terminal to PID 1's stdin/stdout/stderr of a running container</span>
+docker attach reliability-api
+
+<span class="c"># Detach WITHOUT stopping the container: press Ctrl+P then Ctrl+Q</span>
+<span class="c"># WARNING: pressing Ctrl+C sends SIGINT to PID 1 and will STOP the container</span></code></pre>
+
+    <div class="callout warn">
+      <span class="label">attach vs exec</span>
+      <p><code>docker attach</code> connects to PID 1's streams — exiting the attached session may stop the container. <code>docker exec</code> starts a <em>new</em> process inside the container; exiting it never affects PID 1. For debugging, prefer <code>docker exec -it container /bin/bash</code>.</p>
+    </div>
+
+    <h3>Logs</h3>
+    <pre data-title="docker logs"><code><span class="c"># Print all logs since container start</span>
+docker logs reliability-api
+
+<span class="c"># Follow (stream) logs in real time</span>
+docker logs -f reliability-api
+
+<span class="c"># Show last 50 lines only</span>
+docker logs --tail 50 reliability-api
+
+<span class="c"># Show timestamps on each line</span>
+docker logs -t reliability-api
+
+<span class="c"># Logs since a time (RFC3339, Unix timestamp, or Go duration like "2m")</span>
+docker logs --since 2m reliability-api
+docker logs --since 2024-01-01T00:00:00Z reliability-api
+
+<span class="c"># Logs until a time</span>
+docker logs --until 2024-01-02T00:00:00Z reliability-api</code></pre>
+
+    <div class="callout note">
+      <span class="label">Logs survive until the container is removed</span>
+      <p>Stopping a container with <code>docker stop</code> does NOT delete its logs. Logs are stored on the host (default: json-file driver) and are readable until <code>docker rm</code> is run.</p>
+    </div>
+
+    <h3>Inspecting containers</h3>
+    <pre data-title="docker inspect — containers"><code><span class="c"># Full JSON of a container (running or stopped)</span>
+docker inspect reliability-api
+
+<span class="c"># Get the current status</span>
+docker inspect --format '{{.State.Status}}' reliability-api
+
+<span class="c"># Get the exit code of a stopped container</span>
+docker inspect --format '{{.State.ExitCode}}' reliability-api
+
+<span class="c"># Check if the container was OOMKilled</span>
+docker inspect --format '{{.State.OOMKilled}}' reliability-api
+
+<span class="c"># Get health status</span>
+docker inspect --format '{{.State.Health.Status}}' reliability-api
+
+<span class="c"># Get the IP address on a network</span>
+docker inspect --format '{{.NetworkSettings.IPAddress}}' reliability-api</code></pre>
+
+    <div class="table-wrap"><table>
+      <tr><th>Exit Code</th><th>Meaning</th><th>Common cause</th></tr>
+      <tr><td><code>0</code></td><td>Success — process exited normally</td><td><code>--rm</code> containers doing a one-shot task</td></tr>
+      <tr><td><code>1</code></td><td>General application error</td><td>Unhandled exception, missing config</td></tr>
+      <tr><td><code>125</code></td><td>Docker daemon error</td><td>Invalid flag, image not found</td></tr>
+      <tr><td><code>126</code></td><td>Command found but not executable</td><td>Wrong permissions on entrypoint script</td></tr>
+      <tr><td><code>127</code></td><td>Command not found</td><td>Typo in CMD, missing binary in image</td></tr>
+      <tr><td><code>137</code></td><td>Killed by SIGKILL (128 + 9)</td><td>OOMKill, <code>docker kill</code>, <code>docker stop</code> timeout</td></tr>
+      <tr><td><code>143</code></td><td>Killed by SIGTERM (128 + 15)</td><td>Graceful shutdown — process handled SIGTERM and exited</td></tr>
+    </table></div>
+
+    <h3>Copy files in and out of containers</h3>
+    <pre data-title="docker cp"><code><span class="c"># Copy a file from the host INTO a running or stopped container</span>
+docker cp ./config.json reliability-api:/app/config.json
+
+<span class="c"># Copy a file FROM a container to the host</span>
+docker cp reliability-api:/app/logs/app.log ./app.log
+
+<span class="c"># Copy a whole directory</span>
+docker cp reliability-api:/var/log/nginx ./nginx-logs/
+
+<span class="c"># Use case: retrieve logs from a crashed container that can't be exec'd</span>
+docker cp crashed-container:/app/crash.log .
+<span class="c"># Works on stopped containers — you don't need the container running.</span></code></pre>
+
+    <h3>Stats and top</h3>
+    <pre data-title="docker stats / docker top"><code><span class="c"># Live resource usage (CPU %, MEM USAGE / LIMIT, NET I/O, BLOCK I/O)</span>
+docker stats
+
+<span class="c"># Stats for a specific container</span>
+docker stats reliability-api
+
+<span class="c"># One-shot stats snapshot (no streaming)</span>
+docker stats --no-stream
+
+<span class="c"># Custom format</span>
+docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+<span class="c"># Show all processes inside a container (like ps aux inside)</span>
+docker top reliability-api</code></pre>
+
+    <section class="lab">
+      <header>CPU throttle vs OOMKill experiment</header>
+      <div class="body">
+        <ol class="steps">
+          <li>Run reliability-api with a tight CPU limit: <code>docker run -d --name api-throttled --cpus 0.1 -p 8001:8000 reliability-api:0.1.0</code></li>
+          <li>Hammer the <code>/work</code> endpoint: <code>for i in $(seq 1 20); do curl -s http://localhost:8001/work?ms=500 &amp; done; wait</code></li>
+          <li>Watch <code>docker stats api-throttled</code> — CPU% will be capped near 10% and requests will slow down dramatically.</li>
+          <li>Now trigger OOMKill: <code>docker run -d --name api-oom --memory 20m reliability-api:0.1.0</code></li>
+          <li>Check: <code>docker inspect --format '{{.State.OOMKilled}} exit={{.State.ExitCode}}' api-oom</code> → <code>true exit=137</code></li>
+        </ol>
+      </div>
+    </section>
+
+    <h3>rename and update</h3>
+    <pre data-title="docker rename / docker update"><code><span class="c"># Rename a container (works on running or stopped containers)</span>
+docker rename reliability-api api-v1
+
+<span class="c"># Live-update resource limits on a running container (no restart needed)</span>
+docker update --memory 512m reliability-api
+docker update --cpus 1.0 reliability-api
+
+<span class="c"># Change restart policy on a running container</span>
+docker update --restart unless-stopped reliability-api</code></pre>
+
+    <h3>commit — why NOT to use in production</h3>
+    <pre data-title="docker commit"><code><span class="c"># Save the current state of a container's filesystem as a new image</span>
+docker commit reliability-api reliability-api:manually-patched
+
+<span class="c"># This creates an image, but it is UNREPRODUCIBLE:</span>
+<span class="c"># - No Dockerfile, no record of what was changed</span>
+<span class="c"># - Cannot be rebuilt automatically in CI</span>
+<span class="c"># - Layers are opaque; security scanners can't inspect changes</span>
+<span class="c"># - Violates immutable infrastructure principles</span>
+<span class="c"># Use only for local debugging snapshots, never as a release artifact.</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>3. Volumes</h2>
+
+    <h3>Named volumes</h3>
+    <pre data-title="Named volumes — full workflow"><code><span class="c"># Create a named volume</span>
+docker volume create api-data
+
+<span class="c"># List all volumes</span>
+docker volume ls
+
+<span class="c"># Inspect a volume (shows mountpoint on host, driver, labels)</span>
+docker volume inspect api-data
+
+<span class="c"># Mount using --mount syntax (preferred — explicit and readable)</span>
+docker run -d \
+  --name reliability-api \
+  --mount type=volume,source=api-data,destination=/app/data \
+  reliability-api:0.1.0
+
+<span class="c"># Mount using -v shorthand (same result)</span>
+docker run -d --name reliability-api -v api-data:/app/data reliability-api:0.1.0</code></pre>
+
+    <section class="lab">
+      <header>Data persistence experiment — named volume survives container removal</header>
+      <div class="body">
+        <ol class="steps">
+          <li>Run a container and write data: <code>docker run --rm -v persist-demo:/data alpine sh -c 'echo "hello lab" &gt; /data/test.txt'</code></li>
+          <li>The container exits and is removed (<code>--rm</code>). Verify the volume still exists: <code>docker volume ls | grep persist-demo</code></li>
+          <li>Start a new container with the same volume: <code>docker run --rm -v persist-demo:/data alpine cat /data/test.txt</code> → prints <code>hello lab</code></li>
+          <li>Clean up: <code>docker volume rm persist-demo</code></li>
+        </ol>
+      </div>
+    </section>
+
+    <h3>Bind mounts</h3>
+    <pre data-title="Bind mounts"><code><span class="c"># Mount a host directory into the container — changes are bidirectional</span>
+docker run -d \
+  --name reliability-api \
+  --mount type=bind,source=$(pwd)/app,destination=/app/app \
+  reliability-api:0.1.0
+
+<span class="c"># -v shorthand for bind mounts: host path must be absolute (or use $(pwd))</span>
+docker run -d -v $(pwd)/app:/app/app reliability-api:0.1.0
+
+<span class="c"># Read-only bind mount — container cannot write to the host directory</span>
+docker run -d \
+  --mount type=bind,source=$(pwd)/config,destination=/app/config,readonly \
+  reliability-api:0.1.0
+
+<span class="c"># -v shorthand for read-only</span>
+docker run -d -v $(pwd)/config:/app/config:ro reliability-api:0.1.0</code></pre>
+
+    <div class="callout warn">
+      <span class="label">Bind mount edge case: empty host directory hides image content</span>
+      <p>If you bind-mount an <em>empty</em> host directory over a directory that has content in the image, the image content becomes invisible — the empty mount overlays it. Example: <code>-v ./empty:/app/site-packages</code> will cause <code>ModuleNotFoundError</code> because all the installed Python packages are hidden. Always make sure the host source directory has the content you need.</p>
+    </div>
+
+    <div class="callout warn">
+      <span class="label">UID/GID mismatch with bind mounts</span>
+      <p>If the container runs as UID 1001 but the host directory is owned by root (UID 0), the container process may get "Permission denied" when writing. Fix: <code>chown 1001 ./data</code> on the host, or use a named volume instead (Docker manages ownership).</p>
+    </div>
+
+    <h3>tmpfs mounts</h3>
+    <pre data-title="tmpfs mounts"><code><span class="c"># Mount a tmpfs (RAM-backed, non-persistent) filesystem</span>
+docker run -d \
+  --mount type=tmpfs,destination=/tmp,tmpfs-size=64m \
+  reliability-api:0.1.0
+
+<span class="c"># --tmpfs shorthand</span>
+docker run -d --tmpfs /tmp:size=64m reliability-api:0.1.0
+
+<span class="c"># tmpfs size counts against the container's --memory limit.</span>
+<span class="c"># Data in tmpfs is lost when the container stops — use for ephemeral scratch space, caches, secrets.</span></code></pre>
+
+    <h3>Volume comparison</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Feature</th><th>Named Volume</th><th>Bind Mount</th><th>tmpfs</th></tr>
+      <tr><td>Location</td><td>Docker-managed (<code>/var/lib/docker/volumes/</code>)</td><td>Host filesystem path you specify</td><td>RAM only — no disk</td></tr>
+      <tr><td>Survives <code>docker rm</code></td><td>✅ Yes</td><td>✅ Yes (it's your host FS)</td><td>❌ No (memory freed)</td></tr>
+      <tr><td>Survives host reboot</td><td>✅ Yes</td><td>✅ Yes</td><td>❌ No</td></tr>
+      <tr><td>Performance</td><td>Good (overlay driver)</td><td>Good (direct host FS)</td><td>Excellent (RAM speed)</td></tr>
+      <tr><td>Portability</td><td>✅ Works on any host</td><td>⚠️ Path must exist on host</td><td>✅ Works anywhere</td></tr>
+      <tr><td>Best use case</td><td>Databases, persistent app state</td><td>Source code in dev, config files</td><td>Secrets, scratch space, caches</td></tr>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>4. Networks</h2>
+
+    <h3>Network types</h3>
+    <dl class="defs">
+      <dt><code>bridge</code> (default)</dt>
+      <dd>Containers get a private IP on an internal bridge network (<code>docker0</code>). Containers on the <em>same bridge</em> can reach each other by IP. Port publishing (<code>-p</code>) is needed to reach containers from the host or outside. DNS by container name only works on user-defined bridges, not the default <code>bridge</code>.</dd>
+      <dt><code>host</code></dt>
+      <dd>Container shares the host's network namespace. No port mapping — the container's port IS the host's port. Maximum performance, zero isolation. Linux only.</dd>
+      <dt><code>none</code></dt>
+      <dd>Container has no network interfaces (except loopback). Completely isolated. Use for security-sensitive batch jobs that should never touch the network.</dd>
+    </dl>
+
+    <h3>User-defined bridges</h3>
+    <pre data-title="User-defined network — full workflow"><code><span class="c"># Create a user-defined bridge network</span>
+docker network create lab-net
+
+<span class="c"># List networks</span>
+docker network ls
+
+<span class="c"># Inspect a network (shows connected containers, subnet, gateway)</span>
+docker network inspect lab-net
+
+<span class="c"># Run containers on the user-defined network</span>
+docker run -d --name api --network lab-net reliability-api:0.1.0
+docker run -d --name db  --network lab-net postgres:16-alpine
+
+<span class="c"># Containers on the same user-defined bridge can reach each other by NAME</span>
+docker exec api curl http://db:5432
+<span class="c"># Docker's embedded DNS resolves "db" → db container's IP automatically</span>
+
+<span class="c"># Connect a running container to an additional network</span>
+docker network connect lab-net another-container
+
+<span class="c"># Disconnect a container from a network</span>
+docker network disconnect lab-net another-container</code></pre>
+
+    <section class="lab">
+      <header>DNS by container name — user-defined bridge vs default bridge</header>
+      <div class="body">
+        <ol class="steps">
+          <li>Create a custom network: <code>docker network create dns-demo</code></li>
+          <li>Start two containers on it: <code>docker run -d --name server --network dns-demo nginx:alpine</code> and <code>docker run -d --name client --network dns-demo alpine sleep 3600</code></li>
+          <li>From client, resolve server by name: <code>docker exec client ping -c 2 server</code> → works! Docker DNS resolves the name.</li>
+          <li>Now try the same on the <em>default</em> bridge: <code>docker run -d --name srv2 nginx:alpine</code> and <code>docker run --rm alpine ping -c 2 srv2</code> → fails with "bad address" — the default bridge does NOT have automatic DNS.</li>
+          <li>Clean up: <code>docker rm -f server client srv2 &amp;&amp; docker network rm dns-demo</code></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="lab">
+      <header>Container-to-container — no -p needed on same network</header>
+      <div class="body">
+        <ol class="steps">
+          <li><code>docker network create internal-net</code></li>
+          <li><code>docker run -d --name api --network internal-net reliability-api:0.1.0</code> — note: no <code>-p</code>!</li>
+          <li><code>docker run --rm --network internal-net alpine wget -qO- http://api:8000/health</code> → returns <code>{"status":"ok"}</code></li>
+          <li>The port 8000 is NOT exposed to the host — only containers on <code>internal-net</code> can reach it. This is the correct pattern for internal microservices.</li>
+        </ol>
+      </div>
+    </section>
+
+    <h3>Removing networks</h3>
+    <pre data-title="docker network rm / prune"><code><span class="c"># Remove a network (fails if containers are still attached)</span>
+docker network rm lab-net
+
+<span class="c"># Remove all unused networks</span>
+docker network prune</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>5. HEALTHCHECK</h2>
+
+    <div class="table-wrap"><table>
+      <tr><th>Option</th><th>Default</th><th>Recommended (reliability-api)</th><th>Notes</th></tr>
+      <tr><td><code>--interval</code></td><td>30s</td><td>10s</td><td>How often to run the check</td></tr>
+      <tr><td><code>--timeout</code></td><td>30s</td><td>5s</td><td>How long to wait for the check to return</td></tr>
+      <tr><td><code>--start-period</code></td><td>0s</td><td>15s</td><td>Grace period during startup — failures don't count toward retries yet</td></tr>
+      <tr><td><code>--start-interval</code></td><td>5s</td><td>2s</td><td>How often to check during start-period (Docker 25+)</td></tr>
+      <tr><td><code>--retries</code></td><td>3</td><td>3</td><td>Consecutive failures before status becomes <code>unhealthy</code></td></tr>
+    </table></div>
+
+    <pre data-title="HEALTHCHECK in Dockerfile"><code><span class="k">HEALTHCHECK</span> --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  <span class="k">CMD</span> ["wget", "-qO-", "http://localhost:8000/health"]
+<span class="c"># Use exec form (array) so the command is PID 1 of the health check subprocess, not sh</span>
+<span class="c"># wget is present in many slim images; use curl if available</span></code></pre>
+
+    <pre data-title="Override HEALTHCHECK at runtime"><code><span class="c"># Override interval/timeout at run time</span>
+docker run -d \
+  --health-cmd "curl -f http://localhost:8000/health" \
+  --health-interval 10s \
+  --health-timeout 5s \
+  --health-start-period 15s \
+  --health-retries 3 \
+  reliability-api:0.1.0
+
+<span class="c"># Disable the Dockerfile's HEALTHCHECK entirely</span>
+docker run -d --no-healthcheck reliability-api:0.1.0
+
+<span class="c"># Read health status</span>
+docker inspect --format '{{.State.Health.Status}}' reliability-api
+<span class="c"># Possible values: starting, healthy, unhealthy</span>
+
+<span class="c"># Read the last 5 health check results</span>
+docker inspect --format '{{range .State.Health.Log}}{{.ExitCode}} {{.Output}}{{end}}' reliability-api</code></pre>
+
+    <div class="callout note">
+      <span class="label">Docker HEALTHCHECK vs Kubernetes probes — important distinction</span>
+      <p>Docker HEALTHCHECK only changes the container's reported status — Docker does <em>not</em> automatically restart an unhealthy container (unless you use <code>--restart on-failure</code> and the container actually <em>exits</em>, which a health check failure doesn't cause). <br><br>
+      Kubernetes probes are active: a <strong>liveness</strong> probe failure causes kubelet to <em>restart</em> the container; a <strong>readiness</strong> probe failure removes the Pod from Service endpoints (stops traffic). If you run Docker HEALTHCHECK and Kubernetes together, the HEALTHCHECK status is visible in <code>docker inspect</code> inside the node but Kubernetes acts on its own probes independently.</p>
+    </div>
+
+    <div class="table-wrap"><table>
+      <tr><th>Feature</th><th>Docker HEALTHCHECK</th><th>Kubernetes probes</th></tr>
+      <tr><td>Configured in</td><td>Dockerfile or <code>docker run</code> flags</td><td>Pod spec (<code>livenessProbe</code>, <code>readinessProbe</code>, <code>startupProbe</code>)</td></tr>
+      <tr><td>On failure action</td><td>Sets status to <code>unhealthy</code> (no automatic restart)</td><td>Liveness: restart container · Readiness: remove from endpoints</td></tr>
+      <tr><td>Startup grace</td><td><code>--start-period</code></td><td><code>startupProbe</code> (separate probe that blocks others)</td></tr>
+      <tr><td>Probe types</td><td>cmd only</td><td>exec, httpGet, tcpSocket, grpc</td></tr>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>6. Docker Compose</h2>
+
+    <pre data-title="docker-compose.yml — reliability-api + postgres"><code><span class="k">services</span>:
+  <span class="k">api</span>:
+    <span class="k">build</span>: .
+    <span class="k">ports</span>:
+      - <span class="s">"8000:8000"</span>
+    <span class="k">environment</span>:
+      LOG_LEVEL: info
+      READY_DELAY_SECONDS: <span class="s">"2"</span>
+    <span class="k">depends_on</span>:
+      db:
+        <span class="k">condition</span>: service_healthy  <span class="c"># wait for db healthcheck to pass</span>
+    <span class="k">healthcheck</span>:
+      test: [<span class="s">"CMD"</span>, <span class="s">"wget"</span>, <span class="s">"-qO-"</span>, <span class="s">"http://localhost:8000/health"</span>]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  <span class="k">db</span>:
+    <span class="k">image</span>: postgres:16-alpine
+    <span class="k">environment</span>:
+      POSTGRES_PASSWORD: devpassword
+    <span class="k">volumes</span>:
+      - pg-data:/var/lib/postgresql/data
+    <span class="k">healthcheck</span>:
+      test: [<span class="s">"CMD"</span>, <span class="s">"pg_isready"</span>, <span class="s">"-U"</span>, <span class="s">"postgres"</span>]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+<span class="k">volumes</span>:
+  pg-data:</code></pre>
+
+    <pre data-title="Docker Compose commands"><code><span class="c"># Start all services (build if needed, detached)</span>
+docker compose up -d --build
+
+<span class="c"># Stop and remove containers (keep volumes)</span>
+docker compose down
+
+<span class="c"># Stop and remove containers AND volumes</span>
+docker compose down -v
+
+<span class="c"># List containers managed by this compose file</span>
+docker compose ps
+
+<span class="c"># Follow logs for all services</span>
+docker compose logs -f
+
+<span class="c"># Follow logs for one service</span>
+docker compose logs -f api
+
+<span class="c"># Execute a command in a running service container</span>
+docker compose exec api /bin/bash
+
+<span class="c"># Run a one-off command in a new container (no port publish)</span>
+docker compose run --rm api python -m pytest
+
+<span class="c"># Scale a service to N replicas (requires no fixed port mapping)</span>
+docker compose up -d --scale api=3
+
+<span class="c"># Rebuild images without cache</span>
+docker compose build --no-cache</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>7. Dockerfile Instructions</h2>
+
+    <pre data-title="Dockerfile — annotated complete reference"><code><span class="c"># --- Stage 1: build / dependency installation ---</span>
+<span class="k">FROM</span> python:3.12-slim <span class="k">AS</span> builder
+<span class="c"># FROM sets the base image. Use slim/alpine variants to reduce size.</span>
+<span class="c"># AS gives this stage a name for multi-stage builds.</span>
+
+<span class="k">ARG</span> APP_VERSION=0.1.0
+<span class="c"># ARG declares a build-time variable. Not available in the running container unless also set as ENV.</span>
+<span class="c"># Pass at build time: docker build --build-arg APP_VERSION=0.2.0 .</span>
+
+<span class="k">ENV</span> PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+<span class="c"># ENV sets environment variables that PERSIST into the running container.</span>
+<span class="c"># PYTHONDONTWRITEBYTECODE: don't create .pyc files (keeps image clean).</span>
+<span class="c"># PYTHONUNBUFFERED: stdout/stderr not buffered (logs appear immediately in docker logs).</span>
+
+<span class="k">WORKDIR</span> /app
+<span class="c"># WORKDIR sets the working directory for all subsequent RUN, COPY, CMD, ENTRYPOINT instructions.</span>
+<span class="c"># Created automatically if it doesn't exist. Prefer over: RUN mkdir /app &amp;&amp; cd /app.</span>
+
+<span class="k">COPY</span> requirements.txt .
+<span class="c"># COPY copies files from the build context (your local machine) into the image.</span>
+<span class="c"># Copy ONLY requirements.txt first so that pip install is cached unless requirements change.</span>
+
+<span class="k">RUN</span> pip install --no-cache-dir -r requirements.txt
+<span class="c"># RUN executes a command during the build and commits the result as a new layer.</span>
+<span class="c"># --no-cache-dir: don't save pip's download cache inside the image (keeps size down).</span>
+<span class="c"># Each RUN creates a new layer — chain commands with &amp;&amp; to keep layers small.</span>
+
+<span class="c"># --- Stage 2: runtime image ---</span>
+<span class="k">FROM</span> python:3.12-slim
+<span class="c"># Start a FRESH base — the builder stage artifacts (pip cache etc.) are NOT carried over.</span>
+<span class="c"># This is the key benefit of multi-stage builds.</span>
+
+<span class="k">WORKDIR</span> /app
+
+<span class="c"># Copy installed packages from the builder stage</span>
+<span class="k">COPY</span> --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+<span class="k">COPY</span> --from=builder /usr/local/bin /usr/local/bin
+
+<span class="c"># Copy only the application source</span>
+<span class="k">COPY</span> app/ ./app/
+
+<span class="k">ADD</span> https://github.com/krallin/tini/releases/download/v0.19.0/tini /tini
+<span class="c"># ADD can fetch remote URLs and auto-extract tarballs. For regular file copies, prefer COPY.</span>
+<span class="c"># Here: download the tini init process binary for signal handling.</span>
+<span class="k">RUN</span> chmod +x /tini
+
+<span class="k">USER</span> 1000:1000
+<span class="c"># USER sets the UID:GID for all subsequent RUN, CMD, and ENTRYPOINT instructions.</span>
+<span class="c"># NEVER run as root in production — violates least-privilege principle.</span>
+<span class="c"># Note: set USER AFTER installing packages (pip needs root).</span>
+
+<span class="k">EXPOSE</span> 8000
+<span class="c"># EXPOSE is documentation only — it does NOT publish the port to the host.</span>
+<span class="c"># It tells docker run -P which port to map randomly, and documents the app's port.</span>
+<span class="c"># You still need -p 8000:8000 to actually reach the container from outside.</span>
+
+<span class="k">LABEL</span> org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.source="https://github.com/you/reliability-lab"
+<span class="c"># LABEL adds metadata key-value pairs. OCI standard labels are the convention.</span>
+<span class="c"># Visible with: docker inspect --format '{{json .Config.Labels}}' reliability-api:0.1.0</span>
+
+<span class="k">HEALTHCHECK</span> --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  <span class="k">CMD</span> ["wget", "-qO-", "http://localhost:8000/health"]
+<span class="c"># HEALTHCHECK defines how Docker tests if the container is healthy.</span>
+
+<span class="k">STOPSIGNAL</span> SIGTERM
+<span class="c"># STOPSIGNAL sets which signal Docker sends when docker stop is called.</span>
+<span class="c"># Default is SIGTERM. Override if your app uses a different signal for graceful shutdown.</span>
+
+<span class="k">ENTRYPOINT</span> ["/tini", "--"]
+<span class="c"># ENTRYPOINT sets the main command. Exec form (array) — signal-safe.</span>
+<span class="c"># With tini as ENTRYPOINT, CMD is passed as arguments to tini, which then execs CMD.</span>
+<span class="c"># tini handles signal forwarding and zombie reaping correctly.</span>
+
+<span class="k">CMD</span> ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+<span class="c"># CMD provides default arguments to ENTRYPOINT (or the full command if no ENTRYPOINT).</span>
+<span class="c"># Exec form (array): the binary IS PID 1 (inside tini here) — signal-safe.</span>
+<span class="c"># Shell form would be: CMD python -m uvicorn ... — this runs /bin/sh -c "..." as PID 1, NOT your app.</span>
+<span class="c"># Shell form: SIGTERM goes to sh, which may not forward it → 10s stop delay.</span>
+
+<span class="c"># Instructions not shown above but available:</span>
+<span class="c"># VOLUME ["/data"]  — declares mount points; Docker creates an anonymous volume if not mounted</span>
+<span class="c"># ONBUILD COPY . /app  — runs when THIS image is used as a base by another Dockerfile (rare)</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>8. Common Failure Cases</h2>
+
+    <section class="lab">
+      <header>Works inside, fails outside — missing -p</header>
+      <div class="body">
+        <p>You run the container, the app starts fine, but <code>curl http://localhost:8000/health</code> from the host returns "connection refused".</p>
+        <ol class="steps">
+          <li>Reproduce: <code>docker run -d --name no-port reliability-api:0.1.0</code> (no <code>-p</code>)</li>
+          <li>From the host: <code>curl http://localhost:8000/health</code> → <code>curl: (7) Failed to connect to localhost port 8000: Connection refused</code></li>
+          <li>Verify the app is actually running inside: <code>docker exec no-port wget -qO- http://localhost:8000/health</code> → <code>{"status":"ok"}</code></li>
+          <li>Fix: <code>docker run -d -p 8000:8000 reliability-api:0.1.0</code></li>
+          <li>Clean up: <code>docker rm -f no-port</code></li>
+        </ol>
+        <p><strong>Root cause:</strong> EXPOSE documents the port but doesn't publish it. Without <code>-p</code>, the port is only reachable from inside Docker networks.</p>
+      </div>
+    </section>
+
+    <section class="lab">
+      <header>App starts but nothing reaches it — bound to 127.0.0.1 inside</header>
+      <div class="body">
+        <p>You add <code>-p 8000:8000</code>, Docker shows the port as mapped, but requests still fail.</p>
+        <ol class="steps">
+          <li>Reproduce: <code>docker run -d -p 8000:8000 --name loopback python:3.12-slim python -m http.server 8000</code> → actually works because Python's http.server binds to <code>0.0.0.0</code> by default, but the failure happens when an app explicitly binds to <code>127.0.0.1</code>.</li>
+          <li>Simulate: <code>docker run -d -p 8000:8000 --name loopback-bad python:3.12-slim python -c "import http.server, socketserver; socketserver.TCPServer(('127.0.0.1', 8000), http.server.SimpleHTTPRequestHandler).serve_forever()"</code></li>
+          <li><code>curl http://localhost:8000</code> → connection refused, even though <code>-p 8000:8000</code> is set.</li>
+          <li><strong>Root cause:</strong> The app is listening on <code>127.0.0.1:8000</code> <em>inside the container</em>. Docker's port mapping arrives on <code>0.0.0.0:8000</code> of the container's network interface, not on loopback. Traffic never reaches <code>127.0.0.1</code>.</li>
+          <li><strong>Fix:</strong> Configure the app to bind to <code>0.0.0.0</code> (all interfaces) inside the container. For uvicorn: <code>--host 0.0.0.0</code>.</li>
+          <li>Clean up: <code>docker rm -f loopback-bad</code></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="lab">
+      <header>OOMKill — Exit 137</header>
+      <div class="body">
+        <ol class="steps">
+          <li>Run with a tiny memory limit: <code>docker run -d --name oom-demo --memory 10m python:3.12-slim python -c "x = ' ' * (50 * 1024 * 1024)"</code></li>
+          <li>Check status: <code>docker ps -a --filter name=oom-demo</code> → status: <code>Exited (137)</code></li>
+          <li>Confirm OOMKill: <code>docker inspect --format 'OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}' oom-demo</code> → <code>OOMKilled=true ExitCode=137</code></li>
+          <li><strong>Root cause:</strong> Exit 137 = 128 + 9 (SIGKILL signal number). The kernel's OOM killer sends SIGKILL when the container exceeds its memory limit.</li>
+          <li><strong>Fix:</strong> Increase <code>--memory</code> limit, or reduce the application's memory usage.</li>
+          <li>Clean up: <code>docker rm oom-demo</code></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="lab">
+      <header>Slow docker stop (10 seconds) — shell as PID 1</header>
+      <div class="body">
+        <p>See the <a href="#s-9-stop-kill-pause-unpause">stop / kill / pause / unpause</a> section above for the full experiment. Summary:</p>
+        <ol class="steps">
+          <li>Shell-form CMD → <code>/bin/sh</code> is PID 1 → SIGTERM goes to sh → sh doesn't forward to child → Docker waits 10s → SIGKILL.</li>
+          <li>Exec-form CMD → your binary IS PID 1 → SIGTERM received → clean shutdown in &lt;1s.</li>
+          <li>Fix: use exec form in Dockerfile, or use <code>--init</code> to insert tini.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="lab">
+      <header>Permission denied — non-root container (expected behavior)</header>
+      <div class="body">
+        <ol class="steps">
+          <li>Run as a non-root user and try to bind port 80 (privileged port, requires root): <code>docker run --rm --user 1000 python:3.12-slim python -m http.server 80</code> → <code>PermissionError: [Errno 13] Permission denied</code></li>
+          <li><strong>Root cause:</strong> Ports below 1024 require the <code>CAP_NET_BIND_SERVICE</code> capability. Non-root users don't have it by default.</li>
+          <li>Fix options: (a) use a port ≥ 1024 inside the container and map it with <code>-p 80:8000</code>, or (b) add the capability: <code>--cap-add NET_BIND_SERVICE</code>.</li>
+          <li>This is <em>expected and correct behavior</em> — non-root containers are more secure.</li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="lab">
+      <header>Image delete with running container</header>
+      <div class="body">
+        <ol class="steps">
+          <li>Run a container: <code>docker run -d --name img-del-test nginx:alpine</code></li>
+          <li>Try to remove the image: <code>docker rmi nginx:alpine</code> → <code>Error response from daemon: conflict: unable to remove repository reference "nginx:alpine" … container img-del-test is using its referenced image</code></li>
+          <li>Force-remove the image: <code>docker rmi -f nginx:alpine</code> → the tag is removed, the container keeps running (image data still referenced by the container).</li>
+          <li>Verify container still works: <code>docker exec img-del-test nginx -v</code> → still works!</li>
+          <li>The bytes are freed only after: <code>docker rm -f img-del-test</code></li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <h2>9. System Cleanup</h2>
+
+    <pre data-title="docker system df / prune"><code><span class="c"># Show disk usage by images, containers, volumes, build cache</span>
+docker system df
+
+<span class="c"># Verbose breakdown (shows which images/containers/volumes)</span>
+docker system df -v
+
+<span class="c"># Remove ALL unused resources (stopped containers, dangling images, unused networks, build cache)</span>
+<span class="c"># Will prompt for confirmation</span>
+docker system prune
+
+<span class="c"># Also remove unused volumes (adds -v to the prune)</span>
+docker system prune --volumes
+
+<span class="c"># Remove all unused images (not just dangling — this removes ALL images not used by a container)</span>
+docker image prune -a
+
+<span class="c"># Remove the build cache only (frees space without touching images/containers)</span>
+docker builder prune
+
+<span class="c"># Remove build cache older than 48 hours</span>
+docker builder prune --filter until=48h</code></pre>
+
+    <div class="callout warn">
+      <span class="label">docker system prune --volumes</span>
+      <p>This removes all volumes not currently mounted in a running container — including your database volumes. Always run <code>docker system df -v</code> first to review what will be deleted.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>10. Old vs New Syntax</h2>
+
+    <div class="table-wrap"><table>
+      <tr><th>Old (shorthand)</th><th>New (<code>docker &lt;object&gt; &lt;verb&gt;</code>)</th></tr>
+      <tr><td><code>docker images</code></td><td><code>docker image ls</code></td></tr>
+      <tr><td><code>docker rmi</code></td><td><code>docker image rm</code></td></tr>
+      <tr><td><code>docker pull</code></td><td><code>docker image pull</code></td></tr>
+      <tr><td><code>docker build</code></td><td><code>docker image build</code></td></tr>
+      <tr><td><code>docker tag</code></td><td><code>docker image tag</code></td></tr>
+      <tr><td><code>docker save</code></td><td><code>docker image save</code></td></tr>
+      <tr><td><code>docker load</code></td><td><code>docker image load</code></td></tr>
+      <tr><td><code>docker inspect</code> (image)</td><td><code>docker image inspect</code></td></tr>
+      <tr><td><code>docker ps</code></td><td><code>docker container ls</code></td></tr>
+      <tr><td><code>docker run</code></td><td><code>docker container run</code></td></tr>
+      <tr><td><code>docker rm</code></td><td><code>docker container rm</code></td></tr>
+      <tr><td><code>docker start</code></td><td><code>docker container start</code></td></tr>
+      <tr><td><code>docker stop</code></td><td><code>docker container stop</code></td></tr>
+      <tr><td><code>docker kill</code></td><td><code>docker container kill</code></td></tr>
+      <tr><td><code>docker exec</code></td><td><code>docker container exec</code></td></tr>
+      <tr><td><code>docker logs</code></td><td><code>docker container logs</code></td></tr>
+      <tr><td><code>docker inspect</code> (container)</td><td><code>docker container inspect</code></td></tr>
+      <tr><td><code>docker cp</code></td><td><code>docker container cp</code></td></tr>
+      <tr><td><code>docker stats</code></td><td><code>docker container stats</code></td></tr>
+      <tr><td><code>docker top</code></td><td><code>docker container top</code></td></tr>
+      <tr><td><code>docker rename</code></td><td><code>docker container rename</code></td></tr>
+      <tr><td><code>docker update</code></td><td><code>docker container update</code></td></tr>
+      <tr><td><code>docker commit</code></td><td><code>docker container commit</code></td></tr>
+      <tr><td><code>docker attach</code></td><td><code>docker container attach</code></td></tr>
+      <tr><td><code>docker pause</code></td><td><code>docker container pause</code></td></tr>
+      <tr><td><code>docker unpause</code></td><td><code>docker container unpause</code></td></tr>
+      <tr><td><code>docker network ls</code></td><td><code>docker network ls</code> (unchanged)</td></tr>
+      <tr><td><code>docker volume ls</code></td><td><code>docker volume ls</code> (unchanged)</td></tr>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>11. Quick Reference Cheat Sheet</h2>
+
+    <pre data-title="Docker cheat sheet — most-used commands"><code><span class="c">## IMAGES</span>
+docker pull nginx:alpine                          <span class="c"># pull an image</span>
+docker image ls                                   <span class="c"># list images</span>
+docker build -t myapp:1.0 .                       <span class="c"># build from Dockerfile</span>
+docker build --no-cache --progress=plain -t x .   <span class="c"># build without cache, verbose</span>
+docker tag myapp:1.0 registry.io/team/myapp:1.0   <span class="c"># tag (pointer, no copy)</span>
+docker push registry.io/team/myapp:1.0            <span class="c"># push to registry</span>
+docker rmi myapp:1.0                              <span class="c"># remove image</span>
+docker image prune -a                             <span class="c"># remove all unused images</span>
+docker save myapp:1.0 -o myapp.tar                <span class="c"># export to file</span>
+docker load -i myapp.tar                          <span class="c"># import from file</span>
+
+<span class="c">## CONTAINERS — run</span>
+docker run -d --name api -p 8000:8000 myapp:1.0   <span class="c"># detached, named, port published</span>
+docker run -it --rm ubuntu bash                   <span class="c"># interactive, auto-remove on exit</span>
+docker run --rm -v $(pwd):/work -w /work node npm test  <span class="c"># one-off with bind mount</span>
+
+<span class="c">## CONTAINERS — manage</span>
+docker ps                                         <span class="c"># running containers</span>
+docker ps -a                                      <span class="c"># all containers</span>
+docker stop api                                   <span class="c"># graceful stop (SIGTERM → SIGKILL)</span>
+docker rm api                                     <span class="c"># remove stopped container</span>
+docker rm -f api                                  <span class="c"># force stop + remove</span>
+docker container prune                            <span class="c"># remove all stopped containers</span>
+
+<span class="c">## CONTAINERS — inspect</span>
+docker logs -f api                                <span class="c"># follow logs</span>
+docker logs --tail 50 api                         <span class="c"># last 50 lines</span>
+docker exec -it api /bin/bash                     <span class="c"># interactive shell inside</span>
+docker exec api cat /etc/hosts                    <span class="c"># one-off command</span>
+docker inspect api                                <span class="c"># full JSON</span>
+docker inspect --format '{{.State.ExitCode}}' api <span class="c"># Go template</span>
+docker stats --no-stream                          <span class="c"># resource snapshot</span>
+docker top api                                    <span class="c"># processes inside</span>
+docker cp api:/app/logs/app.log .                 <span class="c"># copy file out</span>
+
+<span class="c">## VOLUMES</span>
+docker volume create mydata                       <span class="c"># create named volume</span>
+docker volume ls                                  <span class="c"># list</span>
+docker volume inspect mydata                      <span class="c"># details</span>
+docker volume rm mydata                           <span class="c"># remove (must not be in use)</span>
+docker volume prune                               <span class="c"># remove all unused</span>
+
+<span class="c">## NETWORKS</span>
+docker network create mynet                       <span class="c"># create bridge network</span>
+docker network ls                                 <span class="c"># list</span>
+docker network inspect mynet                      <span class="c"># details</span>
+docker network connect mynet api                  <span class="c"># attach running container</span>
+docker network disconnect mynet api               <span class="c"># detach</span>
+docker network rm mynet                           <span class="c"># remove</span>
+docker network prune                              <span class="c"># remove unused</span>
+
+<span class="c">## COMPOSE</span>
+docker compose up -d --build                      <span class="c"># start / rebuild</span>
+docker compose down                               <span class="c"># stop + remove containers</span>
+docker compose down -v                            <span class="c"># also remove volumes</span>
+docker compose logs -f api                        <span class="c"># follow service logs</span>
+docker compose exec api bash                      <span class="c"># shell in service</span>
+docker compose ps                                 <span class="c"># status</span>
+
+<span class="c">## SYSTEM</span>
+docker system df                                  <span class="c"># disk usage</span>
+docker system prune                               <span class="c"># remove unused resources</span>
+docker system prune --volumes                     <span class="c"># include volumes (destructive)</span>
+docker builder prune                              <span class="c"># clear build cache</span></code></pre>
+
+    <nav class="pager">
+      <a class="prev" href="index.html"><small>◀ Back</small>Labs Hub</a>
+      <a class="next" href="index.html"><small>Next ▶</small>More labs coming soon</a>
+    </nav>
+
+  </article></main>
+</div>
+</body>
+</html>
