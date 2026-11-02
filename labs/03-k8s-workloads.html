@@ -644,6 +644,71 @@ kubectl delete pod reliability-canary</code></pre>
     </section>
 
     <!-- ============================================================ -->
+    <h2>10. Quick Reference Cheat Sheet</h2>
+
+    <pre data-title="Kubernetes Workloads cheat sheet — most-used commands"><code><span class="c">## CLUSTER &amp; NODES</span>
+kind create cluster --config kind-config.yaml       <span class="c"># create multi-node local cluster</span>
+kind load docker-image myimage:0.1.0 --name lab     <span class="c"># load local image directly into kind nodes</span>
+kind get clusters                                   <span class="c"># list active kind clusters</span>
+kind delete cluster --name lab                      <span class="c"># destroy kind cluster</span>
+kubectl cluster-info                                <span class="c"># verify control plane and CoreDNS endpoints</span>
+kubectl get nodes -o wide                           <span class="c"># list nodes with internal IPs, OS, kernel</span>
+kubectl describe node kind-worker                   <span class="c"># inspect allocatable CPU/RAM, conditions &amp; taints</span>
+docker exec -it &lt;node-container&gt; crictl images      <span class="c"># inspect images inside a node container runtime</span>
+
+<span class="c">## PODS &amp; DIAGNOSTICS</span>
+kubectl run my-pod --image=nginx:alpine             <span class="c"># imperative: run a bare test pod</span>
+kubectl apply -f pod.yaml                           <span class="c"># declarative: create/update pod from YAML</span>
+kubectl get pods -o wide                            <span class="c"># list pods with node placement &amp; pod IPs</span>
+kubectl get pods --show-labels                      <span class="c"># list pods with all assigned labels</span>
+kubectl describe pod &lt;pod-name&gt;                     <span class="c"># inspect pod events, exit codes, probe statuses</span>
+kubectl logs &lt;pod-name&gt;                             <span class="c"># view stdout/stderr container logs</span>
+kubectl logs &lt;pod-name&gt; -f                          <span class="c"># stream/follow logs in real-time</span>
+kubectl logs &lt;pod-name&gt; --previous                  <span class="c"># read logs of container *before* it crashed</span>
+kubectl exec -it &lt;pod-name&gt; -- sh                   <span class="c"># open interactive shell inside container</span>
+kubectl exec &lt;pod-name&gt; -- env                      <span class="c"># run single command inside container</span>
+kubectl port-forward pod/&lt;pod-name&gt; 8080:8000       <span class="c"># tunnel host port 8080 to container port 8000</span>
+kubectl delete pod &lt;pod-name&gt;                       <span class="c"># graceful deletion (triggers SIGTERM)</span>
+kubectl delete pod &lt;pod-name&gt; --now                 <span class="c"># immediate deletion (grace-period=0)</span>
+
+<span class="c">## DEPLOYMENTS &amp; REPLICASETS</span>
+kubectl apply -f 02-deployment.yaml                 <span class="c"># create or declaratively update deployment</span>
+kubectl get deployments                             <span class="c"># view desired vs ready replicas</span>
+kubectl get replicasets                             <span class="c"># inspect underlying ReplicaSets and pod hashes</span>
+kubectl get deploy,rs,pods                          <span class="c"># view entire workload hierarchy in one command</span>
+kubectl scale deployment/my-app --replicas=5        <span class="c"># imperatively scale replica count</span>
+kubectl describe deployment/my-app                  <span class="c"># view rolling update strategy, selector &amp; conditions</span>
+kubectl delete -f 02-deployment.yaml                <span class="c"># delete deployment, replicasets and all managed pods</span>
+
+<span class="c">## ROLLING UPDATES, ROLLBACKS &amp; RESILIENCY</span>
+kubectl set image deployment/my-app c=img:v2        <span class="c"># trigger rolling update by updating image</span>
+kubectl rollout status deployment/my-app            <span class="c"># watch rolling update progress in real-time</span>
+kubectl rollout history deployment/my-app           <span class="c"># view list of past revisions</span>
+kubectl rollout history deployment/my-app --rev=2   <span class="c"># inspect exact pod template of a specific revision</span>
+kubectl rollout undo deployment/my-app              <span class="c"># rollback to immediately preceding revision</span>
+kubectl rollout undo deployment/my-app --to-rev=1   <span class="c"># rollback to an explicit historical revision</span>
+kubectl rollout restart deployment/my-app           <span class="c"># trigger zero-downtime restart of all pods</span>
+kubectl annotate deployment/my-app \
+  kubernetes.io/change-cause="deploy v2.0" --overwrite <span class="c"># document release description in rollout history</span>
+
+<span class="c">## NAMESPACES (MULTI-TENANCY &amp; ISOLATION)</span>
+kubectl get namespaces                              <span class="c"># list all cluster namespaces</span>
+kubectl create namespace staging                    <span class="c"># create a new namespace</span>
+kubectl apply -f app.yaml -n staging                <span class="c"># apply manifest into specific namespace</span>
+kubectl get all -n staging                          <span class="c"># inspect all resources inside staging</span>
+kubectl config set-context --current --namespace=stg <span class="c"># switch active default namespace in current context</span>
+kubectl delete namespace staging                    <span class="c"># deletes namespace AND all resources inside it</span>
+
+<span class="c">## LABELS, SELECTORS &amp; ANNOTATIONS</span>
+kubectl get pods -l app=reliability-api             <span class="c"># filter resources by exact key=value label</span>
+kubectl get pods -l 'env in (staging, prod)'        <span class="c"># set-based filter: match either staging or prod</span>
+kubectl get pods -l tier=backend,env=lab            <span class="c"># multi-label AND filter</span>
+kubectl get pods -l '!track'                        <span class="c"># filter pods that do NOT have the 'track' key</span>
+kubectl label pod my-pod env=canary                 <span class="c"># add or update a label dynamically on a running pod</span>
+kubectl label pod my-pod env-                       <span class="c"># remove a label from a running pod (notice trailing -)</span>
+kubectl annotate pod my-pod note="OOM test"         <span class="c"># attach non-identifying metadata annotation</span></code></pre>
+
+    <!-- ============================================================ -->
     <h2>Cleanup</h2>
 
     <pre data-title="Tear down the lab resources"><code><span class="c"># Delete all resources created in this lab</span>

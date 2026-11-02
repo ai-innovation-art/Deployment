@@ -10,15 +10,15 @@ metadata:
     deployment.kubernetes.io/revision: "1"
     description: "Reliability API — demonstrates Kubernetes workload patterns"
 spec:
-  replicas: 3
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: reliability-api
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1           # At most 4 pods total (3 + 1) during an update
-      maxUnavailable: 0     # Never drop below 3 ready pods
+      maxSurge: 1           # At most 3 pods total (2 + 1) during an update
+      maxUnavailable: 0     # Never drop below 2 ready pods
   template:
     metadata:
       labels:
@@ -30,7 +30,7 @@ spec:
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: DoNotSchedule
+          whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: reliability-api
