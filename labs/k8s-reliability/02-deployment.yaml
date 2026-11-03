@@ -2,7 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: reliability-api
-  namespace: default
   labels:
     app.kubernetes.io/name: reliability-api
     app.kubernetes.io/version: "0.1.0"
