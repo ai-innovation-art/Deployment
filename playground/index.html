@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kubernetes Visual Playground & Interactive Architecture Engine</title>
+  <link rel="stylesheet" href="playground.css">
+</head>
+<body>
+
+  <!-- Top Header Navigation -->
+  <header class="playground-header">
+    <div class="brand-section">
+      <div class="k8s-logo-badge">☸</div>
+      <div>
+        <div class="brand-title">Kubernetes Visual Architecture Playground</div>
+        <div class="brand-subtitle">Interactive Real-Time Simulation Engine · Multi-Node Kind Architecture</div>
+      </div>
+    </div>
+
+    <!-- Chapter Tabs -->
+    <nav class="nav-tabs">
+      <button class="tab-btn active" data-tab="workloads" onclick="window.playground.setTab('workloads')">
+        📦 1. Workloads &amp; Scheduling
+      </button>
+      <button class="tab-btn" data-tab="reliability" onclick="window.playground.setTab('reliability')">
+        🩺 2. Health, Probes &amp; OOM
+      </button>
+      <button class="tab-btn" data-tab="networking" onclick="window.playground.setTab('networking')">
+        🌐 3. Services, DNS &amp; Ingress
+      </button>
+      <button class="tab-btn" data-tab="storage_rbac" onclick="window.playground.setTab('storage_rbac')">
+        💾 4. Config, Storage &amp; RBAC
+      </button>
+    </nav>
+
+    <div class="header-actions">
+      <span class="pill-badge" style="color:#7ee787; border-color:rgba(35,134,54,0.4);">● LOCAL PREVIEW</span>
+      <a href="../labs/index.html" class="tab-btn" style="text-decoration:none; padding:6px 12px; font-size:0.75rem;">← Back to Labs</a>
+    </div>
+  </header>
+
+  <!-- Main Split Layout -->
+  <main class="playground-main">
+
+    <!-- Left Panel: Interactive Knobs & Dynamic YAML -->
+    <aside class="sidebar-panel">
+      
+      <!-- Interactive Knobs Deck -->
+      <div class="panel-section-title">
+        <span>Interactive Controls</span>
+        <span style="font-size:0.7rem; color:var(--cyan-accent); font-weight:normal;">Live Sync</span>
+      </div>
+      
+      <div class="control-deck" id="controlDeck">
+        <!-- Injected dynamically by playground.js -->
+      </div>
+
+      <!-- Synchronized YAML Viewer -->
+      <div class="panel-section-title" style="border-top:1px solid var(--border-subtle); margin-top:4px;">
+        <span>Manifest Blueprint (Click line to inspect)</span>
+        <span style="font-size:0.7rem; color:var(--text-muted); font-family:var(--font-mono);">YAML</span>
+      </div>
+
+      <div class="yaml-container">
+        <div class="yaml-toolbar">
+          <span>02-deployment.yaml</span>
+          <span>Click any line for production breakdown</span>
+        </div>
+        <div class="yaml-code-scroll" id="yamlCodeScroll">
+          <!-- YAML lines injected dynamically -->
+        </div>
+
+        <!-- Field Explainer Drawer -->
+        <div class="field-explainer-drawer" id="fieldExplainerDrawer">
+          <div class="field-name-title" id="explainerTitle">Field Title</div>
+          <div class="field-desc" id="explainerDesc">Description</div>
+          <div class="field-impact" id="explainerImpact">Impact</div>
+        </div>
+      </div>
+
+    </aside>
+
+    <!-- Right Panel: The Animated Topology Canvas -->
+    <section class="canvas-panel" id="canvasPanel">
+      <div id="topologyCanvasArea">
+        <!-- Live physical nodes, pods, services injected dynamically -->
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Bottom Terminal Emulator -->
+  <footer class="terminal-dock">
+    <div class="terminal-header">
+      <div class="terminal-dots">
+        <span class="t-dot red"></span>
+        <span class="t-dot yellow"></span>
+        <span class="t-dot green"></span>
+      </div>
+      <span>Live Cluster State Stream · kubectl terminal synchronization</span>
+      <span style="font-family:var(--font-mono); color:var(--cyan-accent);">v1.37.0-kind</span>
+    </div>
+    <div class="terminal-body" id="terminalBody">
+      <!-- Live terminal output injected dynamically -->
+    </div>
+  </footer>
+
+  <script src="playground.js"></script>
+</body>
+</html>

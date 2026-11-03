@@ -1,0 +1,36 @@
+# Load Generator Pod to trigger HPA scaling
+# Hits /work?ms=30 in a continuous loop to burn CPU.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-generator
+  labels:
+    app: load-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: load-generator
+  template:
+    metadata:
+      labels:
+        app: load-generator
+    spec:
+      containers:
+        - name: siege
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Starting sustained load generation against reliability-api..."
+              while true; do
+                wget -q -O- "http://reliability-api:80/work?ms=40" > /dev/null
+              done
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi

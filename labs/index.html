@@ -52,6 +52,12 @@
       <p>All labs run against a real, fully-implemented application located directly in this repo at <code>labs/reliability-api/</code>. It contains <code>app/main.py</code> (FastAPI), unit tests (<code>tests/test_main.py</code>), multi-stage and naive Dockerfiles, and <code>compose.yaml</code>. You can build, test, break, and inspect it locally in real time.</p>
     </div>
 
+    <div class="callout accent" style="border: 2px solid var(--accent); background: var(--surface);">
+      <span class="label" style="background: var(--accent); color: #fff;">Interactive Architecture Simulator</span>
+      <h3 style="margin: 6px 0 4px;"><a href="../playground/index.html" style="text-decoration: none; color: var(--accent);">🚀 Open Kubernetes Visual Playground</a></h3>
+      <p style="margin: 0; font-size: 14px; color: var(--muted);">Real-time interactive canvas with live YAML inspector, failure toggles (OOMKilled, Pending Pods, Selector Typos), and multi-node topology animations.</p>
+    </div>
+
     <h2>All Labs</h2>
     <div class="grid" style="grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));">
 
@@ -83,26 +89,19 @@
         <span class="status">✅ Available</span>
       </a>
 
-      <div class="lab-card soon">
-        <span class="num-badge">LAB 07</span>
-        <h4>Observability</h4>
-        <p>Prometheus scraping, PromQL, Grafana dashboards, SLI/SLO/error budgets.</p>
-        <span class="status">⏳ Coming soon</span>
-      </div>
+      <a class="lab-card ready" href="05-observability-scaling.html">
+        <span class="num-badge">LAB 07 &amp; 08</span>
+        <h4>Observability, Autoscaling &amp; Chaos</h4>
+        <p>Metrics Server, Prometheus scraping, PromQL, Grafana dashboards, HPA auto-scaling under load, and chaos testing.</p>
+        <span class="status">✅ Available</span>
+      </a>
 
-      <div class="lab-card soon">
-        <span class="num-badge">LAB 08</span>
-        <h4>Scaling, Load &amp; Failure</h4>
-        <p>HPA, k6 load testing, failure experiments, measuring recovery.</p>
-        <span class="status">⏳ Coming soon</span>
-      </div>
-
-      <div class="lab-card soon">
+      <a class="lab-card ready" href="06-cicd-gitops.html">
         <span class="num-badge">LAB 09</span>
-        <h4>CI/CD — GitHub Actions</h4>
-        <p>Workflow syntax, build &amp; push to GHCR, image scanning, kind in CI.</p>
-        <span class="status">⏳ Coming soon</span>
-      </div>
+        <h4>CI/CD, Security &amp; GitOps</h4>
+        <p>GitHub Actions pipelines, multi-arch Docker buildx, Trivy vulnerability scanning, Kind in CI, Helm OCI packaging, and GitOps.</p>
+        <span class="status">✅ Available</span>
+      </a>
 
       <div class="lab-card soon">
         <span class="num-badge">LAB 10</span>

@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 05 · Observability, Autoscaling &amp; Chaos Testing — DevOps Lab</title>
+<link rel="stylesheet" href="../notes-animated/assets/style.css">
+<script src="../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../index.html">DevOps Lab</a>
+  <span class="crumb">Labs · Module 07 &amp; 08 · Observability, Autoscaling &amp; Chaos Testing</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+    <h1>Lab 05 · Observability, Autoscaling &amp; Chaos Testing</h1>
+    <p class="lede">Hands-on lab guide for Modules 07 &amp; 08 — you will deploy Kubernetes Metrics Server, scrape Prometheus metrics from <code>reliability-api</code>, construct PromQL queries for RED signals (Rate, Errors, Duration), configure Horizontal Pod Autoscaler (HPA), generate sustained CPU load, watch pods scale out live from 2 to 8 replicas, observe anti-flapping stabilization windows, and inject chaos failure experiments.</p>
+    <div class="meta">
+      <span class="pill accent">Prereq: Lab 03 &amp; 04 · K8s Workloads &amp; Networking</span>
+      <span class="pill">⏱ 5–7 h lab</span>
+      <span class="pill">Prometheus · HPA v2 · Metrics Server</span>
+      <span class="verified">✓ Verified on Kubernetes v1.31+ · Nov 2026</span>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>0. Prerequisites &amp; Architecture Overview</h2>
+
+    <p>Observability and auto-scaling form the central nervous system of any production cluster. Without metrics, scaling decisions cannot be automated, and diagnosing outages requires blind guesswork.</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Component</th><th>Role in Cluster</th><th>Protocol / Port</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Metrics Server</strong></td><td>In-memory accumulator of CPU/RAM from kubelets for HPA and <code>kubectl top</code></td><td>HTTPS :10250 / :443</td></tr>
+        <tr><td><strong>Prometheus</strong></td><td>Time-series database scraping application and node metrics at regular intervals</td><td>HTTP :9090 / :8000/metrics</td></tr>
+        <tr><td><strong>Grafana</strong></td><td>Visual analytics dashboard and alerting engine querying Prometheus</td><td>HTTP :3000</td></tr>
+        <tr><td><strong>HorizontalPodAutoscaler</strong></td><td>Control loop automatically adjusting Deployment replica count based on metrics</td><td>autoscaling/v2 API</td></tr>
+      </tbody>
+    </table></div>
+
+    <pre data-title="Verify cluster starting state"><code><span class="c"># Ensure kind cluster is running and nodes are Ready</span>
+kubectl get nodes
+kubectl get pods -o wide
+
+<span class="c"># Verify reliability-api is running with 2 replicas</span>
+kubectl get deploy reliability-api</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>1. Deploy Metrics-Server &amp; Validate `kubectl top`</h2>
+
+    <p>The standard Kubernetes <code>metrics-server</code> collects resource metrics (CPU and memory usage) from Kubelets on each worker node. In a local kind cluster, Kubelet uses self-signed TLS certificates, which standard metrics-server rejects by default. We patch it with <code>--kubelet-insecure-tls</code>.</p>
+
+    <pre data-title="labs/k8s-observability/01-metrics-server.yaml"><code><span class="c"># Apply the patched metrics-server manifest</span>
+kubectl apply -f labs/k8s-observability/01-metrics-server.yaml
+
+<span class="c"># Wait for metrics-server pod to become Ready</span>
+kubectl rollout status deployment/metrics-server -n kube-system
+
+<span class="c"># Wait ~30 seconds for the first metrics collection cycle, then test:</span>
+kubectl top nodes
+kubectl top pods</code></pre>
+
+    <div class="callout tip">
+      <span class="label">Understanding `kubectl top` Output</span>
+      <p>CPU is reported in <strong>millicores (m)</strong>, where <code>1000m = 1 vCPU core</code>. Memory is reported in <strong>Mebibytes (Mi)</strong>. If <code>kubectl top</code> returns <em>"error: Metrics API not available"</em>, metrics-server needs another 15–30 seconds to scrape its first sample.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>2. Prometheus Fundamentals &amp; Scraping `/metrics`</h2>
+
+    <p><code>reliability-api</code> is pre-instrumented with the Prometheus client library. It exposes application runtime metrics in standard Prometheus text format at <code>http://reliability-api:8000/metrics</code>.</p>
+
+    <pre data-title="Inspect raw Prometheus metrics from the app"><code><span class="c"># Port-forward directly to the application</span>
+kubectl port-forward svc/reliability-api 8080:80 &amp;
+
+<span class="c"># Inspect Prometheus metrics endpoint</span>
+curl -s http://localhost:8080/metrics | grep -E "http_requests_total|process_resident_memory_bytes"
+
+<span class="c"># Deploy our dedicated Prometheus instance</span>
+kubectl apply -f labs/k8s-observability/04-prometheus-minimal.yaml
+
+<span class="c"># Verify Prometheus is running</span>
+kubectl rollout status deployment/prometheus</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>3. PromQL Queries: The RED Method</h2>
+
+    <p>Prometheus Query Language (<strong>PromQL</strong>) allows you to aggregate time-series data. The <strong>RED Method</strong> focuses on three core microservice signals:</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>RED Signal</th><th>What it measures</th><th>PromQL Example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Rate</strong></td><td>Requests per second</td><td><code>rate(http_requests_total[1m])</code></td></tr>
+        <tr><td><strong>Errors</strong></td><td>Failed requests per second</td><td><code>rate(http_requests_total{status=~"5.."}[1m])</code></td></tr>
+        <tr><td><strong>Duration</strong></td><td>Latency histogram distribution</td><td><code>histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))</code></td></tr>
+      </tbody>
+    </table></div>
+
+    <pre data-title="Access Prometheus Web UI and execute PromQL"><code><span class="c"># Port-forward Prometheus Web UI to host port 9090</span>
+kubectl port-forward svc/prometheus 9090:9090
+
+<span class="c"># Open http://localhost:9090 in your browser</span>
+<span class="c"># Run this query to observe requests per second:</span>
+sum(rate(http_requests_total[1m]))</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>4. Grafana Dashboards &amp; Alerting</h2>
+
+    <p>Grafana transforms raw PromQL time series into visual executive dashboards. In production, Alertmanager evaluates alerting rules every 15–30 seconds and routes notifications to Slack, PagerDuty, or Webhooks.</p>
+
+    <div class="callout note">
+      <span class="label">Production Standard: kube-prometheus-stack</span>
+      <p>For enterprise deployments, the entire Prometheus, Grafana, Alertmanager, and node-exporter suite is deployed using a single Helm chart: <code>prometheus-community/kube-prometheus-stack</code>.</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>5. The Horizontal Pod Autoscaler (HPA) Formula</h2>
+
+    <p>The Kubernetes HPA controller evaluates metrics every 15 seconds (configurable via <code>--horizontal-pod-autoscaler-sync-period</code>). It calculates the desired replica count using this exact mathematical formula:</p>
+
+    <div class="callout accent">
+      <p>$$\text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \left( \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \right) \right\rceil$$</p>
+    </div>
+
+    <p><strong>Example:</strong> If 2 replicas are running at an average of 100m CPU, and your target is 50m CPU:</p>
+    <p>$$\text{desiredReplicas} = \lceil 2 \times (100 / 50) \rceil = \lceil 2 \times 2 \rceil = 4 \text{ pods}$$</p>
+
+    <pre data-title="labs/k8s-observability/02-hpa.yaml"><code><span class="c"># Apply the HPA manifest targeting reliability-api</span>
+kubectl apply -f labs/k8s-observability/02-hpa.yaml
+
+<span class="c"># Inspect active HPA status</span>
+kubectl get hpa
+kubectl describe hpa reliability-api-hpa</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>6. Load Generation: Simulating Traffic Surges</h2>
+
+    <p>To watch HPA trigger scale-out, we deploy a load-generator pod that repeatedly invokes <code>/work?ms=40</code>. Each request forces the CPU to calculate cryptographic hashes, generating real, measurable CPU utilization.</p>
+
+    <pre data-title="labs/k8s-observability/03-load-generator.yaml"><code><span class="c"># Start the load generator</span>
+kubectl apply -f labs/k8s-observability/03-load-generator.yaml
+
+<span class="c"># Watch HPA metrics update in real-time</span>
+kubectl get hpa reliability-api-hpa -w</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>7. Observing HPA Scale-Out Live ($2 \to 8$ Pods)</h2>
+
+    <p>As the CPU load crosses the 50% target threshold, watch the ReplicaSet spawn new pods automatically:</p>
+
+    <pre data-title="Watch live scaling progression"><code><span class="c"># Watch deployment replicas expand</span>
+kubectl get deployment reliability-api -w
+
+<span class="c"># View CPU consumption per pod</span>
+kubectl top pods -l app.kubernetes.io/name=reliability-api</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>8. Anti-Flapping: Stabilization Windows &amp; Scale-Down</h2>
+
+    <p><strong>The Flapping Problem:</strong> If traffic drops for 3 seconds, scaling down immediately would cause replicas to thrash (scaling up and down rapidly). Kubernetes solves this using a <strong>Stabilization Window</strong> (default 300s, configured to 60s in our manifest).</p>
+
+    <pre data-title="Stop load generator and observe scale-down delay"><code><span class="c"># Delete load generator</span>
+kubectl delete -f labs/k8s-observability/03-load-generator.yaml
+
+<span class="c"># Watch HPA: Notice CPU drops to 0%, but replicas stay at 8 for 60 seconds</span>
+kubectl get hpa reliability-api-hpa -w
+
+<span class="c"># After 60 seconds of calm traffic, HPA smoothly scales back down to 2!</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>9. Chaos Engineering &amp; Failure Injection</h2>
+
+    <p>Testing resilience requires breaking things under load:</p>
+    <ol class="steps">
+      <li>Run load generator.</li>
+      <li>While under heavy traffic, manually kill 2 pods simultaneously: <code>kubectl delete pod -l app.kubernetes.io/name=reliability-api --now</code>.</li>
+      <li>Observe: The ReplicaSet spawns replacements instantly, and the Service maintains zero-downtime routing through remaining healthy endpoints!</li>
+    </ol>
+
+    <!-- ============================================================ -->
+    <h2>10. Quick Reference Cheat Sheet: The Verb x Resource Matrix</h2>
+
+    <p>Kubernetes CLI follows a universal grammar: <code>kubectl &lt;VERB&gt; &lt;RESOURCE&gt; &lt;NAME&gt; [FLAGS]</code>. Use this matrix for all monitoring and autoscaling operations.</p>
+
+    <pre data-title="Observability &amp; Autoscaling Command Matrix"><code><span class="c">## 1. METRICS &amp; RESOURCE MONITORING</span>
+kubectl top nodes                                   <span class="c"># [TOP] View real-time CPU (m) &amp; RAM (Mi) usage across all nodes</span>
+kubectl top pods                                    <span class="c"># [TOP] View CPU and memory usage of all pods in current namespace</span>
+kubectl top pods -A --sort-by=cpu                   <span class="c"># [TOP] Find highest CPU-consuming pods cluster-wide</span>
+kubectl top pods -A --sort-by=memory                <span class="c"># [TOP] Find highest memory-consuming pods cluster-wide</span>
+
+<span class="c">## 2. HORIZONTAL POD AUTOSCALER (hpa)</span>
+kubectl apply -f 02-hpa.yaml                        <span class="c"># [APPLY] Create or update HPA definition</span>
+kubectl get hpa                                     <span class="c"># [GET] View current targets, MIN/MAX replicas, and current replicas</span>
+kubectl get hpa -w                                  <span class="c"># [GET -W] Stream HPA metric changes and scale events in real-time</span>
+kubectl describe hpa &lt;hpa-name&gt;                     <span class="c"># [DESCRIBE] View scaling event history and stabilization conditions</span>
+kubectl autoscale deployment &lt;name&gt; --min=2 --max=10 --cpu-percent=70 <span class="c"># [AUTOSCALE] Imperatively create HPA</span>
+kubectl delete hpa &lt;hpa-name&gt;                       <span class="c"># [DELETE] Remove autoscaler (deployment remains at current replica count)</span>
+
+<span class="c">## 3. PROMETHEUS &amp; METRICS SCRAPING</span>
+kubectl port-forward svc/prometheus 9090:9090       <span class="c"># [PORT-FORWARD] Tunnel Prometheus Web UI to localhost:9090</span>
+curl -s http://localhost:8000/metrics               <span class="c"># [CURL] Inspect raw application Prometheus metrics</span>
+curl -s http://localhost:9090/api/v1/targets        <span class="c"># [CURL] Check active Prometheus scrape targets and health status</span>
+
+<span class="c">## 4. CHAOS &amp; RESILIENCE TESTING</span>
+kubectl scale deployment &lt;name&gt; --replicas=0        <span class="c"># [SCALE] Drain all pods to simulate complete service outage</span>
+kubectl delete pod -l app=&lt;name&gt; --now              <span class="c"># [DELETE] Force-kill pods under load to test resurrection speed</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>Cleanup</h2>
+
+    <pre data-title="Tear down observability and autoscaling resources"><code><span class="c"># Remove load generator</span>
+kubectl delete -f labs/k8s-observability/03-load-generator.yaml --ignore-not-found
+
+<span class="c"># Remove HPA</span>
+kubectl delete -f labs/k8s-observability/02-hpa.yaml --ignore-not-found
+
+<span class="c"># Remove Prometheus</span>
+kubectl delete -f labs/k8s-observability/04-prometheus-minimal.yaml --ignore-not-found
+
+<span class="c"># Remove Metrics Server</span>
+kubectl delete -f labs/k8s-observability/01-metrics-server.yaml --ignore-not-found</code></pre>
+
+    <div class="callout note">
+      <span class="label">Next up</span>
+      <p>Proceed to <a href="06-cicd-gitops.html">Lab 06 · CI/CD, Automated Testing &amp; GitOps Delivery</a> to automate container builds, vulnerability scanning, and continuous deployment with GitHub Actions.</p>
+    </div>
+
+  </article></main>
+</div>
+</body>
+</html>

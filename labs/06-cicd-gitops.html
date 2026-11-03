@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lab 06 · CI/CD, Automated Testing &amp; GitOps Delivery — DevOps Lab</title>
+<link rel="stylesheet" href="../notes-animated/assets/style.css">
+<script src="../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../index.html">DevOps Lab</a>
+  <span class="crumb">Labs · Module 09 · CI/CD, Automated Testing &amp; GitOps Delivery</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+    <h1>Lab 06 · CI/CD, Automated Testing &amp; GitOps Delivery</h1>
+    <p class="lede">Hands-on lab guide for Module 09 — you will construct a hardened, enterprise-grade GitHub Actions CI/CD pipeline for <code>reliability-api</code>. You will implement automated unit testing with pytest, multi-architecture container builds (AMD64 + ARM64) with Docker Buildx, vulnerability scanning with Trivy, ephemeral Kubernetes integration testing using kind in CI, and GitOps continuous delivery with Helm.</p>
+    <div class="meta">
+      <span class="pill accent">Prereq: Lab 02–05 · Docker, K8s &amp; Observability</span>
+      <span class="pill">⏱ 5–7 h lab</span>
+      <span class="pill">GitHub Actions · Trivy · Docker Buildx · GitOps</span>
+      <span class="verified">✓ Verified for production · Nov 2026</span>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>0. Prerequisites &amp; CI/CD Architecture</h2>
+
+    <p>A production CI/CD pipeline is an automated quality gate that prevents broken, untested, or vulnerable code from reaching production servers. Every commit triggers an automated series of verifications:</p>
+
+    <div class="table-wrap"><table>
+      <thead><tr><th>Pipeline Stage</th><th>Tool</th><th>Failure Condition</th></tr></thead>
+      <tbody>
+        <tr><td><strong>1. Code Quality &amp; Linting</strong></td><td>Ruff / Flake8 / Black</td><td>Formatting errors, unused imports, PEP8 violations</td></tr>
+        <tr><td><strong>2. Unit &amp; Integration Tests</strong></td><td>Pytest</td><td>Any test assertion failure or &lt; 80% code coverage</td></tr>
+        <tr><td><strong>3. Container Build</strong></td><td>Docker Buildx (Multi-Arch)</td><td>Dockerfile build failure on AMD64 or ARM64</td></tr>
+        <tr><td><strong>4. Vulnerability Scanning</strong></td><td>Trivy</td><td>Any CRITICAL or HIGH unpatched security CVE detected</td></tr>
+        <tr><td><strong>5. Cluster Integration Test</strong></td><td>Kind in CI Runner</td><td>Manifests fail to deploy, health probes fail</td></tr>
+        <tr><td><strong>6. Release &amp; GitOps Delivery</strong></td><td>Helm / ArgoCD</td><td>Deployment fails health checks; automated rollback</td></tr>
+      </tbody>
+    </table></div>
+
+    <!-- ============================================================ -->
+    <h2>1. The GitHub Actions Workflow File</h2>
+
+    <p>Workflows live in <code>.github/workflows/</code> in your repository. Let's inspect the complete production pipeline definition for <code>reliability-api</code>.</p>
+
+    <pre data-title=".github/workflows/ci.yml"><code><span class="k">name</span>: <span class="s">CI/CD Release Pipeline</span>
+
+<span class="k">on</span>:
+  <span class="k">push</span>:
+    <span class="k">branches</span>: [ <span class="s">main</span> ]
+  <span class="k">pull_request</span>:
+    <span class="k">branches</span>: [ <span class="s">main</span> ]
+
+<span class="c"># Principle of least privilege: deny write access by default</span>
+<span class="k">permissions</span>:
+  <span class="k">contents</span>: <span class="s">read</span>
+  <span class="k">packages</span>: <span class="s">write</span>
+  <span class="k">security-events</span>: <span class="s">write</span>
+
+<span class="k">jobs</span>:
+  <span class="k">test</span>:
+    <span class="k">name</span>: <span class="s">Lint &amp; Unit Tests</span>
+    <span class="k">runs-on</span>: <span class="s">ubuntu-latest</span>
+    <span class="k">steps</span>:
+      - <span class="k">uses</span>: <span class="s">actions/checkout@v4</span>
+      - <span class="k">name</span>: <span class="s">Set up Python</span>
+        <span class="k">uses</span>: <span class="s">actions/setup-python@v5</span>
+        <span class="k">with</span>:
+          <span class="k">python-version</span>: <span class="s">"3.12"</span>
+      - <span class="k">name</span>: <span class="s">Install dependencies</span>
+        <span class="k">run</span>: |
+          pip install --upgrade pip
+          pip install ruff pytest httpx fastapi uvicorn
+      - <span class="k">name</span>: <span class="s">Run Linter</span>
+        <span class="k">run</span>: <span class="s">ruff check labs/reliability-api/app</span>
+      - <span class="k">name</span>: <span class="s">Run Unit Tests</span>
+        <span class="k">run</span>: <span class="s">pytest labs/reliability-api/tests</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>2. Local Test Execution (Testing Before Pushing)</h2>
+
+    <p>A golden rule of DevOps: <em>never push code to Git without running the test suite locally first</em>.</p>
+
+    <pre data-title="Run tests locally in terminal"><code><span class="c"># Navigate to project root</span>
+cd /workspaces/Deployment
+
+<span class="c"># Run unit tests directly against reliability-api</span>
+python -m pytest labs/reliability-api/tests -v
+
+<span class="c"># Verify test coverage and pass status</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>3. Multi-Architecture Container Image Builds</h2>
+
+    <p>Modern servers run on both <strong>x86_64 (Intel/AMD)</strong> and <strong>ARM64 (Apple Silicon / AWS Graviton)</strong>. A production image must be built as a multi-arch manifest list so it runs identically everywhere without emulation lag.</p>
+
+    <pre data-title="Multi-arch Docker build with Buildx"><code><span class="c"># Set up QEMU for emulation and Buildx for multi-platform compilation</span>
+docker buildx create --name multiarch-builder --use
+docker buildx inspect --bootstrap
+
+<span class="c"># Build for both linux/amd64 and linux/arm64</span>
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t kumawatsunil/reliability-api:0.2.0 \
+  -f labs/reliability-api/Dockerfile \
+  labs/reliability-api/</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>4. Vulnerability Scanning with Trivy</h2>
+
+    <p><strong>Trivy</strong> is the open-source security scanner maintained by Aqua Security. It scans container images for known Common Vulnerabilities and Exposures (CVEs) across OS packages and application dependencies.</p>
+
+    <pre data-title="Scan image for security vulnerabilities"><code><span class="c"># Scan image locally (blocking on CRITICAL CVEs)</span>
+trivy image --severity HIGH,CRITICAL kumawatsunil/reliability-api:0.1.0
+
+<span class="c"># Generate SARIF report for GitHub Security tab</span>
+trivy image --format sarif --output trivy-results.sarif kumawatsunil/reliability-api:0.1.0</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>5. Ephemeral Kind Clusters in CI</h2>
+
+    <p>Don't just test unit code in CI — test your actual Kubernetes YAML against a real cluster! GitHub Actions runners support running <code>kind</code> directly inside the Ubuntu VM.</p>
+
+    <pre data-title="GitHub Actions step: Real Kubernetes test"><code><span class="c"># In .github/workflows/ci.yml:</span>
+- <span class="k">name</span>: <span class="s">Create Kind Cluster in CI</span>
+  <span class="k">uses</span>: <span class="s">helm/kind-action@v1.10.0</span>
+  <span class="k">with</span>:
+    <span class="k">cluster_name</span>: <span class="s">ci-test-cluster</span>
+
+- <span class="k">name</span>: <span class="s">Deploy and Verify Application</span>
+  <span class="k">run</span>: |
+    kubectl apply -f labs/k8s-reliability/02-deployment.yaml
+    kubectl rollout status deployment/reliability-api --timeout=60s
+    kubectl get pods -o wide</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>6. Helm Chart Packaging &amp; OCI Registry</h2>
+
+    <p>Modern Helm (v3.8+) allows storing Helm charts directly inside standard container registries (like GitHub Packages GHCR or Docker Hub) as <strong>OCI (Open Container Initiative) artifacts</strong>.</p>
+
+    <pre data-title="Package and push Helm chart as OCI artifact"><code><span class="c"># Lint chart to catch syntax or templating errors</span>
+helm lint ./reliability-chart
+
+<span class="c"># Package chart into versioned .tgz archive</span>
+helm package ./reliability-chart
+
+<span class="c"># Push to OCI registry (GHCR)</span>
+echo $GITHUB_TOKEN | helm registry login ghcr.io -u $GITHUB_ACTOR --password-stdin
+helm push reliability-chart-0.1.0.tgz oci://ghcr.io/ai-innovation-art/charts</code></pre>
+
+    <!-- ============================================================ -->
+    <h2>7. GitOps Delivery with ArgoCD</h2>
+
+    <p><strong>The GitOps Principle:</strong> <em>Git is the single source of truth for your production cluster state.</em></p>
+    <ul>
+      <li>Instead of a CI runner using admin credentials to <code>kubectl apply</code> into production (which is insecure), an agent inside the cluster (<strong>ArgoCD</strong>) pulls manifests from Git.</li>
+      <li>If someone manually deletes a pod or modifies a service, ArgoCD detects the drift and automatically heals the cluster back to match Git!</li>
+    </ul>
+
+    <!-- ============================================================ -->
+    <h2>8. Supply-Chain Security &amp; Action Pinning</h2>
+
+    <p>Third-party GitHub Actions can be compromised if an attacker takes over an action repository. Production pipelines strictly enforce <strong>Commit SHA Pinning</strong>:</p>
+
+    <div class="callout warn">
+      <span class="label">Vulnerable vs Secure Action Reference</span>
+      <p>❌ <strong>Vulnerable:</strong> <code>uses: actions/checkout@v4</code> (Tag can be rewritten by malicious actors)<br>
+      ✅ <strong>Secure:</strong> <code>uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1</code> (Cryptographically immutable SHA)</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <h2>9. Quick Reference Cheat Sheet: CI/CD &amp; GitOps</h2>
+
+    <pre data-title="CI/CD &amp; GitOps Master Command Reference"><code><span class="c">## 1. LOCAL TESTING &amp; LINTING</span>
+pytest labs/reliability-api/tests -v               <span class="c"># Run unit test suite with verbose output</span>
+pytest --cov=labs/reliability-api/app              <span class="c"># Measure test code coverage percentage</span>
+ruff check labs/reliability-api/app                <span class="c"># Ultra-fast Python code linting</span>
+
+<span class="c">## 2. DOCKER BUILDX (MULTI-ARCH)</span>
+docker buildx ls                                   <span class="c"># List available Buildx builder instances</span>
+docker buildx create --name builder --use          <span class="c"># Initialize and switch to multi-platform builder</span>
+docker buildx build --platform linux/amd64,linux/arm64 -t app:v1 . <span class="c"># Build dual-architecture image</span>
+
+<span class="c">## 3. SECURITY SCANNING (TRIVY)</span>
+trivy image &lt;image-name&gt;                           <span class="c"># Scan container image for all CVE vulnerabilities</span>
+trivy image --severity CRITICAL --exit-code 1 img  <span class="c"># Fail CI pipeline build if CRITICAL CVE exists</span>
+trivy fs .                                         <span class="c"># Scan local filesystem and dependencies for secrets/CVEs</span>
+
+<span class="c">## 4. HELM PACKAGING &amp; OCI</span>
+helm lint ./my-chart                               <span class="c"># Validate chart templates, values and syntax</span>
+helm package ./my-chart                            <span class="c"># Package chart directory into .tgz release archive</span>
+helm push my-chart-0.1.0.tgz oci://registry/charts <span class="c"># Push packaged chart to OCI registry</span></code></pre>
+
+    <!-- ============================================================ -->
+    <h2>Cleanup</h2>
+
+    <pre data-title="Clean up local build artifacts"><code><span class="c"># Remove temporary buildx builders</span>
+docker buildx rm multiarch-builder 2>/dev/null || true
+
+<span class="c"># Remove local packaged .tgz charts</span>
+rm -f *.tgz</code></pre>
+
+  </article></main>
+</div>
+</body>
+</html>
