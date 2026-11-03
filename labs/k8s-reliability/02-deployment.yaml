@@ -41,11 +41,9 @@ spec:
             - containerPort: 8000
               name: http
               protocol: TCP
-          env:
-            - name: LOG_LEVEL
-              value: "info"
-            - name: READY_DELAY_SECONDS
-              value: "5"       # Simulate slow startup for readiness probe demo
+          envFrom:
+            - configMapRef:
+                name: reliability-api-config
           resources:
             requests:
               cpu: "100m"      # 0.1 CPU cores — used by scheduler for placement

@@ -785,66 +785,92 @@ helm uninstall reliability-api -n reliability-lab</code></pre>
     </section>
 
     <!-- ============================================================ -->
-    <h2>10. Quick Reference Cheat Sheet</h2>
+    <h2>10. Quick Reference Cheat Sheet: The Verb x Resource Matrix</h2>
 
-    <pre data-title="Kubernetes Networking, Config &amp; Helm cheat sheet — most-used commands"><code><span class="c">## SERVICES &amp; ENDPOINTS</span>
-kubectl apply -f 03-service-clusterip.yaml          <span class="c"># create internal virtual IP load-balancer</span>
-kubectl get svc -o wide                             <span class="c"># list services, ClusterIPs, external IPs and ports</span>
-kubectl get endpoints &lt;service-name&gt;                <span class="c"># inspect backend pod IPs matching service selector</span>
-kubectl describe svc &lt;service-name&gt;                 <span class="c"># inspect selector, targetPort and active endpoints</span>
-kubectl port-forward svc/&lt;svc-name&gt; 8080:80         <span class="c"># forward traffic to service directly from host</span>
-kubectl expose deployment/&lt;app&gt; --port=80 --target-port=8000 <span class="c"># imperatively generate a Service</span>
+    <p>Kubernetes CLI follows a universal grammar: <code>kubectl &lt;VERB&gt; &lt;RESOURCE&gt; &lt;NAME&gt; [FLAGS]</code>. Use this structured matrix as your master lookup table.</p>
 
-<span class="c">## DNS &amp; SERVICE DISCOVERY</span>
-kubectl run debug --rm -it --image=busybox -- sh    <span class="c"># launch disposable pod for network diagnostics</span>
-nslookup &lt;service-name&gt;                             <span class="c"># query short DNS name within same namespace</span>
-nslookup &lt;svc&gt;.&lt;namespace&gt;.svc.cluster.local        <span class="c"># query Fully Qualified Domain Name (FQDN) cross-namespace</span>
-wget -qO- http://&lt;service-name&gt;:&lt;port&gt;/health       <span class="c"># test HTTP connection using CoreDNS resolution</span>
+    <pre data-title="Kubernetes Master Verb x Resource Matrix"><code><span class="c">## 1. PODS (po) — Atomic Compute Unit</span>
+kubectl run my-pod --image=nginx:alpine             <span class="c"># [RUN] Imperatively start a single test pod</span>
+kubectl apply -f pod.yaml                           <span class="c"># [APPLY] Declaratively create/update pod from YAML</span>
+kubectl get pods -o wide                            <span class="c"># [GET] List pods with node placement &amp; pod IPs</span>
+kubectl get pods --show-labels                      <span class="c"># [GET] List pods with all assigned labels</span>
+kubectl describe pod &lt;pod-name&gt;                     <span class="c"># [DESCRIBE] Deep inspection: events, probe states, exit codes</span>
+kubectl logs &lt;pod-name&gt; -f                          <span class="c"># [LOGS] Stream container stdout/stderr in real-time</span>
+kubectl logs &lt;pod-name&gt; --previous                  <span class="c"># [LOGS] Read logs of container *before* it crashed</span>
+kubectl exec -it &lt;pod-name&gt; -- sh                   <span class="c"># [EXEC] Open interactive shell inside container</span>
+kubectl port-forward pod/&lt;pod-name&gt; 8080:8000       <span class="c"># [PORT-FORWARD] Tunnel host port 8080 to container port 8000</span>
+kubectl label pod &lt;pod-name&gt; env=canary             <span class="c"># [LABEL] Dynamically add/update label</span>
+kubectl label pod &lt;pod-name&gt; env-                   <span class="c"># [LABEL] Remove label (notice trailing -)</span>
+kubectl delete pod &lt;pod-name&gt; --now                 <span class="c"># [DELETE] Force-delete pod without grace period</span>
 
-<span class="c">## INGRESS</span>
-kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml <span class="c"># install NGINX ingress</span>
-kubectl get ingress                                 <span class="c"># list ingress resources, hosts and backend paths</span>
-kubectl describe ingress &lt;ingress-name&gt;             <span class="c"># inspect routing rules, TLS settings and backends</span>
-curl -H "Host: reliability.local" http://localhost  <span class="c"># test Ingress route with custom Host header</span>
+<span class="c">## 2. DEPLOYMENTS (deploy) &amp; REPLICASETS (rs) — Self-Healing Workloads</span>
+kubectl apply -f 02-deployment.yaml                 <span class="c"># [APPLY] Create or declaratively update deployment</span>
+kubectl get deploy,rs,pods                          <span class="c"># [GET] View full workload hierarchy in one command</span>
+kubectl scale deployment/&lt;app&gt; --replicas=5         <span class="c"># [SCALE] Adjust replica count imperatively</span>
+kubectl set image deployment/&lt;app&gt; c=img:v2         <span class="c"># [SET IMAGE] Trigger rolling update with new container image</span>
+kubectl rollout status deployment/&lt;app&gt;             <span class="c"># [ROLLOUT STATUS] Watch rolling update progress in real-time</span>
+kubectl rollout history deployment/&lt;app&gt;            <span class="c"># [ROLLOUT HISTORY] View list of past release revisions</span>
+kubectl rollout history deployment/&lt;app&gt; --rev=2    <span class="c"># [ROLLOUT HISTORY] Inspect pod template of specific revision</span>
+kubectl rollout undo deployment/&lt;app&gt;               <span class="c"># [ROLLOUT UNDO] Rollback to immediately preceding revision</span>
+kubectl rollout undo deployment/&lt;app&gt; --to-rev=1    <span class="c"># [ROLLOUT UNDO] Rollback to explicit historical revision</span>
+kubectl rollout restart deployment/&lt;app&gt;            <span class="c"># [ROLLOUT RESTART] Zero-downtime rolling restart of all pods</span>
+kubectl annotate deployment/&lt;app&gt; \
+  kubernetes.io/change-cause="deploy v2" --overwrite <span class="c">#[ANNOTATE] Record release description in rollout history</span>
+kubectl delete deployment/&lt;app&gt;                     <span class="c"># [DELETE] Remove deployment, replicasets and pods</span>
 
-<span class="c">## CONFIGMAPS (NON-SENSITIVE CONFIGURATION)</span>
-kubectl apply -f 05-configmap.yaml                  <span class="c"># create ConfigMap from manifest</span>
-kubectl create configmap app-cfg --from-literal=KEY=val <span class="c"># imperative ConfigMap creation</span>
-kubectl create configmap app-cfg --from-file=config.json <span class="c"># load entire file into ConfigMap</span>
-kubectl get configmaps                              <span class="c"># list ConfigMaps in current namespace</span>
-kubectl describe configmap &lt;cm-name&gt;                <span class="c"># view raw key-value pairs stored in ConfigMap</span>
+<span class="c">## 3. SERVICES (svc) &amp; ENDPOINTS (ep) — Traffic Balancing</span>
+kubectl apply -f 03-service-clusterip.yaml          <span class="c"># [APPLY] Create internal virtual IP load-balancer</span>
+kubectl expose deployment/&lt;app&gt; --port=80           <span class="c"># [EXPOSE] Auto-generate a service from deployment</span>
+kubectl get svc -o wide                             <span class="c"># [GET] List ClusterIPs, NodePorts, and External IPs</span>
+kubectl get endpoints &lt;svc-name&gt;                    <span class="c"># [GET] Inspect backend pod IPs matching service selector</span>
+kubectl describe svc &lt;svc-name&gt;                     <span class="c"># [DESCRIBE] Inspect selector, targetPort and active endpoints</span>
+kubectl port-forward svc/&lt;svc-name&gt; 8080:80         <span class="c"># [PORT-FORWARD] Tunnel traffic directly to service virtual IP</span>
+kubectl set selector svc &lt;svc-name&gt; "app=v2"        <span class="c"># [SET SELECTOR] Repoint service to different pod label</span>
+kubectl delete svc &lt;svc-name&gt;                       <span class="c"># [DELETE] Tear down service and remove routing rules</span>
 
-<span class="c">## SECRETS (BASE64-ENCODED SENSITIVE DATA)</span>
-kubectl apply -f 06-secret.yaml                     <span class="c"># create Secret from manifest</span>
-kubectl create secret generic db-creds --from-literal=pass=secret <span class="c"># create secret (auto-encodes to base64)</span>
-kubectl get secrets                                 <span class="c"># list secrets in current namespace</span>
-kubectl get secret &lt;sec-name&gt; -o jsonpath='{.data.password}' | base64 -d <span class="c"># decode Secret value in terminal</span>
-kubectl describe secret &lt;sec-name&gt;                  <span class="c"># inspect keys (values are masked by default)</span>
+<span class="c">## 4. INGRESS (ing) — HTTP Domain &amp; Path Routing</span>
+kubectl apply -f 07-ingress.yaml                    <span class="c"># [APPLY] Create Ingress path-routing rules</span>
+kubectl get ingress                                 <span class="c"># [GET] List ingress resources, hosts and backend paths</span>
+kubectl describe ingress &lt;ing-name&gt;                 <span class="c"># [DESCRIBE] Inspect path regex, rewrite rules and backends</span>
+kubectl delete ingress &lt;ing-name&gt;                   <span class="c"># [DELETE] Remove ingress rules</span>
 
-<span class="c">## STORAGE &amp; PERSISTENT VOLUME CLAIMS (PVC)</span>
-kubectl apply -f 08-pvc.yaml                        <span class="c"># request dynamic volume from default StorageClass</span>
-kubectl get storageclass                            <span class="c"># list available CSI storage provisioners (e.g. standard)</span>
-kubectl get pvc                                     <span class="c"># inspect status: Bound, Pending, Lost</span>
-kubectl describe pvc &lt;pvc-name&gt;                     <span class="c"># view attached PV volume name and capacity</span>
+<span class="c">## 5. CONFIGMAPS (cm) &amp; SECRETS — External Configuration &amp; Credentials</span>
+kubectl create cm &lt;name&gt; --from-literal=K=V         <span class="c"># [CREATE CM] Create ConfigMap imperatively from key=value</span>
+kubectl create cm &lt;name&gt; --from-file=config.json    <span class="c"># [CREATE CM] Load entire config file into ConfigMap</span>
+kubectl create secret generic &lt;name&gt; --from-literal=pass=123 <span class="c"># [CREATE SECRET] Auto-encodes to base64</span>
+kubectl get cm,secrets                              <span class="c"># [GET] List configuration and secret stores</span>
+kubectl describe cm &lt;cm-name&gt;                       <span class="c"># [DESCRIBE CM] Read plain-text config values</span>
+kubectl describe secret &lt;sec-name&gt;                  <span class="c"># [DESCRIBE SECRET] Inspect keys (values are masked)</span>
+kubectl get secret &lt;sec-name&gt; \
+  -o jsonpath='{.data.password}' | base64 -d        <span class="c"># [GET JSONPATH] Decode base64 secret to terminal</span>
+kubectl delete cm,secret &lt;name&gt;                     <span class="c"># [DELETE] Remove config or secret store</span>
 
-<span class="c">## RBAC (ROLE-BASED ACCESS CONTROL)</span>
-kubectl apply -f 09-rbac.yaml                       <span class="c"># create ServiceAccount, Role and RoleBinding</span>
-kubectl auth can-i list pods --as=system:serviceaccount:default:my-sa <span class="c"># test permissions of a ServiceAccount</span>
-kubectl auth can-i delete pods                      <span class="c"># test permissions of the current active user context</span>
-kubectl get role,rolebinding,serviceaccount         <span class="c"># inspect active security principals</span>
+<span class="c">## 6. STORAGE (sc, pvc, pv) — Persistent Volume Lifecycle</span>
+kubectl get storageclass                            <span class="c"># [GET SC] List CSI storage provisioners &amp; binding modes</span>
+kubectl apply -f 08-pvc.yaml                        <span class="c"># [APPLY PVC] Request dynamic volume from StorageClass</span>
+kubectl get pvc                                     <span class="c"># [GET PVC] Check status: Pending vs Bound</span>
+kubectl describe pvc &lt;pvc-name&gt;                     <span class="c"># [DESCRIBE PVC] View attached PV name and capacity</span>
+kubectl get pv                                      <span class="c"># [GET PV] List dynamically created physical/cloud volumes</span>
+kubectl delete pvc &lt;pvc-name&gt;                       <span class="c"># [DELETE PVC] Release storage claim</span>
 
-<span class="c">## HELM V3 (PACKAGE MANAGEMENT)</span>
-helm create my-chart                                <span class="c"># scaffold a standard production chart structure</span>
-helm lint ./my-chart                                <span class="c"># validate chart syntax, templates and values</span>
-helm template my-release ./my-chart                 <span class="c"># dry-run render YAML manifests locally to terminal</span>
-helm install my-app ./my-chart                      <span class="c"># deploy chart release to cluster</span>
-helm install my-app ./my-chart -n prod --create-namespace <span class="c"># deploy to isolated namespace</span>
-helm list -A                                        <span class="c"># list all deployed Helm releases across all namespaces</span>
-helm status my-app                                  <span class="c"># check release status, resources created, notes</span>
-helm upgrade my-app ./my-chart --set replicaCount=4 <span class="c"># upgrade release with overridden value</span>
-helm history my-app                                 <span class="c"># view release revisions, update timestamps and descriptions</span>
-helm rollback my-app 1                              <span class="c"># roll release back to revision 1</span>
-helm uninstall my-app                               <span class="c"># delete release and all associated Kubernetes resources</span></code></pre>
+<span class="c">## 7. RBAC &amp; SECURITY (sa, role, rolebinding)</span>
+kubectl apply -f 09-rbac.yaml                       <span class="c"># [APPLY] Create ServiceAccount, Role and RoleBinding</span>
+kubectl get sa,role,rolebinding                     <span class="c"># [GET] Inspect active security principals</span>
+kubectl auth can-i list pods                        <span class="c"># [AUTH CAN-I] Test admin user permissions</span>
+kubectl auth can-i delete pods \
+  --as=system:serviceaccount:default:reliability-sa <span class="c"># [AUTH CAN-I --AS] Impersonate and test robot account</span>
+
+<span class="c">## 8. HELM V3/V4 — Package &amp; Release Management</span>
+helm create &lt;chart-name&gt;                            <span class="c"># [CREATE] Scaffold standard chart structure</span>
+helm lint ./&lt;chart-name&gt;                            <span class="c"># [LINT] Validate syntax, templates and values.yaml</span>
+helm template &lt;release&gt; ./&lt;chart&gt;                   <span class="c"># [TEMPLATE] Dry-run render YAML locally to terminal</span>
+helm install &lt;release&gt; ./&lt;chart&gt;                    <span class="c"># [INSTALL] Deploy entire app stack in one atomic command</span>
+helm list -A                                        <span class="c"># [LIST] List deployed releases across all namespaces</span>
+helm status &lt;release&gt;                               <span class="c"># [STATUS] Check release health and resources</span>
+helm upgrade &lt;release&gt; ./&lt;chart&gt; --set replicas=3   <span class="c"># [UPGRADE] Update release with overridden parameters</span>
+helm history &lt;release&gt;                              <span class="c"># [HISTORY] View revision numbers, timestamps, descriptions</span>
+helm rollback &lt;release&gt; 1                           <span class="c"># [ROLLBACK] Instantly revert stack to revision 1</span>
+helm uninstall &lt;release&gt;                            <span class="c"># [UNINSTALL] Delete all associated Kubernetes resources</span></code></pre>
 
     <!-- ============================================================ -->
     <h2>Cleanup</h2>

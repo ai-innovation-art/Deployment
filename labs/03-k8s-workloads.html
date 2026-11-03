@@ -644,7 +644,9 @@ kubectl delete pod reliability-canary</code></pre>
     </section>
 
     <!-- ============================================================ -->
-    <h2>10. Quick Reference Cheat Sheet</h2>
+    <h2>10. Quick Reference Cheat Sheet: The Verb x Resource Matrix</h2>
+
+    <p>Kubernetes CLI follows a universal grammar: <code>kubectl &lt;VERB&gt; &lt;RESOURCE&gt; &lt;NAME&gt; [FLAGS]</code>. Use this structured matrix as your master lookup table.</p>
 
     <pre data-title="Kubernetes Workloads cheat sheet — most-used commands"><code><span class="c">## CLUSTER &amp; NODES</span>
 kind create cluster --config kind-config.yaml       <span class="c"># create multi-node local cluster</span>
