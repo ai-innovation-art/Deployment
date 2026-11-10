@@ -14,8 +14,12 @@ if ! have kind; then
   sudo install -m 0755 /tmp/kind /usr/local/bin/kind
 fi
 
-if ! have kubectl; then
-  echo ">> installing kubectl $KUBECTL_VERSION"
+# kubectl must be within ONE minor version of the cluster (v1.31 here), so check the
+# version, not just whether kubectl exists. Codespaces often preinstall a newer one.
+want_minor=$(echo "$KUBECTL_VERSION" | cut -d. -f2)
+have_minor=$(kubectl version --client -o json 2>/dev/null | grep -m1 '"minor"' | tr -dc '0-9')
+if ! have kubectl || [ "$have_minor" != "$want_minor" ]; then
+  echo ">> installing kubectl $KUBECTL_VERSION (found minor: ${have_minor:-none})"
   curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
   sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
 fi
