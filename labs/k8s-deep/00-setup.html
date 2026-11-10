@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 00 · Setup · K8s Deep Dive</title>
+<link rel="stylesheet" href="../../notes-animated/assets/style.css">
+<script src="../../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../../index.html">DevOps Lab</a>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Chapter 00 · Setup</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+  <h1>Chapter 00 · Setup: Codespace, images, cluster, checkpoints</h1>
+  <p class="lede">By the end of this chapter, QuickBite runs on plain Docker, its images are on Docker Hub, and you have an empty 3-node Kubernetes cluster. You'll also have opened one of its "nodes" and found the kubelet running inside. You do this chapter once.</p>
+  <div class="meta">
+    <span class="pill accent">Checkpoint at start: none</span>
+    <span class="pill">Checkpoint at end: <code>cluster</code></span>
+    <span class="pill">≈ 1 h, once</span>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>0.1 What we are building</h2>
+  <p>QuickBite is a small food-ordering system with <b>five services of our own and two off-the-shelf ones</b>. A user opens the web page, sees the menu, and places an order. The order is saved, a confirmation "SMS" is sent, and every evening a sales report is printed.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 860 380" role="img" aria-label="QuickBite architecture: browser to web, web to menu-api and orders-api, menu-api to redis, orders-api to postgres and redis, notifier reads redis, daily-report reads postgres">
+      <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--d-stroke)"/></marker></defs>
+      <style>
+        .bx{fill:var(--d-fill);stroke:var(--d-stroke);stroke-width:1.5;rx:8}
+        .bx2{fill:var(--d-fill-2);stroke:var(--d-stroke);stroke-width:1.5}
+        .bx3{fill:var(--d-fill-3);stroke:var(--d-stroke);stroke-width:1.5}
+        .t{fill:var(--d-text);font:600 14px var(--sans);text-anchor:middle}
+        .s{fill:var(--d-muted);font:12px var(--mono);text-anchor:middle}
+        .ln{stroke:var(--d-stroke);stroke-width:1.5;fill:none;marker-end:url(#ar)}
+        .dl{stroke-dasharray:5 4}
+      </style>
+      <rect class="bx" x="20" y="160" width="110" height="56" rx="8"/><text class="t" x="75" y="185">Browser</text><text class="s" x="75" y="203">you</text>
+      <rect class="bx2" x="190" y="160" width="130" height="56" rx="8"/><text class="t" x="255" y="185">web</text><text class="s" x="255" y="203">nginx :8080</text>
+      <rect class="bx2" x="390" y="70" width="150" height="56" rx="8"/><text class="t" x="465" y="95">menu-api</text><text class="s" x="465" y="113">FastAPI :8000 ×3</text>
+      <rect class="bx2" x="390" y="250" width="150" height="56" rx="8"/><text class="t" x="465" y="275">orders-api</text><text class="s" x="465" y="293">FastAPI :8000 ×2</text>
+      <rect class="bx3" x="620" y="160" width="130" height="56" rx="8"/><text class="t" x="685" y="185">redis</text><text class="s" x="685" y="203">cache + queue</text>
+      <rect class="bx3" x="620" y="300" width="130" height="56" rx="8"/><text class="t" x="685" y="325">postgres</text><text class="s" x="685" y="343">orders table</text>
+      <rect class="bx" x="620" y="20" width="130" height="56" rx="8"/><text class="t" x="685" y="45">notifier</text><text class="s" x="685" y="63">worker, no port</text>
+      <rect class="bx" x="390" y="320" width="150" height="50" rx="8"/><text class="t" x="465" y="342">daily-report</text><text class="s" x="465" y="359">runs, exits</text>
+      <path class="ln" d="M130,188 H188"/>
+      <path class="ln" d="M320,178 L388,108"/><text class="s" x="330" y="128">/api/menu</text>
+      <path class="ln" d="M320,198 L388,268"/><text class="s" x="330" y="258">/api/orders</text>
+      <path class="ln" d="M540,105 L618,175"/><text class="s" x="600" y="128">GET menu</text>
+      <path class="ln" d="M540,268 L618,205"/><text class="s" x="610" y="250">LPUSH event</text>
+      <path class="ln" d="M540,288 L618,318"/><text class="s" x="575" y="318">INSERT</text>
+      <path class="ln dl" d="M685,160 L685,78"/><text class="s" x="725" y="125">BRPOP</text>
+      <path class="ln dl" d="M540,345 L618,335"/>
+    </svg>
+    <figcaption>Solid arrows: request path when you click "Order". Dashed: background readers.</figcaption>
+  </figure>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>Service</th><th>Why it exists in the product</th><th>The Kubernetes lesson it carries</th></tr></thead>
+    <tbody>
+      <tr><td><b>web</b></td><td>The only thing users reach. Serves the page and forwards <code>/api/*</code></td><td>NodePort, then Ingress (Ch 5), the edge of the cluster</td></tr>
+      <tr><td><b>menu-api</b></td><td>Read-heavy, stateless. Shows <i>which pod on which node</i> answered</td><td>Replicas, load balancing, rolling update and rollback (Ch 2), scheduling (Ch 3)</td></tr>
+      <tr><td><b>orders-api</b></td><td>Writes orders; useless without the database</td><td>Init container (schema migration), readiness tied to a dependency (Ch 4), Secrets (Ch 6)</td></tr>
+      <tr><td><b>notifier</b></td><td>Background worker: no port, nobody calls it</td><td>A Deployment without a Service; logs as the only window</td></tr>
+      <tr><td><b>daily-report</b></td><td>Runs once a day and exits</td><td>Job and CronJob (Ch 8)</td></tr>
+      <tr><td><b>redis</b></td><td>Menu cache + order-event queue. Losing it is acceptable</td><td>Deployment for disposable state</td></tr>
+      <tr><td><b>postgres</b></td><td>The source of truth. Losing it is not acceptable</td><td>StatefulSet, PVC, headless Service (Ch 7)</td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- ============================================================ -->
+  <h2>0.2 Create the Codespace</h2>
+  <ol>
+    <li>Push this repo (with <code>labs/quickbite</code> and <code>.devcontainer/k8s-deep</code>) to GitHub.</li>
+    <li>On GitHub: <b>Code → Codespaces → ⋯ → New with options</b>.</li>
+    <li>Dev container configuration: <b>K8s Deep Dive</b>. Machine type: <b>2-core / 8 GB</b>.</li>
+    <li>Wait for the post-create step: it runs <code>install-tools.sh</code> (kind, kubectl, helm, plus the <code>k</code> alias).</li>
+  </ol>
+  <div class="callout tip"><span class="label">Free hours</span><p>Personal accounts get <b>120 core-hours per month</b>: 60 hours on a 2-core machine, 30 on a 4-core. A Codespace stops itself after 30 idle minutes, and stopped time is not billed for compute. When you finish a session, stop it yourself: <b>Codespaces → ⋯ → Stop codespace</b>. Your cluster and data survive a stop; <code>make resume</code> brings them back.</p></div>
+  <div class="callout note"><span class="label">Using the default Codespace instead</span><p>If you open a normal Codespace (without choosing the config), Docker is already there. Run <code>make tools</code> once inside <code>labs/quickbite</code> and continue.</p></div>
+
+  <pre data-title="Check the tools"><code>cd labs/quickbite
+make tools
+docker version --format '{{.Server.Version}}'</code></pre>
+  <pre data-title="Expected"><code><span class="o">>> tools ready:
+   kind    v0.24.0
+   kubectl v1.31.0
+   helm    v3.x.x
+27.x.x</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2>0.3 Step 1: Run QuickBite on plain Docker first</h2>
+  <p><b>Why:</b> you already understand Docker 100%. Seeing the app work there first means that when something fails in Kubernetes, you know it's Kubernetes, not the app. It also gives us a "before" picture to compare every Kubernetes object against.</p>
+  <pre data-title="Start everything with Compose"><code>make compose-up                 <span class="c"># = docker compose up -d --build</span>
+docker compose ps</code></pre>
+
+  <details class="q"><summary>Predict: in what order do the containers become ready, and which one exits?</summary><div class="a">
+    <p><code>postgres</code> first (its healthcheck must pass), then <code>db-migrate</code> runs, creates the table and <b>exits with code 0</b>. Only then does <code>orders-api</code> start (<code>condition: service_completed_successfully</code>). <code>redis</code> and <code>menu-api</code> start in parallel. <code>web</code> waits for both APIs. <code>docker compose ps -a</code> shows <code>db-migrate  Exited (0)</code>. In Kubernetes this becomes an <b>init container</b>.</p>
+  </div></details>
+
+  <p>Open the <b>PORTS</b> tab in VS Code → port <b>8080</b> → globe icon. Click "Order" a few times, then:</p>
+  <pre data-title="Watch it work"><code>curl -s localhost:8080/api/version; echo
+docker compose logs notifier --tail 5
+docker compose run --rm daily-report</code></pre>
+  <pre data-title="Example output"><code><span class="o">{"version":"1.0","pod":"3f2a9c1e7b4d","node":"not-in-k8s","uptime_s":42}
+notifier-1  | [notifier 8e1d2c0a9b1f@not-in-k8s] SMS sent: order #1 (1 x Masala Dosa) confirmed
+=========== QuickBite sales report ===========
+item                                 units  orders
+Masala Dosa                              1       1
+TOTAL orders: 1</span></code></pre>
+
+  <details class="q"><summary>Think: what is missing here that a real business needs?</summary><div class="a">
+    <ul>
+      <li>One menu-api container. If it crashes, the menu is down until you notice. <i>(Kubernetes: replicas + self-healing.)</i></li>
+      <li>Everything is on one machine. If the machine dies, everything dies. <i>(Kubernetes: many nodes + a scheduler.)</i></li>
+      <li>Releasing a new version means stop → start, which is downtime. <i>(Kubernetes: rolling update and rollback.)</i></li>
+      <li>The daily report only runs when you type the command. <i>(Kubernetes: CronJob.)</i></li>
+      <li>The DB password sits in <code>compose.yaml</code>. <i>(Kubernetes: Secret + RBAC.)</i></li>
+    </ul>
+    <p>Each bullet is a chapter. This is the reason Kubernetes exists.</p>
+  </div></details>
+
+  <pre data-title="Clean up (keeps the built images)"><code>make compose-down</code></pre>
+
+  <!-- ============================================================ -->
+  <h2>0.4 Step 2: Build and push the images (once)</h2>
+  <p>A kind cluster can't see images that only exist in your Codespace's Docker. It pulls from a registry, the same as a production cluster. So we publish to Docker Hub once, and every future cluster (new Codespace, new account, real VMs later) pulls the same images.</p>
+  <ol>
+    <li>Create an access token: <b>hub.docker.com → Account settings → Personal access tokens → Generate</b> (Read &amp; Write).</li>
+    <li>Log in and push:</li>
+  </ol>
+  <pre data-title="Login + build + push"><code>docker login -u kumawatsunil        <span class="c"># paste the token as the password</span>
+make push                           <span class="c"># = scripts/build-push.sh --push</span></code></pre>
+  <pre data-title="Expected (sizes approximate)"><code><span class="o">REPOSITORY                           TAG          SIZE
+kumawatsunil/quickbite-web           1.0          ~50MB
+kumawatsunil/quickbite-orders-api    1.0          ~180MB
+kumawatsunil/quickbite-notifier      1.0          ~150MB
+kumawatsunil/quickbite-daily-report  1.0          ~160MB
+kumawatsunil/quickbite-menu-api      1.0          ~170MB
+kumawatsunil/quickbite-menu-api      1.1          ~170MB
+kumawatsunil/quickbite-menu-api      1.2-broken   ~170MB
+pushed to https://hub.docker.com/u/kumawatsunil</span></code></pre>
+
+  <div class="table-wrap"><table>
+    <thead><tr><th>menu-api tag</th><th>What changed</th><th>Used in</th></tr></thead>
+    <tbody>
+      <tr><td><code>1.0</code></td><td>3 menu items</td><td>The initial deploy</td></tr>
+      <tr><td><code>1.1</code></td><td>Adds "Spicy Paneer Wrap (NEW in 1.1)". A good release</td><td>Ch 2: a zero-downtime rolling update you can see in the browser</td></tr>
+      <tr><td><code>1.2-broken</code></td><td><code>/ready</code> always returns 503 ("config not found")</td><td>Ch 2: a rollout that hangs, why old pods keep serving, and <code>rollout undo</code></td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout warn"><span class="label">The repos must be public</span><p>New Docker Hub repos are public by default on a free account. If you made them private, the cluster can't pull them and the pods show <code>ErrImagePull</code> (we'll create exactly this error on purpose in Chapter 1).</p></div>
+
+  <!-- ============================================================ -->
+  <h2>0.5 Step 3: Create the 3-node cluster</h2>
+  <pre data-title="k8s/cluster/kind-3node.yaml (the important part)"><code>nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080   <span class="c"># NodePort of the web Service</span>
+        hostPort: 8080         <span class="c"># Codespace port → opens in your browser</span>
+  - role: worker
+  - role: worker</code></pre>
+  <pre data-title="Create it (checkpoint: cluster)"><code>make cluster
+kubectl get nodes -o wide</code></pre>
+
+  <details class="q"><summary>Predict: how many nodes, what roles, what status?</summary><div class="a">
+<pre><code><span class="o">NAME                      STATUS   ROLES           VERSION   INTERNAL-IP   CONTAINER-RUNTIME
+quickbite-control-plane   Ready    control-plane   v1.31.0   172.18.0.4    containerd://1.7.x
+quickbite-worker          Ready    &lt;none&gt;          v1.31.0   172.18.0.2    containerd://1.7.x
+quickbite-worker2         Ready    &lt;none&gt;          v1.31.0   172.18.0.3    containerd://1.7.x</span></code></pre>
+    <p>Note the runtime: <b>containerd</b>, not Docker. Kubernetes talks to containerd through CRI. Docker is only the "fake hardware" kind uses to create the node machines.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>0.6 Look inside a "node": it's a real machine for Kubernetes</h2>
+  <p>This is the answer to "is kind real?". Each node is a Docker container, but inside it is exactly what a VM node runs.</p>
+
+  <pre data-title="From the Codespace (the 'datacenter' view)"><code>docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}'</code></pre>
+  <pre data-title="Expected"><code><span class="o">NAMES                     IMAGE                  PORTS
+quickbite-control-plane   kindest/node:v1.31.0   0.0.0.0:8080->30080/tcp, 127.0.0.1:4xxxx->6443/tcp
+quickbite-worker          kindest/node:v1.31.0
+quickbite-worker2         kindest/node:v1.31.0</span></code></pre>
+  <p>Port <code>6443</code> is the API server. <code>kubectl</code> talks to it via the address saved in <code>~/.kube/config</code>.</p>
+
+  <pre data-title="Step inside the control-plane node (like SSH into a VM)"><code>docker exec -it quickbite-control-plane bash
+
+<span class="c"># 1. The node agent and the runtime: ordinary Linux processes</span>
+ps -eo pid,comm | grep -E 'kubelet|containerd$'
+
+<span class="c"># 2. The control plane runs as "static pods": the kubelet starts whatever YAML is in this folder</span>
+ls /etc/kubernetes/manifests
+
+<span class="c"># 3. Containers on this node, seen through CRI (no docker in here!)</span>
+crictl ps --name 'kube-|etcd' -o table
+
+exit</code></pre>
+  <pre data-title="Expected"><code><span class="o">    1xx kubelet
+    1xx containerd
+etcd.yaml  kube-apiserver.yaml  kube-controller-manager.yaml  kube-scheduler.yaml
+CONTAINER   IMAGE   CREATED   STATE     NAME                      ...
+a1b2...             10m       Running   kube-scheduler
+c3d4...             10m       Running   kube-controller-manager
+e5f6...             10m       Running   kube-apiserver
+0a1b...             10m       Running   etcd
+...                           Running   kube-proxy</span></code></pre>
+
+  <details class="q"><summary>Predict: run the same three commands inside <code>quickbite-worker</code>. What's different?</summary><div class="a">
+    <p><code>kubelet</code> and <code>containerd</code> are there. <code>/etc/kubernetes/manifests</code> is <b>empty</b>, and <code>crictl ps</code> shows only <code>kube-proxy</code> and <code>kindnet-cni</code>. A worker has no brain; it only runs what the control plane assigns to it. That is the whole architecture in one comparison:</p>
+    <ul><li><b>Control plane</b> = decides (API server, etcd, scheduler, controllers)</li><li><b>Worker</b> = executes (kubelet, runtime, kube-proxy, CNI)</li></ul>
+  </div></details>
+
+  <pre data-title="The same view, from Kubernetes itself"><code>kubectl get pods -n kube-system -o wide</code></pre>
+  <p>Every control-plane component is also visible as a pod. Look at the <code>NODE</code> column: <code>kube-proxy</code> and <code>kindnet</code> have one pod <b>per node</b> (that's a DaemonSet, Ch 8), while the API server, etcd and the scheduler run only on <code>quickbite-control-plane</code>.</p>
+
+  <!-- ============================================================ -->
+  <h2>0.7 Your session routine from now on</h2>
+  <div class="grid">
+    <div class="card"><h4>Start of session</h4>
+<pre><code>cd labs/quickbite
+git pull
+make resume      <span class="c"># or: make cluster</span>
+make status</code></pre></div>
+    <div class="card"><h4>End of session</h4>
+<p>Just stop the Codespace (⋯ → Stop). No cleanup needed; next time <code>make resume</code> picks up.</p>
+<p>New account? Same commands. The images come from Docker Hub.</p></div>
+  </div>
+
+  <h2>0.8 If something goes wrong</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Symptom</th><th>Cause</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td><code>kind: command not found</code></td><td>Tools not installed (default Codespace)</td><td><code>make tools</code>, then open a new terminal</td></tr>
+      <tr><td><code>The connection to the server 127.0.0.1:xxxxx was refused</code></td><td>Codespace restarted; node containers stopped</td><td><code>make resume</code> (restarts them)</td></tr>
+      <tr><td><code>Bind for 0.0.0.0:8080 failed: port is already allocated</code></td><td>Compose is still running on 8080</td><td><code>make compose-down</code>, then <code>make cluster</code></td></tr>
+      <tr><td><code>denied: requested access to the resource is denied</code> on push</td><td>Not logged in, or wrong username</td><td><code>docker login -u kumawatsunil</code></td></tr>
+      <tr><td>Nodes <code>NotReady</code> for more than 2 minutes</td><td>Machine too small or still starting</td><td><code>kubectl describe node quickbite-worker</code> → Conditions; if stuck: <code>make down &amp;&amp; make cluster</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout example"><span class="label">Done when</span><p>✅ <code>docker images</code> lists 7 quickbite tags and they're visible on hub.docker.com/u/kumawatsunil &nbsp; ✅ <code>kubectl get nodes</code> shows 3 Ready nodes &nbsp; ✅ You can explain why the worker's manifests folder is empty.</p></div>
+
+  <div class="pager"><a href="index.html">← Roadmap</a><a href="01-deploy-and-trace.html">Chapter 01: Deploy and trace →</a></div>
+
+  </article></main>
+</div>
+</body>
+</html>

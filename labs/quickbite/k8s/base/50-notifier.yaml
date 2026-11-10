@@ -1,0 +1,25 @@
+# notifier: background worker. No ports, so no Service and no probes over HTTP.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notifier
+  namespace: quickbite
+  labels: { app.kubernetes.io/name: notifier, app.kubernetes.io/part-of: quickbite, tier: worker }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: notifier }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: notifier, app.kubernetes.io/part-of: quickbite, tier: worker }
+    spec:
+      containers:
+        - name: notifier
+          image: kumawatsunil/quickbite-notifier:1.0
+          env:
+            - { name: REDIS_HOST, valueFrom: { configMapKeyRef: { name: quickbite-config, key: REDIS_HOST } } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 128Mi }

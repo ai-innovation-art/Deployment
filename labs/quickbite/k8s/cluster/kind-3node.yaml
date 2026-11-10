@@ -1,0 +1,18 @@
+# 3-node cluster: 1 control plane + 2 workers.
+# Each "node" is a Docker container running a REAL kubelet + containerd + kube-proxy.
+#   kind create cluster --config k8s/cluster/kind-3node.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: quickbite
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.31.0
+    extraPortMappings:
+      # Codespace port 8080 -> node port 30080 -> web Service -> web pods
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+  - role: worker
+    image: kindest/node:v1.31.0
+  - role: worker
+    image: kindest/node:v1.31.0

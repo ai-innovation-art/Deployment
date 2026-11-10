@@ -1,0 +1,34 @@
+# daily-report: runs at 21:00 India time, prints the sales report, exits.
+# Run it now:  kubectl -n quickbite create job report-now --from=cronjob/daily-report
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: daily-report
+  namespace: quickbite
+  labels: { app.kubernetes.io/name: daily-report, app.kubernetes.io/part-of: quickbite, tier: batch }
+spec:
+  schedule: "0 21 * * *"
+  timeZone: "Asia/Kolkata"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels: { app.kubernetes.io/name: daily-report, app.kubernetes.io/part-of: quickbite, tier: batch }
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: report
+              image: kumawatsunil/quickbite-daily-report:1.0
+              env:
+                - { name: DB_HOST, valueFrom: { configMapKeyRef: { name: quickbite-config, key: DB_HOST } } }
+                - { name: DB_NAME, valueFrom: { configMapKeyRef: { name: quickbite-config, key: DB_NAME } } }
+                - { name: DB_USER, valueFrom: { secretKeyRef: { name: postgres-credentials, key: username } } }
+                - { name: DB_PASSWORD, valueFrom: { secretKeyRef: { name: postgres-credentials, key: password } } }
+              resources:
+                requests: { cpu: 20m, memory: 32Mi }
+                limits: { memory: 128Mi }

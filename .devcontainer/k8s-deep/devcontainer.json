@@ -1,0 +1,18 @@
+{
+  // Codespace for the Kubernetes deep-dive (labs/k8s-deep + labs/quickbite).
+  // Choose it via: Code > Codespaces > ... > New with options > Dev container configuration: "K8s Deep Dive"
+  "name": "K8s Deep Dive",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": { "minikube": "none" }
+  },
+  // 2 cores / 8 GB is enough for 3 kind nodes + QuickBite and uses half the free hours of a 4-core machine.
+  "hostRequirements": { "cpus": 2, "memory": "8gb" },
+  "forwardPorts": [8080],
+  "portsAttributes": { "8080": { "label": "QuickBite web" } },
+  "postCreateCommand": "bash labs/quickbite/scripts/install-tools.sh",
+  "customizations": {
+    "vscode": { "extensions": ["ms-kubernetes-tools.vscode-kubernetes-tools", "redhat.vscode-yaml"] }
+  }
+}

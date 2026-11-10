@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickBite</title>
+<style>
+  :root { --bg:#fafaf7; --card:#fff; --text:#1d1d1b; --muted:#6b6b66; --accent:#d9480f; --border:#e6e4dc; --ok:#2b8a3e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161614; --card:#20201d; --text:#ecebe6; --muted:#9a9890; --border:#33322e; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:12px; }
+  header h1 { margin:0; font-size:20px; color:var(--accent); }
+  main { max-width:960px; margin:0 auto; padding:16px; display:grid; gap:16px; grid-template-columns:1fr 1fr; }
+  @media (max-width:720px) { main { grid-template-columns:1fr; } }
+  section { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  h2 { margin:0 0 8px; font-size:16px; }
+  .item { display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); }
+  button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:6px 12px; cursor:pointer; }
+  .who { font:12px/1.4 ui-monospace, monospace; color:var(--muted); background:var(--bg); border-radius:6px; padding:8px; margin-top:8px; white-space:pre-wrap; }
+  .full { grid-column:1/-1; }
+  .err { color:#c92a2a; }
+</style>
+</head>
+<body>
+<header><h1>QuickBite</h1><span style="color:var(--muted)">Kubernetes deep-dive demo app</span></header>
+<main>
+  <section>
+    <h2>Menu</h2>
+    <div id="menu">loading...</div>
+    <div class="who" id="menu-who"></div>
+    <button style="margin-top:8px" onclick="loadMenu()">Reload (watch the pod change)</button>
+  </section>
+  <section>
+    <h2>Recent orders</h2>
+    <div id="orders">loading...</div>
+    <div class="who" id="orders-who"></div>
+  </section>
+  <section class="full">
+    <h2>What just happened</h2>
+    <div class="who" id="log">Each request: browser → web (nginx) → Service → one of the API pods. The pod and node names show which replica answered.</div>
+  </section>
+</main>
+<script>
+const log = (m) => { const el = document.getElementById('log'); el.textContent = new Date().toLocaleTimeString() + '  ' + m + '\n' + el.textContent; };
+const who = (d) => `version: ${d.version}\npod:     ${d.pod}\nnode:    ${d.node}` + (d.source ? `\nsource:  ${d.source}` : '');
+
+async function loadMenu() {
+  try {
+    const r = await fetch('/api/menu'); const d = await r.json();
+    document.getElementById('menu').innerHTML = d.items.map(i =>
+      `<div class="item"><span>${i.name} — ₹${i.price}</span><button onclick="order('${i.name.replace(/'/g, "")}')">Order</button></div>`).join('');
+    document.getElementById('menu-who').textContent = who(d);
+    log(`GET /api/menu → menu-api pod ${d.pod} on ${d.node} (v${d.version}, ${d.source})`);
+  } catch (e) { document.getElementById('menu').innerHTML = `<span class="err">menu-api unreachable: ${e}</span>`; }
+}
+async function loadOrders() {
+  try {
+    const r = await fetch('/api/orders'); const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.status);
+    document.getElementById('orders').innerHTML = d.orders.length
+      ? d.orders.map(o => `<div class="item"><span>#${o.id} ${o.qty} × ${o.item}</span><small>${o.created_at.slice(11,19)}</small></div>`).join('')
+      : 'No orders yet.';
+    document.getElementById('orders-who').textContent = who(d);
+  } catch (e) { document.getElementById('orders').innerHTML = `<span class="err">orders-api error: ${e.message}</span>`; }
+}
+async function order(item) {
+  const r = await fetch('/api/orders', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ item, qty: 1 }) });
+  const d = await r.json();
+  if (r.ok) log(`POST /api/orders → orders-api pod ${d.pod} saved order #${d.order_id} in postgres, event queued in redis: ${d.event_queued}`);
+  else log(`POST /api/orders FAILED: ${d.detail}`);
+  loadOrders();
+}
+loadMenu(); loadOrders();
+</script>
+</body>
+</html>

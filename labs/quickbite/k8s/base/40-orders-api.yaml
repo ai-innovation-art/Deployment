@@ -1,0 +1,60 @@
+# orders-api: writes to postgres, publishes events to redis.
+# The initContainer db-migrate must exit 0 before the API container starts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-api
+  namespace: quickbite
+  labels: { app.kubernetes.io/name: orders-api, app.kubernetes.io/part-of: quickbite }
+spec:
+  selector: { app.kubernetes.io/name: orders-api }
+  ports:
+    - { name: http, port: 8000, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  namespace: quickbite
+  labels: { app.kubernetes.io/name: orders-api, app.kubernetes.io/part-of: quickbite, tier: backend }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: orders-api }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: orders-api, app.kubernetes.io/part-of: quickbite, tier: backend }
+    spec:
+      initContainers:
+        - name: db-migrate
+          image: kumawatsunil/quickbite-orders-api:1.0
+          command: ["python", "-m", "app.migrate"]
+          env:
+            - { name: DB_HOST, valueFrom: { configMapKeyRef: { name: quickbite-config, key: DB_HOST } } }
+            - { name: DB_NAME, valueFrom: { configMapKeyRef: { name: quickbite-config, key: DB_NAME } } }
+            - { name: DB_USER, valueFrom: { secretKeyRef: { name: postgres-credentials, key: username } } }
+            - { name: DB_PASSWORD, valueFrom: { secretKeyRef: { name: postgres-credentials, key: password } } }
+      containers:
+        - name: orders-api
+          image: kumawatsunil/quickbite-orders-api:1.0
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: DB_HOST, valueFrom: { configMapKeyRef: { name: quickbite-config, key: DB_HOST } } }
+            - { name: DB_NAME, valueFrom: { configMapKeyRef: { name: quickbite-config, key: DB_NAME } } }
+            - { name: DB_USER, valueFrom: { secretKeyRef: { name: postgres-credentials, key: username } } }
+            - { name: DB_PASSWORD, valueFrom: { secretKeyRef: { name: postgres-credentials, key: password } } }
+            - { name: REDIS_HOST, valueFrom: { configMapKeyRef: { name: quickbite-config, key: REDIS_HOST } } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          readinessProbe:
+            httpGet: { path: /ready, port: http }   # checks the DB connection
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /health, port: http }  # does NOT check the DB (on purpose)
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }

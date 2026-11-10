@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 01 · Deploy and Trace · K8s Deep Dive</title>
+<link rel="stylesheet" href="../../notes-animated/assets/style.css">
+<script src="../../notes-animated/assets/notes.js"></script>
+<style>
+  .dg .bx{fill:var(--d-fill);stroke:var(--d-stroke);stroke-width:1.5}
+  .dg .cp{fill:var(--d-fill-2);stroke:var(--d-stroke);stroke-width:1.5}
+  .dg .wk{fill:var(--d-fill-3);stroke:var(--d-stroke);stroke-width:1.5}
+  .dg .vip{fill:none;stroke:var(--accent);stroke-width:1.5;stroke-dasharray:5 4}
+  .dg .zone{fill:none;stroke:var(--d-muted);stroke-width:1;stroke-dasharray:3 4}
+  .dg .t{fill:var(--d-text);font:600 13px var(--sans);text-anchor:middle}
+  .dg .s{fill:var(--d-muted);font:11px var(--mono);text-anchor:middle}
+  .dg .zl{fill:var(--d-muted);font:600 12px var(--sans)}
+  .dg .ln{stroke:var(--accent);stroke-width:2;fill:none;marker-end:url(#a1)}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../../index.html">DevOps Lab</a>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Chapter 01 · Deploy and trace</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+  <h1>Chapter 01 · Deploy QuickBite and trace everything</h1>
+  <p class="lede">You'll deploy QuickBite by hand, one service at a time in the order a real team would. After each step you'll stop and prove what happened inside the cluster. Then you'll follow one click in the browser across nodes, iptables, DNS and three services. This is the chapter where the dots connect.</p>
+  <div class="meta">
+    <span class="pill accent">Checkpoint at start: <code>make cluster</code></span>
+    <span class="pill">Checkpoint at end: <code>app</code></span>
+    <span class="pill">≈ 2–3 h</span>
+  </div>
+
+  <pre data-title="Start here (every time you begin this chapter)"><code>cd labs/quickbite
+make cluster                  <span class="c"># 3 Ready nodes, no QuickBite</span>
+alias k=kubectl               <span class="c"># already in ~/.bashrc if install-tools ran</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2>1.1 From Compose to Kubernetes: the translation table</h2>
+  <p>You already know every row on the left. Each row on the right is the Kubernetes way to say the same thing, plus the part Docker can't do.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>compose.yaml</th><th>Kubernetes object</th><th>What you gain</th></tr></thead>
+    <tbody>
+      <tr><td>The whole file / project name</td><td><b>Namespace</b> <code>quickbite</code></td><td>Isolation, quotas, permissions per team</td></tr>
+      <tr><td><code>environment:</code></td><td><b>ConfigMap</b> + <b>Secret</b></td><td>Config separate from images; secrets access-controlled</td></tr>
+      <tr><td><code>services: menu-api</code></td><td><b>Deployment</b> → ReplicaSet → Pods</td><td>Replicas, self-healing, rolling updates</td></tr>
+      <tr><td>Container name as DNS (<code>menu-api</code>)</td><td><b>Service</b> (ClusterIP + DNS name)</td><td>One stable address in front of many changing pods</td></tr>
+      <tr><td><code>ports: "8080:8080"</code></td><td><b>Service type NodePort</b> (later Ingress)</td><td>Reachable on <i>every</i> node</td></tr>
+      <tr><td><code>volumes: pgdata</code></td><td><b>PersistentVolumeClaim</b> via a StatefulSet</td><td>Storage that follows the pod across restarts</td></tr>
+      <tr><td><code>depends_on: service_completed_successfully</code></td><td><b>initContainers</b></td><td>Guaranteed order inside a pod</td></tr>
+      <tr><td><code>healthcheck:</code></td><td><b>readinessProbe</b> / <b>livenessProbe</b></td><td>Traffic control + automatic restarts</td></tr>
+      <tr><td><code>docker compose run daily-report</code></td><td><b>CronJob</b></td><td>Runs on schedule, keeps history, retries</td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- ============================================================ -->
+  <h2>1.2 The deploy order, and why it's this order</h2>
+  <p>Dependencies flow downwards: config first, then data stores, then the services that use them, then the edge.</p>
+  <pre data-title="Dependency order"><code>  00 namespace + config + secret      <span class="c"># everything else references these</span>
+  10 postgres   20 redis              <span class="c"># data stores, no dependencies</span>
+  30 menu-api   40 orders-api         <span class="c"># need redis / postgres</span>
+  50 notifier                         <span class="c"># needs redis</span>
+  60 web                              <span class="c"># needs the APIs' Services to exist (nginx resolves them at start)</span>
+  70 daily-report (CronJob)           <span class="c"># needs postgres with data</span></code></pre>
+  <div class="callout note"><span class="label">Kubernetes doesn't really need the order</span><p>If you apply everything at once (<code>kubectl apply -k k8s/base</code>, which is what <code>make resume</code> does), it still works. Pods that start too early fail or wait, and controllers keep retrying until everything converges. That is <b>reconciliation</b>. We go in order today only so you can watch each piece.</p></div>
+
+  <p>Open a <b>second terminal</b> and leave this running for the whole chapter. It's your live view of the cluster:</p>
+  <pre data-title="Terminal 2: live watch"><code>kubectl get pods -n quickbite -o wide -w</code></pre>
+
+  <!-- ============================================================ -->
+  <h2>1.3 Step 1: Namespace, ConfigMap, Secret</h2>
+  <pre data-title="Apply"><code>k apply -f k8s/base/00-namespace-config.yaml
+k get ns quickbite
+k -n quickbite get configmap,secret</code></pre>
+  <details class="q"><summary>Predict: will any pod start? Will Terminal 2 show anything?</summary><div class="a">
+    <p>No. These objects are <b>pure data</b> stored in etcd. Nothing runs. No controller turns a ConfigMap into a process; it only becomes useful when a pod references it.</p>
+  </div></details>
+
+  <pre data-title="Is the Secret secret?"><code>k -n quickbite get secret postgres-credentials -o jsonpath='{.data.password}'; echo
+k -n quickbite get secret postgres-credentials -o jsonpath='{.data.password}' | base64 -d; echo</code></pre>
+  <pre data-title="Output"><code><span class="o">cXVpY2tiaXRlLWRldi1wYXNzd29yZA==
+quickbite-dev-password</span></code></pre>
+  <div class="callout warn"><span class="label">base64 is not encryption</span><p>Anyone who can <code>get secret</code> can read it. What protects Secrets is <b>RBAC</b> (who may read them, Ch 9) and encryption at rest in etcd. Keep this in mind; we come back to it.</p></div>
+
+  <!-- ============================================================ -->
+  <h2>1.4 Step 2: Postgres, and the life of <code>kubectl apply</code></h2>
+  <p>This is the first object that makes something <i>run</i>. Before applying it, read the stepper. It shows the chain of components that will react, one after the other.</p>
+
+  <div class="widget stepper" data-steps='[
+    {"title":"kubectl sends the YAML to the API server","html":"<code>kubectl apply</code> reads <code>10-postgres.yaml</code>, finds the cluster URL and certificate in <code>~/.kube/config</code>, and sends HTTPS requests to the API server on port 6443. It is the <b>only</b> component you ever talk to. You will see these HTTP calls yourself in a minute with <code>-v=6</code>."},
+    {"title":"API server: who are you, are you allowed, is it valid?","html":"<b>Authentication</b> (your client certificate), <b>authorization</b> (RBAC: may you create StatefulSets in <code>quickbite</code>?), <b>admission</b> (defaults are filled in, policies can reject), <b>validation</b> (is the YAML a valid StatefulSet?). If any fails, kubectl prints an error and nothing is stored."},
+    {"title":"Stored in etcd, and nothing is running yet","html":"The API server writes the StatefulSet and Service to <b>etcd</b>, the cluster database, and replies <code>statefulset.apps/postgres created</code>. Important: at this moment there is <b>no pod</b>. You have only recorded what you <i>want</i>."},
+    {"title":"Controller: desired 1, actual 0, so create a pod","html":"The <b>StatefulSet controller</b> inside kube-controller-manager is watching the API. It sees <code>replicas: 1</code> and 0 pods, so it creates Pod <code>postgres-0</code> and PVC <code>data-postgres-0</code> from the template. The pod has no node yet: <code>Pending</code>."},
+    {"title":"Storage gets provisioned","html":"The PVC asks for 1Gi. kind ships the <b>local-path provisioner</b> as the default StorageClass. It waits until the pod is scheduled (<code>WaitForFirstConsumer</code>), then creates a PV as a folder on <i>that</i> node. PVC status: <code>Bound</code>."},
+    {"title":"Scheduler picks a node","html":"The <b>scheduler</b> watches for pods without <code>spec.nodeName</code>. It <b>filters</b> out nodes that cannot run it (the control plane has a <code>NoSchedule</code> taint; not enough memory for the 128Mi request) and <b>scores</b> the rest. Then it writes the winner into the pod: <code>Scheduled: assigned quickbite/postgres-0 to quickbite-worker2</code>."},
+    {"title":"kubelet on that node starts it","html":"The <b>kubelet</b> on the chosen worker sees a pod bound to its node. Through CRI it tells <b>containerd</b> to create the sandbox (a network namespace; the CNI gives it an IP), pull <code>postgres:16-alpine</code>, mount the volume and start the container. Events: <code>Pulling</code> → <code>Pulled</code> → <code>Created</code> → <code>Started</code>."},
+    {"title":"Probe passes, pod becomes Ready, Service gets the endpoint","html":"The kubelet runs the readiness probe (<code>pg_isready</code>). When it passes, the pod becomes <code>Ready 1/1</code>. The EndpointSlice controller adds the pod IP behind Service <code>postgres</code>. Every step was a component <b>reacting to a change in the API</b>; nobody called anybody directly."}
+  ]'>
+    <div class="w-title">Stepper: from <code>kubectl apply</code> to a Ready postgres-0</div>
+    <div class="w-sub">Highlighted boxes are the actors in the current step.</div>
+    <svg class="dg" viewBox="0 0 880 300" role="img" aria-label="kubectl, API server, etcd, controller manager, scheduler on the control plane; kubelet, containerd and pod on a worker">
+      <defs><marker id="a0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--d-stroke)"/></marker></defs>
+      <rect class="zone" x="150" y="10" width="420" height="280" rx="10"/><text class="zl" x="160" y="30">quickbite-control-plane</text>
+      <rect class="zone" x="600" y="10" width="270" height="280" rx="10"/><text class="zl" x="610" y="30">quickbite-worker2</text>
+      <g data-step="0"><rect class="bx" x="10" y="120" width="110" height="50" rx="8"/><text class="t" x="65" y="142">kubectl</text><text class="s" x="65" y="158">you</text></g>
+      <g data-step="0,1,2,3,5,6,7"><rect class="cp" x="290" y="120" width="140" height="50" rx="8"/><text class="t" x="360" y="142">kube-apiserver</text><text class="s" x="360" y="158">:6443</text></g>
+      <g data-step="2"><rect class="cp" x="290" y="220" width="140" height="50" rx="8"/><text class="t" x="360" y="242">etcd</text><text class="s" x="360" y="258">database</text></g>
+      <g data-step="3,4,7"><rect class="cp" x="170" y="45" width="180" height="50" rx="8"/><text class="t" x="260" y="67">controller-manager</text><text class="s" x="260" y="83">StatefulSet, EndpointSlice</text></g>
+      <g data-step="5"><rect class="cp" x="380" y="45" width="170" height="50" rx="8"/><text class="t" x="465" y="67">kube-scheduler</text><text class="s" x="465" y="83">filter → score → bind</text></g>
+      <g data-step="6,7"><rect class="wk" x="640" y="60" width="190" height="50" rx="8"/><text class="t" x="735" y="82">kubelet</text><text class="s" x="735" y="98">node agent</text></g>
+      <g data-step="6"><rect class="wk" x="640" y="135" width="190" height="45" rx="8"/><text class="t" x="735" y="155">containerd + CNI</text><text class="s" x="735" y="170">runtime, pod IP</text></g>
+      <g data-step="4,6,7"><rect class="wk" x="640" y="205" width="190" height="65" rx="8"/><text class="t" x="735" y="228">postgres-0</text><text class="s" x="735" y="244">10.244.x.x</text><text class="s" x="735" y="260">PV: /var/local-path-provisioner</text></g>
+      <path d="M120,145 H288" stroke="var(--d-stroke)" stroke-width="1.5" marker-end="url(#a0)"/>
+      <path d="M360,170 V218" stroke="var(--d-stroke)" stroke-width="1.5" marker-end="url(#a0)"/>
+      <path d="M300,118 L280,97" stroke="var(--d-stroke)" stroke-width="1.5"/>
+      <path d="M420,118 L450,97" stroke="var(--d-stroke)" stroke-width="1.5"/>
+      <path d="M430,145 H638" stroke="var(--d-stroke)" stroke-width="1.5" marker-end="url(#a0)"/><text class="s" x="535" y="138">watch</text>
+    </svg>
+    <div class="stage"></div>
+    <div class="controls"><button class="btn" data-prev>← Prev</button><button class="btn primary" data-next>Next →</button><span class="count"></span></div>
+  </div>
+
+  <p>Now do it, and <b>see</b> the HTTP calls of step 1 with verbose logging:</p>
+  <pre data-title="Apply postgres with kubectl's HTTP log visible"><code>k apply -f k8s/base/10-postgres.yaml -v=6 2>&1 | grep -E ' (GET|POST|PATCH) '</code></pre>
+  <pre data-title="Example output (trimmed)"><code><span class="o">GET   https://127.0.0.1:41235/api/v1/namespaces/quickbite/services/postgres         404 Not Found
+POST  https://127.0.0.1:41235/api/v1/namespaces/quickbite/services                  201 Created
+GET   https://127.0.0.1:41235/apis/apps/v1/namespaces/quickbite/statefulsets/postgres 404 Not Found
+POST  https://127.0.0.1:41235/apis/apps/v1/namespaces/quickbite/statefulsets         201 Created</span></code></pre>
+  <p><b>Read it:</b> <code>apply</code> first asks "does it exist?" (GET → 404), then creates (POST → 201). Run the same command again and you'll see GET → 200 and a PATCH: that's how <code>apply</code> is safe to repeat. kubectl is just an HTTP client.</p>
+
+  <details class="q"><summary>Predict: what is the pod's name, and which node will it land on?</summary><div class="a">
+    <p>Name: <b><code>postgres-0</code></b>. StatefulSets give ordinal names, not random hashes (Deployments do that, see step 3). Node: <b>one of the two workers, never the control plane</b>. You can't know which in advance; the scores are close. Check Terminal 2.</p>
+  </div></details>
+
+  <pre data-title="Read the evidence of every stepper step"><code>k -n quickbite get events --sort-by=.lastTimestamp | grep -E 'postgres'
+k -n quickbite get pvc
+k get pv</code></pre>
+  <pre data-title="Example output"><code><span class="o">Normal  SuccessfulCreate      statefulset/postgres         create Claim data-postgres-0 Pod postgres-0 in StatefulSet postgres success
+Normal  SuccessfulCreate      statefulset/postgres         create Pod postgres-0 in StatefulSet postgres successful
+Normal  WaitForFirstConsumer  pvc/data-postgres-0          waiting for first consumer to be created before binding
+Normal  Scheduled             pod/postgres-0               Successfully assigned quickbite/postgres-0 to quickbite-worker2
+Normal  ProvisioningSucceeded pvc/data-postgres-0          Successfully provisioned volume pvc-6c1f...
+Normal  Pulling               pod/postgres-0               Pulling image "postgres:16-alpine"
+Normal  Pulled                pod/postgres-0               Successfully pulled image "postgres:16-alpine" in 6.1s
+Normal  Created               pod/postgres-0               Created container: postgres
+Normal  Started               pod/postgres-0               Started container postgres
+
+NAME               STATUS   VOLUME        CAPACITY   ACCESS MODES   STORAGECLASS
+data-postgres-0    Bound    pvc-6c1f...   1Gi        RWO            standard</span></code></pre>
+  <p>Match each event to a stepper box: <code>SuccessfulCreate</code> = controller-manager · <code>Scheduled</code> = scheduler · <code>Pulling / Created / Started</code> = kubelet + containerd.</p>
+
+  <h3>Peek into etcd: the desired state is really stored there</h3>
+  <pre data-title="List QuickBite keys in etcd (read-only)"><code>k -n kube-system exec etcd-quickbite-control-plane -- etcdctl \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  get /registry --prefix --keys-only | grep quickbite</code></pre>
+  <pre data-title="Example output"><code><span class="o">/registry/configmaps/quickbite/quickbite-config
+/registry/namespaces/quickbite
+/registry/persistentvolumeclaims/quickbite/data-postgres-0
+/registry/pods/quickbite/postgres-0
+/registry/secrets/quickbite/postgres-credentials
+/registry/services/specs/quickbite/postgres
+/registry/statefulsets/quickbite/postgres
+...</span></code></pre>
+  <div class="callout tip"><span class="label">The one-sentence model of Kubernetes</span><p><b>etcd holds what you want. Controllers keep changing the world until it matches.</b> Everything else is detail. Only the API server reads and writes etcd; every other component talks to the API server.</p></div>
+
+  <!-- ============================================================ -->
+  <h2>1.5 Step 3: Redis and menu-api: Deployment → ReplicaSet → Pods</h2>
+  <pre data-title="Apply"><code>k apply -f k8s/base/20-redis.yaml -f k8s/base/30-menu-api.yaml
+k -n quickbite rollout status deploy/menu-api</code></pre>
+
+  <details class="q"><summary>Predict: menu-api has <code>replicas: 3</code> and 2 workers. How will the 3 pods be placed?</summary><div class="a">
+    <p>Almost always <b>2 on one worker and 1 on the other</b>, and <b>0 on the control plane</b>. Why:</p>
+    <ul>
+      <li>The control plane carries the taint <code>node-role.kubernetes.io/control-plane:NoSchedule</code>, and our pods have no toleration, so it's <b>filtered out</b>.</li>
+      <li>The scheduler's default scoring includes a soft spreading rule (pods of the same workload on different nodes score higher), so it avoids putting all 3 on one worker.</li>
+    </ul>
+    <p>"Almost always", because spreading is a <i>preference</i>, not a rule. Chapter 3 turns it into a hard rule, and you'll predict cases where pods stay Pending.</p>
+  </div></details>
+
+  <pre data-title="Verify placement and the taint"><code>k -n quickbite get pods -l app.kubernetes.io/name=menu-api -o wide
+k describe node quickbite-control-plane | grep -A1 Taints</code></pre>
+
+  <h3>Who created these pods? Follow the owner chain</h3>
+  <pre data-title="The three layers"><code>k -n quickbite get deploy,rs,pods -l app.kubernetes.io/name=menu-api
+
+k -n quickbite get pods -l app.kubernetes.io/name=menu-api \
+  -o custom-columns='POD:.metadata.name,OWNER-KIND:.metadata.ownerReferences[0].kind,OWNER:.metadata.ownerReferences[0].name,NODE:.spec.nodeName'</code></pre>
+  <pre data-title="Example output"><code><span class="o">NAME                       READY   UP-TO-DATE   AVAILABLE
+deployment.apps/menu-api   3/3     3            3
+
+NAME                                  DESIRED   CURRENT   READY
+replicaset.apps/menu-api-7c9d5f6b8d   3         3         3
+
+POD                         OWNER-KIND   OWNER                 NODE
+menu-api-7c9d5f6b8d-4kq2x   ReplicaSet   menu-api-7c9d5f6b8d   quickbite-worker
+menu-api-7c9d5f6b8d-9wzlp   ReplicaSet   menu-api-7c9d5f6b8d   quickbite-worker2
+menu-api-7c9d5f6b8d-tm7rd   ReplicaSet   menu-api-7c9d5f6b8d   quickbite-worker</span></code></pre>
+  <figure class="diagram">
+<pre style="background:var(--surface);border:none;padding:0;font-size:13px;line-height:1.6"><code>Deployment  menu-api                 ← you edit THIS (image, replicas, strategy)
+   │  owns                              Deployment controller: "manage versions"
+   ▼
+ReplicaSet  menu-api-<b>7c9d5f6b8d</b>        ← one per version of the pod template
+   │  owns                              (7c9d5f6b8d = hash of the template)
+   ▼                                    ReplicaSet controller: "keep exactly N pods"
+Pods        menu-api-7c9d5f6b8d-<b>4kq2x</b>  ← random suffix: pods are cattle, not pets
+            menu-api-7c9d5f6b8d-9wzlp
+            menu-api-7c9d5f6b8d-tm7rd</code></pre>
+    <figcaption>Why two layers? The ReplicaSet keeps a count; the Deployment switches between ReplicaSets during an update. In Chapter 2 you'll see two ReplicaSets side by side while 1.0 is replaced by 1.1.</figcaption>
+  </figure>
+
+  <h3>Each pod knows where it runs (the Downward API)</h3>
+  <pre data-title="Ask a pod directly, bypassing every Service"><code>k -n quickbite exec deploy/menu-api -- python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://localhost:8000/version').read().decode())"</code></pre>
+  <pre data-title="Output"><code><span class="o">{"version":"1.0","pod":"menu-api-7c9d5f6b8d-4kq2x","node":"quickbite-worker","uptime_s":63}</span></code></pre>
+  <p><code>node</code> comes from <code>env NODE_NAME ← fieldRef: spec.nodeName</code> in <code>30-menu-api.yaml</code>. The scheduler wrote that field, and the kubelet injected it into the container. In Docker it said <code>not-in-k8s</code>.</p>
+
+  <!-- ============================================================ -->
+  <h2>1.6 Step 4: orders-api and its init container</h2>
+  <pre data-title="Apply and watch Terminal 2 closely"><code>k apply -f k8s/base/40-orders-api.yaml</code></pre>
+  <details class="q"><summary>Predict: which STATUS values will you see in Terminal 2, in order?</summary><div class="a">
+<pre><code><span class="o">orders-api-5d8c...-abcde   0/1   Pending           0   0s
+orders-api-5d8c...-abcde   0/1   Init:0/1          0   1s    ← db-migrate running
+orders-api-5d8c...-abcde   0/1   PodInitializing   0   4s    ← db-migrate exited 0
+orders-api-5d8c...-abcde   0/1   Running           0   5s    ← API started, readiness not yet passed
+orders-api-5d8c...-abcde   1/1   Running           0   10s   ← /ready returned 200 (DB reachable)</span></code></pre>
+    <p><code>Init:0/1</code> means "0 of 1 init containers finished". The API container <b>doesn't start at all</b> until every init container exits with 0. Same as <code>service_completed_successfully</code> in Compose, but per pod, on every restart, on every node.</p>
+  </div></details>
+  <pre data-title="Read the init container's logs (it has exited, logs remain)"><code>k -n quickbite logs deploy/orders-api -c db-migrate</code></pre>
+  <pre data-title="Output"><code><span class="o">[db-migrate] schema ready (attempt 1)</span></code></pre>
+
+  <h3>Break it on purpose: init container can't reach the database</h3>
+  <pre data-title="Scale postgres to 0, then restart orders-api"><code>k -n quickbite scale statefulset postgres --replicas=0
+k -n quickbite rollout restart deploy/orders-api
+sleep 20; k -n quickbite get pods -l app.kubernetes.io/name=orders-api</code></pre>
+  <details class="q"><summary>Predict: what happens to the OLD orders-api pods, and to the new ones?</summary><div class="a">
+    <p>New pods sit in <code>Init:0/1</code>. db-migrate prints <code>postgres not ready (n/30)</code> and retries. Meanwhile the <b>old pods keep running</b>: the rolling update doesn't remove an old pod until a new one is Ready. They now fail readiness (no DB), so they show <code>0/1</code> and are removed from the Service. Orders fail, but nothing crashes or restarts in a loop.</p>
+<pre><code>k -n quickbite logs -l app.kubernetes.io/name=orders-api -c db-migrate --tail=2 --prefix</code></pre>
+  </div></details>
+  <pre data-title="Fix it"><code>k -n quickbite scale statefulset postgres --replicas=1
+k -n quickbite rollout status deploy/orders-api</code></pre>
+  <p>No action needed on orders-api: the init container was still retrying, saw the DB come back, and the pods continued on their own. <b>That is reconciliation.</b> Note too that postgres came back with the <i>same</i> PVC, so the table still exists.</p>
+
+  <!-- ============================================================ -->
+  <h2>1.7 Step 5: notifier, web, daily-report</h2>
+  <pre data-title="Apply the rest"><code>k apply -f k8s/base/50-notifier.yaml -f k8s/base/60-web.yaml -f k8s/base/70-daily-report.yaml
+k -n quickbite get deploy,sts,cronjob,svc</code></pre>
+  <pre data-title="Example output"><code><span class="o">NAME                         READY   UP-TO-DATE   AVAILABLE
+deployment.apps/menu-api     3/3     3            3
+deployment.apps/notifier     1/1     1            1
+deployment.apps/orders-api   2/2     2            2
+deployment.apps/redis        1/1     1            1
+deployment.apps/web          2/2     2            2
+NAME                        READY
+statefulset.apps/postgres   1/1
+NAME                         SCHEDULE     TIMEZONE       SUSPEND   ACTIVE
+cronjob.batch/daily-report   0 21 * * *   Asia/Kolkata   False     0
+NAME         TYPE        CLUSTER-IP      PORT(S)
+menu-api     ClusterIP   10.96.142.17    8000/TCP
+orders-api   ClusterIP   10.96.88.201    8000/TCP
+postgres     ClusterIP   None            5432/TCP
+redis        ClusterIP   10.96.30.9      6379/TCP
+web          NodePort    10.96.201.55    80:30080/TCP</span></code></pre>
+  <details class="q"><summary>Notice: why does <code>notifier</code> have no Service, and why is postgres's CLUSTER-IP <code>None</code>?</summary><div class="a">
+    <p><b>notifier</b>: nobody connects <i>to</i> it; it connects <i>out</i> to Redis. A Service is only for receiving traffic. <b>postgres</b> is <i>headless</i> (<code>clusterIP: None</code>): DNS returns the pod IP directly instead of a virtual IP. StatefulSets use this so each replica gets its own stable DNS name (<code>postgres-0.postgres</code>). Chapter 7.</p>
+  </div></details>
+  <p>Open <b>PORTS → 8080</b> in the browser. QuickBite is running on Kubernetes. Click <b>Reload</b> on the menu a few times and watch the <code>pod:</code> line change.</p>
+
+  <!-- ============================================================ -->
+  <h2>1.8 The life of a click: one request across the cluster</h2>
+  <p>You clicked "Reload". Here's every hop that request took. Step through it, then prove each hop with the commands below.</p>
+
+  <div class="widget stepper" data-steps='[
+    {"title":"Browser → Codespace port 8080","html":"GitHub forwards the Codespace port 8080 to your browser. On the Codespace, Docker maps <code>0.0.0.0:8080 → quickbite-control-plane:30080</code> (from <code>extraPortMappings</code>). So the packet arrives at the <b>control-plane node</b> on port 30080, even though no web pod runs there."},
+    {"title":"NodePort: kube-proxy rules on the node catch port 30080","html":"<b>kube-proxy</b> (one per node) has programmed <b>iptables</b> rules: <i>any packet to port 30080 on this node → Service web</i>. Every node has the same rules, which is why a NodePort works on <b>every</b> node. Nothing is listening on 30080; it is pure packet rewriting in the kernel."},
+    {"title":"Service web → pick one Ready web pod (DNAT)","html":"The rules pick one of the web pod IPs at random (only <b>Ready</b> pods are in the list, from the EndpointSlice) and rewrite the destination: <code>→ 10.244.2.7:8080</code>. If that pod is on another node, kindnet routes the packet across the node network."},
+    {"title":"nginx in the web pod: /api/menu → http://menu-api:8000","html":"nginx sees <code>/api/menu</code> and proxies to <code>menu-api:8000</code>. It resolved that name at startup through <b>CoreDNS</b> (<code>/etc/resolv.conf</code> → <code>nameserver 10.96.0.10</code>, search domain <code>quickbite.svc.cluster.local</code>) → the menu-api <b>ClusterIP</b>, e.g. <code>10.96.142.17</code>."},
+    {"title":"ClusterIP is virtual: kube-proxy DNATs again","html":"No machine owns <code>10.96.142.17</code>. On the web pod node, the iptables rules for Service menu-api rewrite the destination to one of the <b>three menu-api pod IPs</b>, picked at random. That is the load balancing you see when the <code>pod:</code> value changes on Reload."},
+    {"title":"menu-api → redis (same mechanism, third time)","html":"menu-api calls <code>redis:6379</code>: DNS → ClusterIP → DNAT → the redis pod. Cache hit: <code>source: redis-cache</code>; miss: it fills the cache. Then the response travels back the same path; connection tracking (conntrack) undoes each rewrite in reverse."}
+  ]'>
+    <div class="w-title">Stepper: GET /api/menu, hop by hop</div>
+    <div class="w-sub">Dashed orange boxes are virtual (Service IPs). They exist only as iptables rules.</div>
+    <svg class="dg" viewBox="0 0 880 330" role="img" aria-label="Request path from browser through NodePort, web pod, CoreDNS, menu-api ClusterIP, menu-api pods, redis">
+      <defs><marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/></marker></defs>
+      <rect class="zone" x="140" y="10" width="200" height="310" rx="10"/><text class="zl" x="150" y="30">control-plane node</text>
+      <rect class="zone" x="360" y="10" width="510" height="310" rx="10"/><text class="zl" x="370" y="30">worker nodes (pods spread across both)</text>
+      <g data-step="0"><rect class="bx" x="10" y="140" width="110" height="50" rx="8"/><text class="t" x="65" y="162">Browser</text><text class="s" x="65" y="178">PORTS 8080</text></g>
+      <g data-step="0,1"><rect class="cp" x="160" y="140" width="160" height="50" rx="8"/><text class="t" x="240" y="162">:30080 NodePort</text><text class="s" x="240" y="178">iptables (kube-proxy)</text></g>
+      <g data-step="2"><rect class="vip" x="160" y="230" width="160" height="40" rx="8"/><text class="t" x="240" y="255">Service web</text></g>
+      <g data-step="2,3"><rect class="wk" x="380" y="140" width="140" height="50" rx="8"/><text class="t" x="450" y="162">web pod</text><text class="s" x="450" y="178">nginx :8080</text></g>
+      <g data-step="3"><rect class="bx" x="380" y="45" width="140" height="50" rx="8"/><text class="t" x="450" y="67">CoreDNS</text><text class="s" x="450" y="83">10.96.0.10</text></g>
+      <g data-step="4"><rect class="vip" x="545" y="140" width="130" height="50" rx="8"/><text class="t" x="610" y="162">Svc menu-api</text><text class="s" x="610" y="178">10.96.142.17</text></g>
+      <g data-step="4,5"><rect class="wk" x="700" y="60" width="150" height="38" rx="8"/><text class="t" x="775" y="84">menu-api pod 1</text></g>
+      <g data-step="4"><rect class="wk" x="700" y="110" width="150" height="38" rx="8"/><text class="t" x="775" y="134">menu-api pod 2</text></g>
+      <g data-step="4"><rect class="wk" x="700" y="160" width="150" height="38" rx="8"/><text class="t" x="775" y="184">menu-api pod 3</text></g>
+      <g data-step="5"><rect class="vip" x="545" y="250" width="130" height="40" rx="8"/><text class="t" x="610" y="275">Svc redis</text></g>
+      <g data-step="5"><rect class="wk" x="700" y="250" width="150" height="40" rx="8"/><text class="t" x="775" y="275">redis pod</text></g>
+      <path class="ln" d="M120,165 H158" data-step="0"/>
+      <path class="ln" d="M240,190 V228" data-step="1,2"/>
+      <path class="ln" d="M320,250 C350,250 350,175 378,170" data-step="2"/>
+      <path class="ln" d="M450,140 V97" data-step="3"/>
+      <path class="ln" d="M520,165 H543" data-step="3,4"/>
+      <path class="ln" d="M675,160 L698,82" data-step="4"/>
+      <path class="ln" d="M775,98 C800,180 700,230 677,265" data-step="5"/>
+      <path class="ln" d="M675,270 H698" data-step="5"/>
+    </svg>
+    <div class="stage"></div>
+    <div class="controls"><button class="btn" data-prev>← Prev</button><button class="btn primary" data-next>Next →</button><span class="count"></span></div>
+  </div>
+
+  <h3>Prove every hop</h3>
+  <pre data-title="Hop 1: the port mapping into the node"><code>docker port quickbite-control-plane</code></pre>
+  <pre data-title="Hops 2, 3, 5: the iptables rules kube-proxy wrote (on the control-plane node)"><code>docker exec quickbite-control-plane iptables-save -t nat | grep -E 'quickbite/(web|menu-api)' | head -20</code></pre>
+  <pre data-title="Example output (trimmed)"><code><span class="o">-A KUBE-NODEPORTS -p tcp -m comment --comment "quickbite/web:http" -m tcp --dport 30080 -j KUBE-EXT-...
+-A KUBE-SERVICES -d 10.96.142.17/32 -p tcp -m comment --comment "quickbite/menu-api:http cluster IP" --dport 8000 -j KUBE-SVC-...
+-A KUBE-SVC-... -m comment --comment "quickbite/menu-api:http -> 10.244.1.4:8000" -m statistic --mode random --probability 0.33333 -j KUBE-SEP-...
+-A KUBE-SVC-... -m comment --comment "quickbite/menu-api:http -> 10.244.1.5:8000" -m statistic --mode random --probability 0.50000 -j KUBE-SEP-...
+-A KUBE-SVC-... -m comment --comment "quickbite/menu-api:http -> 10.244.2.3:8000" -j KUBE-SEP-...
+-A KUBE-SEP-... -p tcp -j DNAT --to-destination 10.244.1.4:8000</span></code></pre>
+  <details class="q"><summary>Why 0.333, then 0.5, then nothing? Is that fair?</summary><div class="a">
+    <p>Rules are checked top to bottom. Rule 1 matches 1/3 of packets. Of the remaining 2/3, rule 2 takes half, which is another 1/3. The last rule takes everything left, the final 1/3. So it's equal 1/3 each. This is the "load balancer" behind a ClusterIP: random, per connection, in the kernel.</p>
+  </div></details>
+
+  <pre data-title="Compare the rules with the Service's endpoint list"><code>k -n quickbite get endpointslices -l kubernetes.io/service-name=menu-api
+k -n quickbite get pods -l app.kubernetes.io/name=menu-api -o wide</code></pre>
+  <p>The IPs in the EndpointSlice = the IPs of the <b>Ready</b> menu-api pods = the IPs in the iptables rules. Three views of the same fact.</p>
+
+  <pre data-title="Hop 4: DNS from inside the web pod"><code>k -n quickbite exec deploy/web -- cat /etc/resolv.conf
+k -n quickbite exec deploy/web -- nslookup menu-api
+k -n kube-system get svc kube-dns</code></pre>
+  <pre data-title="Example output"><code><span class="o">search quickbite.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10
+options ndots:5
+
+Name:    menu-api.quickbite.svc.cluster.local
+Address: 10.96.142.17</span></code></pre>
+  <p>The short name <code>menu-api</code> works because the first search domain adds <code>.quickbite.svc.cluster.local</code>. From another namespace you would have to write <code>menu-api.quickbite</code>.</p>
+
+  <pre data-title="See the load balancing from the outside"><code>for i in $(seq 1 9); do curl -s localhost:8080/api/version | grep -o '"pod":"[^"]*","node":"[^"]*"'; done</code></pre>
+  <pre data-title="Example output"><code><span class="o">"pod":"menu-api-7c9d5f6b8d-tm7rd","node":"quickbite-worker"
+"pod":"menu-api-7c9d5f6b8d-9wzlp","node":"quickbite-worker2"
+"pod":"menu-api-7c9d5f6b8d-4kq2x","node":"quickbite-worker"
+"pod":"menu-api-7c9d5f6b8d-9wzlp","node":"quickbite-worker2"
+...</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2>1.9 Follow an order through four services</h2>
+  <p>Open three terminals side by side, then click <b>Order</b> on "Masala Dosa" in the browser.</p>
+  <pre data-title="Terminal A: orders-api access logs (both replicas)"><code>k -n quickbite logs -l app.kubernetes.io/name=orders-api -f --prefix</code></pre>
+  <pre data-title="Terminal B: the notifier"><code>k -n quickbite logs deploy/notifier -f</code></pre>
+  <pre data-title="Terminal C: the database"><code>k -n quickbite exec -it postgres-0 -- psql -U quickbite -d quickbite -c 'SELECT * FROM orders ORDER BY id DESC LIMIT 5;'</code></pre>
+  <pre data-title="What you see"><code><span class="o">A: [pod/orders-api-5d8c...-x7k2p/orders-api] INFO: 10.244.2.7:51234 - "POST /orders HTTP/1.0" 201 Created
+B: [notifier notifier-6b7f...-q9d4m@quickbite-worker] SMS sent: order #1 (1 x Masala Dosa) confirmed
+C:  id |    item     | qty |          created_at
+   ----+-------------+-----+-------------------------------
+     1 | Masala Dosa |   1 | 2026-11-10 14:02:11.52+00</span></code></pre>
+  <details class="q"><summary>The client IP in Terminal A is <code>10.244.x.x</code>, not your browser. Whose IP is it?</summary><div class="a"><p>The <b>web pod's</b> IP. nginx opened a new connection to orders-api, so from orders-api's point of view the caller is nginx. Run <code>k -n quickbite get pods -l app.kubernetes.io/name=web -o wide</code> and match the IP.</p></div></details>
+
+  <pre data-title="Run the daily report now instead of waiting for 21:00"><code>k -n quickbite create job report-now --from=cronjob/daily-report
+k -n quickbite logs job/report-now -f</code></pre>
+
+  <!-- ============================================================ -->
+  <h2>1.10 Self-healing: three kinds of failure, three different reactions</h2>
+  <p>"Kubernetes heals itself" is too vague to be useful. Who heals, and how? Predict each case before running it.</p>
+
+  <h3>A. A pod is deleted</h3>
+  <pre data-title="Delete one menu-api pod"><code>POD=$(k -n quickbite get pod -l app.kubernetes.io/name=menu-api -o jsonpath='{.items[0].metadata.name}')
+k -n quickbite delete pod $POD
+k -n quickbite get pods -l app.kubernetes.io/name=menu-api -o wide</code></pre>
+  <details class="q"><summary>Predict: same name back? Same node? Who did it?</summary><div class="a">
+    <p>A <b>new pod with a new random suffix</b>, possibly on a different node. The <b>ReplicaSet controller</b> saw 2 &lt; 3 and created a new Pod object; the <b>scheduler</b> placed it fresh. The deleted pod is gone forever; pods are never "moved". The other two pods kept serving, so the menu never went down.</p>
+  </div></details>
+
+  <h3>B. The process inside a container crashes</h3>
+  <pre data-title="Kill PID 1 inside one menu-api container"><code>POD=$(k -n quickbite get pod -l app.kubernetes.io/name=menu-api -o jsonpath='{.items[0].metadata.name}')
+k -n quickbite exec $POD -- python -c "import os,signal; os.kill(1, signal.SIGTERM)"
+k -n quickbite get pod $POD</code></pre>
+  <details class="q"><summary>Predict: new pod or same pod? What column changes?</summary><div class="a">
+    <p><b>Same pod name, same node, same IP</b>, and <code>RESTARTS</code> goes from 0 to 1. The <b>kubelet</b> on that node restarted the container (pod <code>restartPolicy: Always</code>). No controller, no scheduler involved. <code>k -n quickbite logs $POD --previous</code> shows the logs of the dead container.</p>
+    <p><b>Pod restart (kubelet, same pod) vs pod replacement (controller, new pod)</b> is one of the most important distinctions in Kubernetes troubleshooting.</p>
+  </div></details>
+
+  <h3>C. A bad image is released</h3>
+  <pre data-title="Point notifier at a tag that doesn't exist"><code>k -n quickbite set image deploy/notifier notifier=kumawatsunil/quickbite-notifier:9.9
+k -n quickbite get pods -l app.kubernetes.io/name=notifier</code></pre>
+  <details class="q"><summary>Predict: is notifier down now?</summary><div class="a">
+    <p>No. You'll see the old pod still <code>Running</code> and a new pod in <code>ErrImagePull</code> → <code>ImagePullBackOff</code>. The Deployment won't kill the old pod until the new one is Ready, so a broken release doesn't take the service down. Diagnose with:</p>
+<pre><code>k -n quickbite describe pod -l app.kubernetes.io/name=notifier | grep -A3 -E 'Failed|Back-off'
+<span class="o">Warning  Failed   ...  Failed to pull image "kumawatsunil/quickbite-notifier:9.9": ... not found
+Warning  Failed   ...  Error: ErrImagePull
+Normal   BackOff  ...  Back-off pulling image "kumawatsunil/quickbite-notifier:9.9"</span></code></pre>
+  </div></details>
+  <pre data-title="Fix: undo the last change (Chapter 2 explains how this works)"><code>k -n quickbite rollout undo deploy/notifier
+k -n quickbite rollout status deploy/notifier</code></pre>
+
+  <!-- ============================================================ -->
+  <h2>1.11 Commands used in this chapter</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Goal</th><th>Command</th></tr></thead>
+    <tbody>
+      <tr><td>Create / update from files (idempotent)</td><td><code>k apply -f FILE</code> · <code>k apply -k DIR</code></td></tr>
+      <tr><td>See kubectl's HTTP calls</td><td><code>k apply -f FILE -v=6</code></td></tr>
+      <tr><td>Live view of pods with nodes</td><td><code>k get pods -o wide -w</code></td></tr>
+      <tr><td>Several kinds at once</td><td><code>k get deploy,rs,pods,svc,pvc,cronjob</code></td></tr>
+      <tr><td>Filter by label</td><td><code>-l app.kubernetes.io/name=menu-api</code></td></tr>
+      <tr><td>Custom columns (owner, node...)</td><td><code>-o custom-columns='POD:.metadata.name,NODE:.spec.nodeName'</code></td></tr>
+      <tr><td>One field</td><td><code>-o jsonpath='{.data.password}'</code></td></tr>
+      <tr><td>Cluster history (who did what)</td><td><code>k get events --sort-by=.lastTimestamp</code></td></tr>
+      <tr><td>Why is this pod not running?</td><td><code>k describe pod NAME</code> → Events at the bottom</td></tr>
+      <tr><td>Wait for a rollout</td><td><code>k rollout status deploy/NAME</code></td></tr>
+      <tr><td>Logs: one container, all replicas, previous crash</td><td><code>logs POD -c INIT</code> · <code>logs -l LABEL --prefix -f</code> · <code>logs POD --previous</code></td></tr>
+      <tr><td>Run a command inside a pod</td><td><code>k exec deploy/web -- CMD</code> · <code>k exec -it postgres-0 -- psql ...</code></td></tr>
+      <tr><td>Scale</td><td><code>k scale statefulset postgres --replicas=0</code></td></tr>
+      <tr><td>Restart all pods of a Deployment</td><td><code>k rollout restart deploy/NAME</code></td></tr>
+      <tr><td>Change image / undo</td><td><code>k set image deploy/N c=IMG</code> · <code>k rollout undo deploy/N</code></td></tr>
+      <tr><td>Trigger a CronJob now</td><td><code>k create job NAME --from=cronjob/CJ</code></td></tr>
+      <tr><td>Node internals (kind)</td><td><code>docker exec NODE iptables-save -t nat</code> · <code>docker exec -it NODE crictl ps</code></td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- ============================================================ -->
+  <h2>1.12 Check yourself</h2>
+  <details class="q"><summary>1. You run <code>kubectl apply</code> and get "created", but no pod appears. Name three components that could be the reason, and the command that shows which one.</summary><div class="a"><p>Controller-manager (didn't create the pod: check <code>k get rs</code> and <code>k describe deploy</code>), scheduler (pod <code>Pending</code>: <code>k describe pod</code> → "FailedScheduling"), kubelet/runtime (pod scheduled but stuck in <code>ContainerCreating</code> / <code>ImagePullBackOff</code>: <code>k describe pod</code> events). <code>k get events --sort-by=.lastTimestamp</code> shows all three.</p></div></details>
+  <details class="q"><summary>2. Does traffic from the browser go through the control-plane node? Is that a problem in production?</summary><div class="a"><p>Here yes, because only the control-plane container has the port mapping. NodePort works on any node, so in production a cloud load balancer spreads traffic across all worker nodes (Service type LoadBalancer or Ingress, Ch 5), and the control plane is not in the data path.</p></div></details>
+  <details class="q"><summary>3. A menu-api pod fails its readiness probe. Does it restart? Does it receive traffic?</summary><div class="a"><p>It does <b>not</b> restart (that's liveness). It's removed from the EndpointSlice, so iptables rules stop sending it traffic. When readiness passes again, it's added back. Chapter 2 uses exactly this with <code>1.2-broken</code>.</p></div></details>
+  <details class="q"><summary>4. What survived when you scaled postgres to 0 and back? Why?</summary><div class="a"><p>The data. The PVC <code>data-postgres-0</code> isn't deleted when a StatefulSet scales down, and the new <code>postgres-0</code> re-attaches the same claim by name.</p></div></details>
+  <details class="q"><summary>5. Pod restart vs pod replacement: who does each, and what changes?</summary><div class="a"><p>Restart: the kubelet, same pod and IP, RESTARTS+1. Replacement: the ReplicaSet controller + scheduler, new name, new IP, maybe a new node.</p></div></details>
+
+  <div class="callout example"><span class="label">Checkpoint reached: <code>app</code></span><p>Your cluster now matches what <code>make resume</code> builds. Next session, start Chapter 02 with <code>make resume</code>.</p></div>
+
+  <div class="pager"><a href="00-setup.html">← Chapter 00: Setup</a><a href="index.html">Roadmap →</a></div>
+
+  </article></main>
+</div>
+</body>
+</html>

@@ -1,0 +1,40 @@
+# web: the only component users reach directly.
+# NodePort 30080 is mapped by kind to port 8080 of your Codespace (see kind-3node.yaml).
+# Chapter 6 replaces this with an Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: quickbite
+  labels: { app.kubernetes.io/name: web, app.kubernetes.io/part-of: quickbite }
+spec:
+  type: NodePort
+  selector: { app.kubernetes.io/name: web }
+  ports:
+    - { name: http, port: 80, targetPort: http, nodePort: 30080 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: quickbite
+  labels: { app.kubernetes.io/name: web, app.kubernetes.io/part-of: quickbite, tier: frontend }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: web }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: web, app.kubernetes.io/part-of: quickbite, tier: frontend }
+    spec:
+      containers:
+        - name: web
+          image: kumawatsunil/quickbite-web:1.0
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 20m, memory: 16Mi }
+            limits: { memory: 64Mi }

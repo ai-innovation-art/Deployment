@@ -1,0 +1,56 @@
+# menu-api: stateless, read-heavy. 3 replicas behind one ClusterIP Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: menu-api
+  namespace: quickbite
+  labels: { app.kubernetes.io/name: menu-api, app.kubernetes.io/part-of: quickbite }
+spec:
+  type: ClusterIP              # internal only; web reaches it as http://menu-api:8000
+  selector: { app.kubernetes.io/name: menu-api }
+  ports:
+    - { name: http, port: 8000, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: menu-api
+  namespace: quickbite
+  labels: { app.kubernetes.io/name: menu-api, app.kubernetes.io/part-of: quickbite, tier: backend }
+  annotations:
+    kubernetes.io/change-cause: "initial release 1.0"
+spec:
+  replicas: 3
+  revisionHistoryLimit: 10       # how many old ReplicaSets are kept for rollback
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                # at most 3+1 = 4 pods during an update
+      maxUnavailable: 0          # never drop below 3 ready pods
+  selector:
+    matchLabels: { app.kubernetes.io/name: menu-api }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: menu-api, app.kubernetes.io/part-of: quickbite, tier: backend }
+    spec:
+      containers:
+        - name: menu-api
+          image: kumawatsunil/quickbite-menu-api:1.0
+          ports:
+            - { name: http, containerPort: 8000 }
+          env:
+            - { name: REDIS_HOST, valueFrom: { configMapKeyRef: { name: quickbite-config, key: REDIS_HOST } } }
+            - { name: CACHE_TTL_SECONDS, valueFrom: { configMapKeyRef: { name: quickbite-config, key: CACHE_TTL_SECONDS } } }
+            - name: NODE_NAME      # Downward API: the pod learns which node it landed on
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }

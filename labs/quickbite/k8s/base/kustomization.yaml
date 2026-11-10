@@ -1,0 +1,12 @@
+# kubectl apply -k k8s/base   applies every file below, in this order.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - 00-namespace-config.yaml
+  - 10-postgres.yaml
+  - 20-redis.yaml
+  - 30-menu-api.yaml
+  - 40-orders-api.yaml
+  - 50-notifier.yaml
+  - 60-web.yaml
+  - 70-daily-report.yaml
