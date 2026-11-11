@@ -6,6 +6,7 @@
 <title>YAML Method · K8s Deep Dive</title>
 <link rel="stylesheet" href="../../notes-animated/assets/style.css">
 <script src="../../notes-animated/assets/notes.js"></script>
+<style>.def{background:var(--ok-soft);border:1px solid var(--ok);border-radius:4px;padding:0 4px;font-weight:600}</style>
 </head>
 <body>
 <div class="topbar">
@@ -169,18 +170,52 @@ volumeClaimTemplates name "data" + pod postgres-0  →  PVC data-postgres-0</cod
     <li><code>targetPort</code> is NOT a host port. It's the port inside the pod. It defaults to <code>port</code> and can be a name.</li>
   </ul>
 
-  <h2>Defaults you don't write</h2>
+  <h2>Options and defaults</h2>
+  <p>Highlighted = the default used when you leave the field out. <b>required</b> = apply fails without it. Check any field with <code>kubectl explain &lt;kind&gt;.&lt;path&gt;</code>; see what was filled in with <code>kubectl get &lt;obj&gt; -o yaml</code>.</p>
   <div class="table-wrap"><table>
-    <thead><tr><th>Field</th><th>Default</th></tr></thead>
+    <thead><tr><th>Field</th><th>Options (default highlighted)</th><th>Required?</th></tr></thead>
     <tbody>
-      <tr><td>Service <code>type</code></td><td><code>ClusterIP</code></td></tr>
-      <tr><td><code>targetPort</code></td><td>Same as <code>port</code></td></tr>
-      <tr><td><code>replicas</code></td><td>1</td></tr>
-      <tr><td><code>restartPolicy</code> (pod)</td><td><code>Always</code>. Deployment/StatefulSet allow only Always; Jobs use OnFailure / Never</td></tr>
-      <tr><td><code>strategy</code> (Deployment)</td><td>RollingUpdate, maxSurge 25%, maxUnavailable 25%</td></tr>
-      <tr><td><code>revisionHistoryLimit</code></td><td>10</td></tr>
-      <tr><td><code>imagePullPolicy</code></td><td>IfNotPresent (Always for <code>:latest</code>)</td></tr>
-      <tr><td><code>storageClassName</code></td><td>The cluster default (kind: standard)</td></tr>
+      <tr><th colspan="3" style="text-align:left">Service</th></tr>
+      <tr><td><code>type</code></td><td><b class="def">ClusterIP</b> · NodePort · LoadBalancer · ExternalName</td><td>optional</td></tr>
+      <tr><td><code>clusterIP</code></td><td><b class="def">auto-assigned</b> · <code>None</code> (headless) · a fixed IP</td><td>optional</td></tr>
+      <tr><td><code>ports[].port</code></td><td>a number</td><td><b>required</b></td></tr>
+      <tr><td><code>ports[].targetPort</code></td><td><b class="def">same as port</b> · number · port name</td><td>optional</td></tr>
+      <tr><td><code>ports[].protocol</code></td><td><b class="def">TCP</b> · UDP · SCTP</td><td>optional</td></tr>
+      <tr><td><code>sessionAffinity</code></td><td><b class="def">None</b> · ClientIP (same client → same pod)</td><td>optional</td></tr>
+      <tr><th colspan="3" style="text-align:left">Deployment</th></tr>
+      <tr><td><code>replicas</code></td><td><b class="def">1</b> · any number</td><td>optional</td></tr>
+      <tr><td><code>selector</code> · <code>template</code></td><td>must match each other</td><td><b>required</b></td></tr>
+      <tr><td><code>strategy.type</code></td><td><b class="def">RollingUpdate</b> · Recreate (stop all, then start)</td><td>optional</td></tr>
+      <tr><td><code>maxSurge</code> / <code>maxUnavailable</code></td><td><b class="def">25%</b> / <b class="def">25%</b> · number or %</td><td>optional</td></tr>
+      <tr><td><code>revisionHistoryLimit</code></td><td><b class="def">10</b> · any number</td><td>optional</td></tr>
+      <tr><td><code>minReadySeconds</code></td><td><b class="def">0</b> · seconds a pod must stay Ready to count</td><td>optional</td></tr>
+      <tr><th colspan="3" style="text-align:left">StatefulSet</th></tr>
+      <tr><td><code>serviceName</code></td><td>name of a headless Service</td><td><b>required</b></td></tr>
+      <tr><td><code>podManagementPolicy</code></td><td><b class="def">OrderedReady</b> (0→1→2) · Parallel</td><td>optional</td></tr>
+      <tr><td><code>updateStrategy.type</code></td><td><b class="def">RollingUpdate</b> (highest index first) · OnDelete</td><td>optional</td></tr>
+      <tr><td><code>persistentVolumeClaimRetentionPolicy</code></td><td><b class="def">Retain</b> · Delete (on scale-down / delete)</td><td>optional</td></tr>
+      <tr><th colspan="3" style="text-align:left">Pod spec (inside template)</th></tr>
+      <tr><td><code>containers[].name</code> · <code>image</code></td><td>—</td><td><b>required</b></td></tr>
+      <tr><td><code>restartPolicy</code></td><td><b class="def">Always</b> · OnFailure · Never. Deployment/StatefulSet allow only Always; Jobs: OnFailure / Never</td><td>optional</td></tr>
+      <tr><td><code>imagePullPolicy</code></td><td><b class="def">IfNotPresent</b> (Always if tag is <code>:latest</code> or missing) · Always · Never</td><td>optional</td></tr>
+      <tr><td><code>terminationGracePeriodSeconds</code></td><td><b class="def">30</b> · seconds between SIGTERM and SIGKILL</td><td>optional</td></tr>
+      <tr><td><code>dnsPolicy</code></td><td><b class="def">ClusterFirst</b> · Default · None · ClusterFirstWithHostNet</td><td>optional</td></tr>
+      <tr><td><code>serviceAccountName</code></td><td><b class="def">default</b> · any ServiceAccount</td><td>optional</td></tr>
+      <tr><td><code>containerPort.protocol</code></td><td><b class="def">TCP</b> · UDP · SCTP</td><td>optional</td></tr>
+      <tr><th colspan="3" style="text-align:left">Probes</th></tr>
+      <tr><td>handler</td><td>exec · httpGet · tcpSocket · grpc (pick one)</td><td><b>required</b> (one of)</td></tr>
+      <tr><td><code>initialDelaySeconds</code></td><td><b class="def">0</b></td><td>optional</td></tr>
+      <tr><td><code>periodSeconds</code></td><td><b class="def">10</b></td><td>optional</td></tr>
+      <tr><td><code>timeoutSeconds</code></td><td><b class="def">1</b></td><td>optional</td></tr>
+      <tr><td><code>failureThreshold</code> / <code>successThreshold</code></td><td><b class="def">3</b> / <b class="def">1</b> (liveness &amp; startup: success must be 1)</td><td>optional</td></tr>
+      <tr><th colspan="3" style="text-align:left">PVC / volumeClaimTemplates</th></tr>
+      <tr><td><code>accessModes</code></td><td>ReadWriteOnce · ReadOnlyMany · ReadWriteMany · ReadWriteOncePod</td><td><b>required</b></td></tr>
+      <tr><td><code>resources.requests.storage</code></td><td>size, e.g. 1Gi</td><td><b>required</b></td></tr>
+      <tr><td><code>storageClassName</code></td><td><b class="def">cluster default</b> (kind: standard) · any class · <code>""</code> (none)</td><td>optional</td></tr>
+      <tr><td><code>volumeMode</code></td><td><b class="def">Filesystem</b> · Block</td><td>optional</td></tr>
+      <tr><th colspan="3" style="text-align:left">Secret / ConfigMap</th></tr>
+      <tr><td>Secret <code>type</code></td><td><b class="def">Opaque</b> · kubernetes.io/tls · kubernetes.io/dockerconfigjson · kubernetes.io/basic-auth</td><td>optional</td></tr>
+      <tr><td><code>immutable</code></td><td><b class="def">false</b> · true</td><td>optional</td></tr>
     </tbody>
   </table></div>
   <ul>
