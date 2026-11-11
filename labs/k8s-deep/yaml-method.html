@@ -90,6 +90,19 @@ Pod DNS:     postgres-0.postgres.quickbite.svc.cluster.local   (6 parts, Statefu
     3. If the Service selector doesn't match, the pod runs but has <b>0 endpoints</b> (silent error). Check <code>kubectl get endpointslices</code>.<br>
     4. Headless means DNS returns the pod IP directly. With a StatefulSet, each pod gets <code>pod.service.ns.svc.cluster.local</code>.</p></div>
 
+  <h2>The 5 label places</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>#</th><th>Where</th><th>What it is</th><th>If missing</th><th>If wrong</th></tr></thead>
+    <tbody>
+      <tr><td>A</td><td>Service <code>metadata.labels</code></td><td>Tag on the Service</td><td>Nothing breaks</td><td>Tools/<code>-l</code> can't find it</td></tr>
+      <tr><td>B</td><td>Service <code>spec.selector</code></td><td>Search for pods (traffic)</td><td>No endpoints, traffic goes nowhere</td><td>0 endpoints, <b>silent</b></td></tr>
+      <tr><td>C</td><td>Workload <code>metadata.labels</code></td><td>Tag on the Deployment/StatefulSet (NOT copied to pods)</td><td>Nothing breaks</td><td>Tools/<code>-l</code> can't find it</td></tr>
+      <tr><td>D</td><td>Workload <code>spec.selector.matchLabels</code></td><td>Search for pods it owns. Immutable</td><td><b>Apply rejected</b></td><td><b>Apply rejected</b></td></tr>
+      <tr><td>E</td><td>Workload <code>spec.template.metadata.labels</code></td><td>The badge stamped on every pod</td><td><b>Apply rejected</b></td><td>Rejected (vs D) / silent (vs B)</td></tr>
+    </tbody>
+  </table></div>
+  <p>A and C are <b>name tags on objects</b>. B and D are <b>searches</b>. E is the <b>badge on pods</b> that B and D search for. Only E has to satisfy both searches.</p>
+
   <h2>Container: env, probes, resources</h2>
   <pre data-title="env: 3 sources"><code>env:
   - { name: X, value: "fixed" }
