@@ -246,6 +246,35 @@ new pod never Ready     → rollout stops, old pods keep serving</code></pre>
     <li>Logs: <code>kubectl logs &lt;pod&gt; -c db-migrate</code>.</li>
   </ul>
 
+  <h2>When you need a Service</h2>
+  <pre data-title="ownership vs traffic"><code>Deployment ─► ReplicaSet ─► Pod ─► Container    (creates and keeps pods running)
+Service ──selector──► Pods                      (finds pods: DNS name + virtual IP + kube-proxy rules on every node)</code></pre>
+  <ul>
+    <li>Need a Service only if something connects <b>in</b> to the pod. Workers that only connect out (notifier → redis) need none.</li>
+    <li>A Service gives a stable name, load balancing, and tracks only <b>Ready</b> pods.</li>
+    <li><code>NodePort</code> = ClusterIP + a port (30000–32767) opened on <b>every</b> node, even nodes without the pod. Omit <code>nodePort</code> to get a random one.</li>
+    <li>Ports below 1024 need root, so non-root containers use 8080 and the Service maps <code>80 → 8080</code>.</li>
+    <li>Production: LoadBalancer or Ingress instead of NodePort.</li>
+  </ul>
+
+  <h2>Job and CronJob</h2>
+  <pre data-title="3 levels"><code>CronJob   spec.schedule ...                    WHEN
+  Job     spec.jobTemplate.spec ...            retries, cleanup
+    Pod   spec.jobTemplate.spec.template.spec  containers (restartPolicy: Never | OnFailure)</code></pre>
+  <ul>
+    <li>Cron: <code>min hour day month weekday</code> · <code>0 21 * * *</code> = 21:00 daily · <code>*/15 * * * *</code> = every 15 min. Set <code>timeZone</code>, else UTC.</li>
+    <li><code>concurrencyPolicy</code>: <b>Allow</b> (default) · Forbid (skip new) · Replace (kill old).</li>
+    <li><code>backoffLimit</code> retries (default 6) · <code>ttlSecondsAfterFinished</code> auto-delete · history limits 3 / 1.</li>
+    <li><code>Never</code> = a new pod per retry (old logs kept) · <code>OnFailure</code> = same pod restarts.</li>
+    <li>Run now: <code>kubectl create job report-now --from=cronjob/daily-report</code>. Done pod = <code>Completed</code>, not restarted.</li>
+  </ul>
+
+  <h2>Kustomize</h2>
+  <ul>
+    <li><code>kubectl apply -k &lt;dir&gt;</code> applies every file listed in <code>kustomization.yaml</code>. Unchanged objects print <code>unchanged</code> (apply is safe to repeat).</li>
+    <li><code>kubectl kustomize &lt;dir&gt;</code> shows the combined YAML without applying.</li>
+  </ul>
+
   <h2>Debugging</h2>
   <pre data-title="test from inside the cluster (ClusterIP is unreachable from outside)"><code>kubectl run tmp --rm -it --restart=Never --image=curlimages/curl -n quickbite --   sh -c 'curl -s menu-api:8000/menu'
 
@@ -316,6 +345,37 @@ kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=redis -n quickb
   <ul>
     <li><code>kubectl exec deploy/redis</code> picks a pod for you. <code>kubectl delete pod -l &lt;label&gt;</code> deletes by label.</li>
   </ul>
+
+  <h2>Kinds you'll use regularly</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Kind</th><th>apiVersion</th><th>Short</th><th>Namespaced</th><th>For</th></tr></thead>
+    <tbody>
+      <tr><td>Namespace</td><td>v1</td><td>ns</td><td>No</td><td>Folder for objects</td></tr>
+      <tr><td>Pod</td><td>v1</td><td>po</td><td>Yes</td><td>Containers running together (rarely written directly)</td></tr>
+      <tr><td>Deployment</td><td>apps/v1</td><td>deploy</td><td>Yes</td><td>Stateless apps, rolling updates</td></tr>
+      <tr><td>ReplicaSet</td><td>apps/v1</td><td>rs</td><td>Yes</td><td>Created by Deployment, keeps N pods</td></tr>
+      <tr><td>StatefulSet</td><td>apps/v1</td><td>sts</td><td>Yes</td><td>Databases: fixed names + own disk</td></tr>
+      <tr><td>DaemonSet</td><td>apps/v1</td><td>ds</td><td>Yes</td><td>One pod per node (agents)</td></tr>
+      <tr><td>Job</td><td>batch/v1</td><td>—</td><td>Yes</td><td>Run to completion</td></tr>
+      <tr><td>CronJob</td><td>batch/v1</td><td>cj</td><td>Yes</td><td>Job on a schedule</td></tr>
+      <tr><td>Service</td><td>v1</td><td>svc</td><td>Yes</td><td>Stable name + load balancing</td></tr>
+      <tr><td>EndpointSlice</td><td>discovery.k8s.io/v1</td><td>—</td><td>Yes</td><td>Pod IPs behind a Service (auto)</td></tr>
+      <tr><td>Ingress</td><td>networking.k8s.io/v1</td><td>ing</td><td>Yes</td><td>HTTP routing by host/path</td></tr>
+      <tr><td>NetworkPolicy</td><td>networking.k8s.io/v1</td><td>netpol</td><td>Yes</td><td>Which pod may talk to which</td></tr>
+      <tr><td>ConfigMap</td><td>v1</td><td>cm</td><td>Yes</td><td>Settings</td></tr>
+      <tr><td>Secret</td><td>v1</td><td>—</td><td>Yes</td><td>Sensitive settings</td></tr>
+      <tr><td>PersistentVolumeClaim</td><td>v1</td><td>pvc</td><td>Yes</td><td>Request for a disk</td></tr>
+      <tr><td>PersistentVolume</td><td>v1</td><td>pv</td><td>No</td><td>The disk</td></tr>
+      <tr><td>StorageClass</td><td>storage.k8s.io/v1</td><td>sc</td><td>No</td><td>How disks are made</td></tr>
+      <tr><td>ServiceAccount</td><td>v1</td><td>sa</td><td>Yes</td><td>Identity for pods</td></tr>
+      <tr><td>Role / RoleBinding</td><td>rbac.authorization.k8s.io/v1</td><td>—</td><td>Yes</td><td>Permissions in a namespace</td></tr>
+      <tr><td>ClusterRole / ClusterRoleBinding</td><td>rbac.authorization.k8s.io/v1</td><td>—</td><td>No</td><td>Cluster-wide permissions</td></tr>
+      <tr><td>HorizontalPodAutoscaler</td><td>autoscaling/v2</td><td>hpa</td><td>Yes</td><td>Scale replicas on load</td></tr>
+      <tr><td>PodDisruptionBudget</td><td>policy/v1</td><td>pdb</td><td>Yes</td><td>Min pods during maintenance</td></tr>
+      <tr><td>ResourceQuota / LimitRange</td><td>v1</td><td>quota / limits</td><td>Yes</td><td>Namespace resource limits</td></tr>
+      <tr><td>Node</td><td>v1</td><td>no</td><td>No</td><td>A machine (created by the cluster)</td></tr>
+    </tbody>
+  </table></div>
 
   </article></main>
 </div>
