@@ -19,181 +19,47 @@
   <nav class="toc"><h4>On this page</h4><ol></ol></nav>
   <main><article class="content">
 
-  <h1>How to write any Kubernetes YAML</h1>
-  <p class="lede">A method, not memorization. It works for any object in any project: <b>find the type → generate a template → find where fields go with <code>explain</code> → validate → compare with what's running</b>. Keep this page open whenever you write or change a manifest.</p>
-  <div class="meta">
-    <span class="pill accent">Reference page</span>
-    <span class="pill">Used in every chapter</span>
-  </div>
+  <h1>YAML: commands cheat sheet</h1>
 
-  <!-- ============================================================ -->
-  <h2>The skeleton every object shares</h2>
-  <pre data-title="5 top-level fields: you write 4, Kubernetes writes 1"><code><span class="k">apiVersion</span>: apps/v1          <span class="c"># 1. which API group/version   ┐ WHAT it is</span>
-<span class="k">kind</span>: Deployment             <span class="c"># 2. which type of object       ┘</span>
-<span class="k">metadata</span>:                     <span class="c"># 3. WHO it is</span>
-  name: menu-api              <span class="c">#    name is INSIDE metadata</span>
-  namespace: quickbite
-  labels:
-    app.kubernetes.io/name: menu-api
-  annotations: {}
-<span class="k">spec</span>:                         <span class="c"># 4. WHAT YOU WANT (desired state), written by you</span>
-  replicas: 3
-<span class="k">status</span>:                       <span class="c"># 5. WHAT IS (actual state), written by Kubernetes, never by you</span>
-  readyReplicas: 3</code></pre>
-  <div class="callout tip"><span class="label">The core idea</span><p>You write <code>spec</code>. Controllers keep working until <code>status</code> matches it. <code>READY 2/3</code> in <code>kubectl get</code> output means status hasn't caught up with spec yet.</p></div>
-  <p>Exceptions: ConfigMap and Secret have <code>data</code> / <code>stringData</code> instead of <code>spec</code>, because they hold data, not a desired state.</p>
+  <h2>The 5 steps</h2>
+  <pre data-title="find → generate → explain → validate → compare"><code><span class="c"># 1. Find the kind, apiVersion, and whether it's namespaced</span>
+kubectl api-resources | grep -i deployment
 
-  <!-- ============================================================ -->
-  <h2>Step 1 · Find <code>apiVersion</code> and <code>kind</code></h2>
-  <pre data-title="Ask the cluster, don't memorize"><code>kubectl api-resources                          <span class="c"># every object type the cluster knows</span>
-kubectl api-resources | grep -i deployment     <span class="c"># one type</span>
-kubectl api-resources --namespaced=false       <span class="c"># cluster-wide types (Node, PV, Namespace...)</span></code></pre>
-  <pre data-title="Example output"><code><span class="o">NAME          SHORTNAMES   APIVERSION   NAMESPACED   KIND
-deployments   deploy       apps/v1      true         Deployment</span></code></pre>
-  <p>Copy <code>APIVERSION</code> → <code>apiVersion:</code> and <code>KIND</code> → <code>kind:</code>. <code>apiVersion</code> is <code>group/version</code>; the core group has no name, so it's just <code>v1</code>.</p>
+<span class="c"># 2. Generate a template (then delete creationTimestamp, {} and status)</span>
+kubectl create deployment menu-api --image=nginx --replicas=3 --dry-run=client -o yaml &gt; my.yaml
 
+<span class="c"># 3. Find where a field goes, and its type</span>
+kubectl explain deployment.spec.template.spec.containers
+kubectl explain deployment --recursive | less
+
+<span class="c"># 4. Validate against the real API server (nothing is created)</span>
+kubectl apply -f my.yaml --dry-run=server
+
+<span class="c"># 5. Compare with what's running, then apply</span>
+kubectl diff -f my.yaml
+kubectl apply -f my.yaml</code></pre>
+
+  <h2>Generators: Namespace, ConfigMap, Secret</h2>
+  <pre data-title="generate, don't type"><code>kubectl create namespace quickbite --dry-run=client -o yaml &gt; ns.yaml
+
+kubectl create configmap quickbite-config -n quickbite \
+  --from-literal=DB_HOST=postgres --from-literal=CACHE_TTL_SECONDS=30 \
+  --dry-run=client -o yaml &gt; cm.yaml
+
+kubectl create secret generic postgres-credentials -n quickbite \
+  --from-literal=username=quickbite --from-literal=password=quickbite-dev-password \
+  --dry-run=client -o yaml &gt; secret.yaml</code></pre>
+
+  <h2>Secret types</h2>
   <div class="table-wrap"><table>
-    <thead><tr><th>apiVersion</th><th>Objects</th></tr></thead>
+    <thead><tr><th>Command</th><th><code>type:</code></th><th>For</th></tr></thead>
     <tbody>
-      <tr><td><code>v1</code></td><td>Pod, Service, ConfigMap, Secret, Namespace, PersistentVolumeClaim, ServiceAccount</td></tr>
-      <tr><td><code>apps/v1</code></td><td>Deployment, StatefulSet, DaemonSet, ReplicaSet</td></tr>
-      <tr><td><code>batch/v1</code></td><td>Job, CronJob</td></tr>
-      <tr><td><code>networking.k8s.io/v1</code></td><td>Ingress, NetworkPolicy</td></tr>
-      <tr><td><code>rbac.authorization.k8s.io/v1</code></td><td>Role, RoleBinding, ClusterRole, ClusterRoleBinding</td></tr>
-      <tr><td><code>autoscaling/v2</code></td><td>HorizontalPodAutoscaler</td></tr>
-      <tr><td><code>policy/v1</code></td><td>PodDisruptionBudget</td></tr>
+      <tr><td><code>kubectl create secret generic</code></td><td><code>Opaque</code></td><td>Any key/value: passwords, API keys</td></tr>
+      <tr><td><code>kubectl create secret tls</code></td><td><code>kubernetes.io/tls</code></td><td>Certificate + key (<code>--cert</code>, <code>--key</code>)</td></tr>
+      <tr><td><code>kubectl create secret docker-registry</code></td><td><code>kubernetes.io/dockerconfigjson</code></td><td>Pulling private images</td></tr>
     </tbody>
   </table></div>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Version suffix</th><th>Meaning</th></tr></thead>
-    <tbody>
-      <tr><td><code>v1alpha1</code></td><td>Experimental: can change or disappear</td></tr>
-      <tr><td><code>v1beta1</code></td><td>Mostly stable: changes come with a migration path</td></tr>
-      <tr><td><code>v1</code></td><td>Stable: never breaks</td></tr>
-    </tbody>
-  </table></div>
-
-  <!-- ============================================================ -->
-  <h2>Step 2 · Generate a template (never start from a blank file)</h2>
-  <p><code>--dry-run=client -o yaml</code> means "don't create anything, just print the YAML". You get a correct structure to edit.</p>
-  <pre data-title="Generators for the common objects"><code><span class="c"># Deployment</span>
-kubectl create deployment menu-api --image=kumawatsunil/quickbite-menu-api:1.0 --replicas=3 \
-  --port=8000 --dry-run=client -o yaml > deployment.yaml
-
-<span class="c"># Service (ClusterIP) for an existing Deployment name</span>
-kubectl create service clusterip menu-api --tcp=8000:8000 --dry-run=client -o yaml > service.yaml
-
-<span class="c"># Service from a Deployment that already exists in the cluster</span>
-kubectl expose deployment menu-api --port=8000 --dry-run=client -o yaml
-
-<span class="c"># Pod</span>
-kubectl run test --image=nginx --port=80 --dry-run=client -o yaml
-
-<span class="c"># ConfigMap / Secret</span>
-kubectl create configmap app-config --from-literal=REDIS_HOST=redis --dry-run=client -o yaml
-kubectl create secret generic db-creds --from-literal=password=s3cret --dry-run=client -o yaml
-
-<span class="c"># Namespace</span>
-kubectl create namespace quickbite --dry-run=client -o yaml
-
-<span class="c"># Job / CronJob</span>
-kubectl create job report --image=busybox --dry-run=client -o yaml -- echo hi
-kubectl create cronjob report --image=busybox --schedule="0 21 * * *" --dry-run=client -o yaml -- echo hi
-
-<span class="c"># Ingress</span>
-kubectl create ingress web --rule="quickbite.local/*=web:80" --dry-run=client -o yaml
-
-<span class="c"># RBAC</span>
-kubectl create role pod-reader --verb=get,list --resource=pods --dry-run=client -o yaml
-kubectl create rolebinding read-pods --role=pod-reader --user=alice --dry-run=client -o yaml</code></pre>
-  <div class="callout note"><span class="label">No generator?</span><p>StatefulSet, DaemonSet, PVC and NetworkPolicy have no <code>kubectl create</code> generator. Copy the nearest template (a Deployment for StatefulSet/DaemonSet), or the example from kubernetes.io/docs, then use Step 3.</p></div>
-
-  <!-- ============================================================ -->
-  <h2>Step 3 · Find WHERE a field goes, with <code>kubectl explain</code></h2>
-  <p>The path you type is the place in the YAML: <b>one dot = one indentation level</b>.</p>
-  <pre data-title="Example: where does a readiness probe go?"><code>kubectl explain deployment.spec                                    <span class="c"># → template</span>
-kubectl explain deployment.spec.template.spec                      <span class="c"># → containers</span>
-kubectl explain deployment.spec.template.spec.containers           <span class="c"># → readinessProbe</span>
-kubectl explain deployment.spec.template.spec.containers.readinessProbe
-
-kubectl explain deployment.spec --recursive | less                 <span class="c"># the whole tree at once</span></code></pre>
-  <pre data-title="The path above, as YAML"><code>spec:                          <span class="c"># deployment.spec</span>
-  template:                    <span class="c">#   .template</span>
-    spec:                      <span class="c">#     .spec</span>
-      containers:              <span class="c">#       .containers</span>
-        - name: menu-api
-          readinessProbe:      <span class="c">#         .readinessProbe   ← here</span>
-            httpGet:
-              path: /ready
-              port: 8000</code></pre>
-  <p>Each <code>explain</code> output shows the field's <b>type</b> and <b>description</b>, and whether it's <b>required</b>. The type tells you how to write it:</p>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Type in explain</th><th>Write it as</th><th>Example</th></tr></thead>
-    <tbody>
-      <tr><td><code>&lt;string&gt;</code></td><td>a value</td><td><code>image: nginx:1.27</code></td></tr>
-      <tr><td><code>&lt;integer&gt;</code> / <code>&lt;boolean&gt;</code></td><td>number / true or false (no quotes)</td><td><code>replicas: 3</code></td></tr>
-      <tr><td><code>&lt;Object&gt;</code> (e.g. <code>&lt;PodSpec&gt;</code>)</td><td>a nested block, indented 2 spaces</td><td><code>resources:</code> ↵ <code>  limits: ...</code></td></tr>
-      <tr><td><code>&lt;[]Object&gt;</code></td><td>a list: every item starts with <code>- </code></td><td><code>containers:</code> ↵ <code>  - name: web</code></td></tr>
-      <tr><td><code>&lt;map[string]string&gt;</code></td><td>free key: value pairs</td><td><code>labels:</code> ↵ <code>  tier: backend</code></td></tr>
-      <tr><td><code>&lt;IntOrString&gt;</code></td><td>number or name</td><td><code>port: 8000</code> or <code>port: http</code></td></tr>
-    </tbody>
-  </table></div>
-
-  <!-- ============================================================ -->
-  <h2>Step 4 · Validate before applying</h2>
-  <pre data-title="Check without changing anything"><code>kubectl apply -f deployment.yaml --dry-run=client   <span class="c"># YAML syntax + structure, local only</span>
-kubectl apply -f deployment.yaml --dry-run=server   <span class="c"># full validation by the API server, nothing saved</span></code></pre>
-  <p>Use <code>--dry-run=server</code>: it catches wrong field names, wrong types, wrong apiVersion, a missing namespace, and policy rejections.</p>
-
-  <!-- ============================================================ -->
-  <h2>Step 5 · Compare with what's running</h2>
-  <pre data-title="See the full object and the changes"><code>kubectl get deploy menu-api -n quickbite -o yaml   <span class="c"># the live object, incl. defaults you never wrote + status</span>
-kubectl diff -f deployment.yaml                     <span class="c"># exactly what apply would change</span>
-kubectl apply -f deployment.yaml                    <span class="c"># apply for real</span></code></pre>
-  <div class="callout tip"><span class="label">Learn defaults from the live object</span><p><code>-o yaml</code> shows every field Kubernetes filled in for you (<code>strategy</code>, <code>revisionHistoryLimit</code>, <code>terminationGracePeriodSeconds</code>, ...). This is the fastest way to discover options you didn't know existed.</p></div>
-
-  <!-- ============================================================ -->
-  <h2>The whole method on one screen</h2>
-  <pre data-title="Cheat sheet"><code>kubectl api-resources | grep -i &lt;thing&gt;                      <span class="c"># 1 apiVersion + kind</span>
-kubectl create &lt;thing&gt; ... --dry-run=client -o yaml > x.yaml  <span class="c"># 2 template</span>
-kubectl explain &lt;kind&gt;.spec.&lt;path&gt;                           <span class="c"># 3 where does it go?</span>
-kubectl apply -f x.yaml --dry-run=server                      <span class="c"># 4 validate</span>
-kubectl diff -f x.yaml &amp;&amp; kubectl apply -f x.yaml             <span class="c"># 5 compare, then apply</span></code></pre>
-
-  <!-- ============================================================ -->
-  <h2>YAML syntax rules that cause most errors</h2>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Rule</th><th>Wrong</th><th>Right</th></tr></thead>
-    <tbody>
-      <tr><td>Spaces only, never tabs; 2 per level</td><td>(tab) <code>name: x</code></td><td><code>  name: x</code></td></tr>
-      <tr><td>Space after the colon</td><td><code>replicas:3</code></td><td><code>replicas: 3</code></td></tr>
-      <tr><td>List items start with <code>- </code></td><td><code>containers:</code> ↵ <code>  name: web</code></td><td><code>containers:</code> ↵ <code>  - name: web</code></td></tr>
-      <tr><td>Quote values that look like numbers or booleans but must be strings</td><td><code>CACHE_TTL_SECONDS: 30</code> (in a ConfigMap)</td><td><code>CACHE_TTL_SECONDS: "30"</code></td></tr>
-      <tr><td>Several objects in one file: separate with <code>---</code></td><td>two objects with no separator</td><td><code>---</code> on its own line between them</td></tr>
-      <tr><td>Flow style is the same thing on one line</td><td></td><td><code>{ cpu: 50m, memory: 64Mi }</code> = block style</td></tr>
-    </tbody>
-  </table></div>
-
-  <h2>Common errors and what they mean</h2>
-  <div class="table-wrap"><table>
-    <thead><tr><th>Error</th><th>Cause</th></tr></thead>
-    <tbody>
-      <tr><td><code>no matches for kind "X" in version "Y"</code></td><td>Wrong apiVersion for that kind (Step 1)</td></tr>
-      <tr><td><code>unknown field "spec.template.spec.containers[0].readynessProbe"</code></td><td>Typo, or field at the wrong level (Step 3)</td></tr>
-      <tr><td><code>error converting YAML to JSON: yaml: line 12: mapping values are not allowed</code></td><td>Indentation or a missing space after <code>:</code></td></tr>
-      <tr><td><code>cannot unmarshal number into ... of type string</code></td><td>Unquoted number where a string is required</td></tr>
-      <tr><td><code>selector does not match template labels</code></td><td><code>spec.selector.matchLabels</code> ≠ <code>spec.template.metadata.labels</code></td></tr>
-      <tr><td><code>namespaces "quickbite" not found</code></td><td>Namespace not created yet</td></tr>
-      <tr><td><code>field is immutable</code></td><td>Some fields can't change after creation (e.g. a Deployment's selector): delete and recreate</td></tr>
-    </tbody>
-  </table></div>
-
-  <h2>Short names</h2>
-  <pre data-title="kubectl get &lt;short&gt;"><code>po pods · deploy deployments · rs replicasets · sts statefulsets · ds daemonsets
-svc services · ep endpoints · ing ingresses · cm configmaps · ns namespaces · no nodes
-pv persistentvolumes · pvc persistentvolumeclaims · sa serviceaccounts · cj cronjobs · hpa</code></pre>
-
-  <div class="pager"><a href="index.html">← Roadmap</a><a href="01-deploy-and-trace.html">Chapter 01 →</a></div>
+  <div class="callout note"><span class="label">Remember</span><p>ConfigMap values are plain text. A Secret's <code>stringData</code> is plain text, and its <code>data</code> must be base64 (<code>echo -n 'pw' | base64</code>). base64 is encoding, not encryption.</p></div>
 
   </article></main>
 </div>
