@@ -103,6 +103,40 @@ Pod DNS:     postgres-0.postgres.quickbite.svc.cluster.local   (6 parts, Statefu
   </table></div>
   <p>A and C are <b>name tags on objects</b>. B and D are <b>searches</b>. E is the <b>badge on pods</b> that B and D search for. Only E has to satisfy both searches.</p>
 
+  <h2>Labels vs annotations</h2>
+  <div class="callout note"><span class="label">Rule</span><p>If something will <b>search</b> by it, make it a <b>label</b>. If it's <b>information</b>, make it an <b>annotation</b>.</p></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>labels</th><th>annotations</th></tr></thead>
+    <tbody>
+      <tr><td>Selectors can use it</td><td>Yes</td><td>Never</td></tr>
+      <tr><td>Value size</td><td>Short (≤ 63 chars)</td><td>Large (even JSON)</td></tr>
+      <tr><td>Examples</td><td><code>app.kubernetes.io/name</code>, <code>tier</code></td><td><code>kubernetes.io/change-cause</code>, git commit, build URL</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Downward API</h2>
+  <p>Passes facts about the pod <b>into</b> the container (env var or file). The app can't ask Kubernetes; Kubernetes tells it.</p>
+  <pre data-title="fieldRef"><code>env:
+  - name: NODE_NAME
+    valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+<span class="c"># also: metadata.name · metadata.namespace · status.podIP · metadata.labels['x']</span>
+<span class="c"># resourceFieldRef: { resource: limits.memory }   → its own limit</span></code></pre>
+
+  <h2>Taints and tolerations</h2>
+  <p><b>Taint</b> = "keep out" sign on a <b>node</b>. <b>Toleration</b> = a pod's pass that ignores that sign. Pass ≠ invitation: a toleration allows the node, it doesn't force it.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Effect</th><th>New pods</th><th>Pods already running</th></tr></thead>
+    <tbody>
+      <tr><td><code>NoSchedule</code></td><td>Not placed (unless they tolerate it)</td><td>Stay</td></tr>
+      <tr><td><code>PreferNoSchedule</code></td><td>Avoided if possible</td><td>Stay</td></tr>
+      <tr><td><code>NoExecute</code></td><td>Not placed</td><td><b>Evicted</b> (unless tolerated, optionally for N seconds)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="commands"><code>kubectl describe node quickbite-control-plane | grep Taints
+<span class="c"># node-role.kubernetes.io/control-plane:NoSchedule</span>
+kubectl taint node &lt;node&gt; key=value:NoSchedule     <span class="c"># add</span>
+kubectl taint node &lt;node&gt; key=value:NoSchedule-    <span class="c"># remove (trailing -)</span></code></pre>
+
   <h2>Container: env, probes, resources</h2>
   <pre data-title="env: 3 sources"><code>env:
   - { name: X, value: "fixed" }
