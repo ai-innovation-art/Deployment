@@ -235,6 +235,17 @@ new pod never Ready     → rollout stops, old pods keep serving</code></pre>
     <li><code>httpGet</code>: 200–399 = pass. <code>port: http</code> and <code>targetPort: http</code> refer to the named containerPort.</li>
   </ul>
 
+  <h2>Init containers and command</h2>
+  <ul>
+    <li><code>initContainers:</code> run one by one, each must <b>exit 0</b>, then the main containers start. Retried on failure. Status: <code>Init:0/1</code> → <code>PodInitializing</code> → <code>Running</code>.</li>
+    <li>They run on <b>every</b> pod start (each replica, each restart), so their job must be safe to repeat (<code>CREATE TABLE IF NOT EXISTS</code>).</li>
+    <li>Replaces compose <code>depends_on: service_completed_successfully</code>. Kubernetes has no <code>depends_on</code>.</li>
+    <li><code>command</code> = Docker ENTRYPOINT · <code>args</code> = Docker CMD. Use them to run a different program from the same image.</li>
+    <li>The list decides <b>when</b> (<code>initContainers</code> vs <code>containers</code>); <code>command</code> decides <b>what</b>.</li>
+    <li>Each container has its own <code>image</code> and <code>env</code> (nothing is shared or inherited). The same image is pulled once per node and reused. Keep both tags in sync (Kustomize <code>images:</code> / Helm values).</li>
+    <li>Logs: <code>kubectl logs &lt;pod&gt; -c db-migrate</code>.</li>
+  </ul>
+
   <h2>Debugging</h2>
   <pre data-title="test from inside the cluster (ClusterIP is unreachable from outside)"><code>kubectl run tmp --rm -it --restart=Never --image=curlimages/curl -n quickbite --   sh -c 'curl -s menu-api:8000/menu'
 
