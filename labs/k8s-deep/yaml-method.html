@@ -61,6 +61,91 @@ kubectl create secret generic postgres-credentials -n quickbite \
   </table></div>
   <div class="callout note"><span class="label">Remember</span><p>ConfigMap values are plain text. A Secret's <code>stringData</code> is plain text, and its <code>data</code> must be base64 (<code>echo -n 'pw' | base64</code>). base64 is encoding, not encryption.</p></div>
 
+  <h2>Service and StatefulSet</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Service type</th><th>Gives you</th></tr></thead>
+    <tbody>
+      <tr><td><code>ClusterIP</code> (default)</td><td>One fixed virtual IP, inside the cluster only. Load-balances across pods</td></tr>
+      <tr><td><code>clusterIP: None</code> (headless)</td><td>No virtual IP. DNS returns the pod IPs directly</td></tr>
+      <tr><td><code>NodePort</code></td><td>ClusterIP + a port (30000–32767) open on every node</td></tr>
+      <tr><td><code>LoadBalancer</code></td><td>NodePort + a cloud load balancer</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="the two label matches"><code>StatefulSet  spec.selector.matchLabels ──must match──► spec.template.metadata.labels (pod labels)
+Service      spec.selector             ──must match──► the same pod labels
+
+Service DNS: postgres.quickbite.svc.cluster.local              (5 parts)
+Pod DNS:     postgres-0.postgres.quickbite.svc.cluster.local   (6 parts, StatefulSet + headless only)</code></pre>
+  <ul>
+    <li><code>serviceName</code> (StatefulSet) must name a headless Service. It gives each pod its DNS name.</li>
+    <li>Pods are named <code>&lt;name&gt;-0</code>, <code>-1</code>, <code>-2</code>, created in order. Each pod gets its own PVC, and keeps it when replaced.</li>
+    <li>Replicas are <b>separate databases</b>. Copying data between them is the database's job (an operator), not Kubernetes'.</li>
+    <li><code>clusterIP</code> and <code>selector</code> can't be changed later: delete and recreate.</li>
+    <li><code>metadata.labels</code> = tags on this object. <code>spec.selector</code> = a search for pods.</li>
+  </ul>
+  <div class="callout note"><span class="label">4-line summary</span><p>
+    1. Labels tag pods. Selectors find pods by those tags.<br>
+    2. If the StatefulSet/Deployment selector doesn't match the template labels, apply is <b>rejected</b> (loud error).<br>
+    3. If the Service selector doesn't match, the pod runs but has <b>0 endpoints</b> (silent error). Check <code>kubectl get endpointslices</code>.<br>
+    4. Headless means DNS returns the pod IP directly. With a StatefulSet, each pod gets <code>pod.service.ns.svc.cluster.local</code>.</p></div>
+
+  <h2>Container: env, probes, resources</h2>
+  <pre data-title="env: 3 sources"><code>env:
+  - { name: X, value: "fixed" }
+  - { name: X, valueFrom: { configMapKeyRef: { name: &lt;cm&gt;,     key: &lt;key&gt; } } }
+  - { name: X, valueFrom: { secretKeyRef:    { name: &lt;secret&gt;, key: &lt;key&gt; } } }
+  - { name: X, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }</code></pre>
+  <ul>
+    <li>The app decides the variable names. You only supply values. A wrong cm/secret name or key gives <code>CreateContainerConfigError</code>.</li>
+    <li><code>exec</code> has no shell. Use <code>sh -c "..."</code> when the command needs <code>$VAR</code>.</li>
+    <li><code>containerPort</code> is documentation, like <code>EXPOSE</code>. Name it so Services can use <code>targetPort: &lt;name&gt;</code>.</li>
+  </ul>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Probe</th><th>Fails →</th></tr></thead>
+    <tbody>
+      <tr><td>readiness</td><td>Removed from endpoints (no traffic). No restart</td></tr>
+      <tr><td>liveness</td><td>Container restarted. Keep it gentler than readiness (<code>initialDelaySeconds</code>)</td></tr>
+      <tr><td>startup</td><td>Holds the other two until the app has started</td></tr>
+    </tbody>
+  </table></div>
+  <p>Defaults: initialDelay 0 · period 10 · timeout 1 · failureThreshold 3. No liveness is fine. A crashed process is restarted anyway.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>requests</th><th>limits</th></tr></thead>
+    <tbody>
+      <tr><td>Used by</td><td>Scheduler (placement)</td><td>Kernel (runtime cap)</td></tr>
+      <tr><td>Over the limit</td><td>—</td><td>CPU throttled · memory <b>OOMKilled</b></td></tr>
+    </tbody>
+  </table></div>
+  <p><code>100m</code> = 0.1 core · <code>Mi/Gi</code> binary. QoS: Guaranteed (requests = limits) · Burstable · BestEffort (nothing set, evicted first).</p>
+
+  <h2>Storage</h2>
+  <pre data-title="PVC → PV ← StorageClass"><code>PVC           the request: "1Gi, RWO"     (namespaced)
+PV            the actual disk             (cluster-wide)
+StorageClass  how disks are made          (kind default: standard / local-path)
+
+volumeClaimTemplates name "data" + pod postgres-0  →  PVC data-postgres-0</code></pre>
+  <ul>
+    <li>Access modes: RWO (one node) · ROX · RWX (needs NFS) · RWOP (one pod).</li>
+    <li>Deleting a pod or StatefulSet keeps the PVC. Delete it yourself.</li>
+    <li>local-path disks live on one node, so the pod is pinned to that node.</li>
+    <li>Delete the pod → same name, same node, same disk, same data.</li>
+  </ul>
+
+  <h2>Deployment vs StatefulSet</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>Deployment</th><th>StatefulSet</th></tr></thead>
+    <tbody>
+      <tr><td>Pod names</td><td><code>redis-6b8c9d7f5-x2kqp</code> (random)</td><td><code>postgres-0</code> (fixed, ordered)</td></tr>
+      <tr><td>Disk</td><td>None, or shared</td><td>One PVC per pod</td></tr>
+      <tr><td>Extra fields</td><td><code>strategy</code>, <code>revisionHistoryLimit</code></td><td><code>serviceName</code>, <code>volumeClaimTemplates</code></td></tr>
+      <tr><td>Choose when</td><td>Losing the data is OK (cache, APIs)</td><td>Data must survive (databases)</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li>Service <code>port</code> = what clients dial · <code>targetPort</code> = where the container listens (defaults to port).</li>
+    <li><code>kubectl exec deploy/redis</code> picks a pod for you. <code>kubectl delete pod -l &lt;label&gt;</code> deletes by label.</li>
+  </ul>
+
   </article></main>
 </div>
 </body>
