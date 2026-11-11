@@ -58,6 +58,8 @@
   </table></div>
   <div class="callout note"><span class="label">Images are built once</span><p>Chapter 0 builds and pushes the images to Docker Hub one time. After that, no session ever rebuilds them; the cluster pulls <code>kumawatsunil/quickbite-*</code> directly.</p></div>
 
+  <div class="callout tip"><span class="label">Reference: keep open while writing manifests</span><p><a href="yaml-method.html"><b>How to write any Kubernetes YAML</b></a>: the 5-step method (api-resources → template → explain → dry-run → diff), syntax rules and common errors.</p></div>
+
   <h2>Roadmap</h2>
 
   <div class="chap"><div class="n">00</div><div><h3 style="margin-top:0"><a href="00-setup.html">Setup: Codespace, images, cluster, checkpoints</a></h3>
