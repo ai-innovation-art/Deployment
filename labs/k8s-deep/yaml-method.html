@@ -135,14 +135,55 @@ volumeClaimTemplates name "data" + pod postgres-0  →  PVC data-postgres-0</cod
   <div class="table-wrap"><table>
     <thead><tr><th></th><th>Deployment</th><th>StatefulSet</th></tr></thead>
     <tbody>
-      <tr><td>Pod names</td><td><code>redis-6b8c9d7f5-x2kqp</code> (random)</td><td><code>postgres-0</code> (fixed, ordered)</td></tr>
-      <tr><td>Disk</td><td>None, or shared</td><td>One PVC per pod</td></tr>
-      <tr><td>Extra fields</td><td><code>strategy</code>, <code>revisionHistoryLimit</code></td><td><code>serviceName</code>, <code>volumeClaimTemplates</code></td></tr>
-      <tr><td>Choose when</td><td>Losing the data is OK (cache, APIs)</td><td>Data must survive (databases)</td></tr>
+      <tr><td>Creates pods via</td><td>ReplicaSet (Deployment → RS → Pod)</td><td>Directly</td></tr>
+      <tr><td>Pod names</td><td><code>redis-6b8c9d7f5-x2kqp</code> (random, new on replace)</td><td><code>postgres-0</code>, <code>-1</code> (fixed, kept on replace)</td></tr>
+      <tr><td>Start / stop order</td><td>All at once</td><td>0 → 1 → 2, reverse on scale-down</td></tr>
+      <tr><td>Disk</td><td>None, or one shared claim</td><td>One PVC per pod (<code>volumeClaimTemplates</code>)</td></tr>
+      <tr><td>Per-pod DNS</td><td>No</td><td>Yes, needs a headless Service + <code>serviceName</code></td></tr>
+      <tr><td>Has (other lacks)</td><td><code>strategy</code>, <code>revisionHistoryLimit</code></td><td><code>serviceName</code>, <code>volumeClaimTemplates</code></td></tr>
+      <tr><td>Choose when</td><td>Losing the data is OK (cache, APIs, web)</td><td>Data must survive (databases)</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Postgres vs Redis (QuickBite)</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>Postgres</th><th>Redis</th></tr></thead>
+    <tbody>
+      <tr><td>Workload</td><td>StatefulSet</td><td>Deployment</td></tr>
+      <tr><td>Service</td><td>Headless (<code>clusterIP: None</code>)</td><td>Normal ClusterIP (virtual IP)</td></tr>
+      <tr><td>DNS name returns</td><td>The pod IP</td><td>The Service's virtual IP</td></tr>
+      <tr><td>Disk</td><td>PVC <code>data-postgres-0</code></td><td>None</td></tr>
+      <tr><td>Readiness</td><td><code>sh -c "pg_isready ..."</code> (needs <code>$VAR</code>)</td><td><code>redis-cli ping</code> (no shell)</td></tr>
+      <tr><td>Liveness</td><td>Yes, 20 s delay</td><td>None (a crash is restarted anyway)</td></tr>
+      <tr><td>Pod deleted →</td><td>Same name, same node, same data</td><td>New name, data lost</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Ports</h2>
+  <pre data-title="outside → inside"><code>laptop:8080 ──► hostPort 8080   kind extraPortMappings (only kind)
+           ──► nodePort 30080   open on EVERY node (Service type NodePort)
+           ──► port 80          Service port: what pods dial (web:80)
+           ──► targetPort 8080  container's port inside the pod
+               containerPort    documentation of that same port</code></pre>
+  <ul>
+    <li><code>targetPort</code> is NOT a host port. It's the port inside the pod. It defaults to <code>port</code> and can be a name.</li>
+  </ul>
+
+  <h2>Defaults you don't write</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Field</th><th>Default</th></tr></thead>
+    <tbody>
+      <tr><td>Service <code>type</code></td><td><code>ClusterIP</code></td></tr>
+      <tr><td><code>targetPort</code></td><td>Same as <code>port</code></td></tr>
+      <tr><td><code>replicas</code></td><td>1</td></tr>
+      <tr><td><code>restartPolicy</code> (pod)</td><td><code>Always</code>. Deployment/StatefulSet allow only Always; Jobs use OnFailure / Never</td></tr>
+      <tr><td><code>strategy</code> (Deployment)</td><td>RollingUpdate, maxSurge 25%, maxUnavailable 25%</td></tr>
+      <tr><td><code>revisionHistoryLimit</code></td><td>10</td></tr>
+      <tr><td><code>imagePullPolicy</code></td><td>IfNotPresent (Always for <code>:latest</code>)</td></tr>
+      <tr><td><code>storageClassName</code></td><td>The cluster default (kind: standard)</td></tr>
     </tbody>
   </table></div>
   <ul>
-    <li>Service <code>port</code> = what clients dial · <code>targetPort</code> = where the container listens (defaults to port).</li>
     <li><code>kubectl exec deploy/redis</code> picks a pod for you. <code>kubectl delete pod -l &lt;label&gt;</code> deletes by label.</li>
   </ul>
 
