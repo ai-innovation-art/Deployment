@@ -217,6 +217,43 @@ volumeClaimTemplates name "data" + pod postgres-0  →  PVC data-postgres-0</cod
     <li><code>targetPort</code> is NOT a host port. It's the port inside the pod. It defaults to <code>port</code> and can be a name.</li>
   </ul>
 
+  <h2>Deployment rollout settings</h2>
+  <pre data-title="replicas 3 · maxSurge 1 · maxUnavailable 0"><code>max pods during update  = replicas + maxSurge       = 4
+min Ready pods          = replicas - maxUnavailable = 3
+new pod never Ready     → rollout stops, old pods keep serving</code></pre>
+  <ul>
+    <li><code>RollingUpdate</code> = no downtime. <code>Recreate</code> = kill all, then start (use when old and new can't run together).</li>
+    <li><code>revisionHistoryLimit</code> = old ReplicaSets kept for <code>rollout undo</code>. 0 = no rollback.</li>
+    <li><code>kubernetes.io/change-cause</code> annotation = the CHANGE-CAUSE column in <code>rollout history</code>.</li>
+    <li><code>kubectl rollout status</code> changes nothing. It waits until all new pods are Ready (used in scripts/CI).</li>
+  </ul>
+
+  <h2>Probes: /health vs /ready</h2>
+  <ul>
+    <li>Liveness (<code>/health</code>): "is the process alive?" <b>Never check dependencies</b>, or a Redis outage restarts every pod (restart storm).</li>
+    <li>Readiness (<code>/ready</code>): "should I get traffic?" Fast (period 5, failureThreshold 2). Liveness slow (~30 s).</li>
+    <li><code>httpGet</code>: 200–399 = pass. <code>port: http</code> and <code>targetPort: http</code> refer to the named containerPort.</li>
+  </ul>
+
+  <h2>Debugging</h2>
+  <pre data-title="test from inside the cluster (ClusterIP is unreachable from outside)"><code>kubectl run tmp --rm -it --restart=Never --image=curlimages/curl -n quickbite --   sh -c 'curl -s menu-api:8000/menu'
+
+kubectl get nodes -o custom-columns=NODE:.metadata.name,POD-RANGE:.spec.podCIDR
+<span class="c"># each node owns a pod range: 10.244.1.x = worker2, 10.244.2.x = worker</span>
+kubectl wait --for=condition=Ready pod -l app.kubernetes.io/name=redis -n quickbite --timeout=60s</code></pre>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Pod status</th><th>Meaning → check</th></tr></thead>
+    <tbody>
+      <tr><td><code>Pending</code></td><td>No node fits → <code>describe</code> Events</td></tr>
+      <tr><td><code>ContainerCreating</code></td><td>Pulling image / mounting. Wait</td></tr>
+      <tr><td><code>ErrImagePull</code> / <code>ImagePullBackOff</code></td><td>Wrong image or tag</td></tr>
+      <tr><td><code>CreateContainerConfigError</code></td><td>Missing ConfigMap/Secret or key</td></tr>
+      <tr><td><code>Running 0/1</code></td><td>Readiness failing → <code>logs</code>, <code>describe</code></td></tr>
+      <tr><td><code>CrashLoopBackOff</code></td><td>App keeps crashing → <code>logs --previous</code></td></tr>
+      <tr><td><code>OOMKilled</code></td><td>Over memory limit → raise limit / fix leak</td></tr>
+    </tbody>
+  </table></div>
+
   <h2>Options and defaults</h2>
   <p>Highlighted = the default used when you leave the field out. <b>required</b> = apply fails without it. Check any field with <code>kubectl explain &lt;kind&gt;.&lt;path&gt;</code>; see what was filled in with <code>kubectl get &lt;obj&gt; -o yaml</code>.</p>
   <div class="table-wrap"><table>
