@@ -58,9 +58,7 @@
   </table></div>
   <div class="callout note"><span class="label">Images are built once</span><p>Chapter 0 builds and pushes the images to Docker Hub one time. After that, no session ever rebuilds them; the cluster pulls <code>kumawatsunil/quickbite-*</code> directly.</p></div>
 
-  <div class="callout tip"><span class="label">Reference: keep open while writing manifests</span><p><a href="01-deploy-and-trace-notes.html"><b>How to write any Kubernetes YAML</b></a>: the 5-step method (api-resources → template → explain → dry-run → diff), syntax rules and common errors.</p></div>
   <div class="callout tip"><span class="label">Revision</span><p><a href="revision.html"><b>Topics covered</b></a>: every topic per chapter in one line.</p></div>
-  <div class="callout tip"><span class="label">Reference: networking</span><p><a href="01-request-trace-notes.html"><b>Request trace: iptables and DNS</b></a>: one click followed through NodePort, kube-proxy rules, CoreDNS and pods, with the commands to prove each hop.</p></div>
 
   <h2>Roadmap</h2>
 
@@ -70,11 +68,11 @@
 
   <div class="chap"><div class="n">01</div><div><h3 style="margin-top:0"><a href="01-deploy-and-trace.html">Deploy QuickBite and trace everything</a></h3>
     <p>Deploy service by service in dependency order. Follow <code>kubectl apply</code> through the API server, etcd, controllers, scheduler and kubelet, then follow one browser click through NodePort, kube-proxy, DNS and three services.</p>
-    <span class="tag ok">ready</span><span class="tag">control plane</span><span class="tag">request path</span><span class="tag">self-healing</span></div></div>
+    <span class="tag ok">ready</span><a class="tag" href="01-deploy-and-trace-notes.html">notes: YAML &amp; objects</a><a class="tag" href="01-request-trace-notes.html">notes: request trace</a><span class="tag">control plane</span><span class="tag">request path</span><span class="tag">self-healing</span></div></div>
 
   <div class="chap"><div class="n">02</div><div><h3 style="margin-top:0"><a href="02-rollouts.html">Workloads and releases: ship 1.1, ship a broken 1.2, roll back</a></h3>
     <p>Pod → ReplicaSet → Deployment from the inside. Rolling update maths (maxSurge / maxUnavailable), watching two ReplicaSets trade pods, a rollout that never finishes, <code>rollout history / undo / pause / resume</code>, and change-cause.</p>
-    <span class="tag ok">ready</span><a class="tag" href="02-rollouts.html#notes">notes</a><span class="tag">rollout</span><span class="tag">rollback</span></div></div>
+    <span class="tag ok">ready</span><span class="tag">rollout</span><span class="tag">rollback</span></div></div>
 
   <div class="chap"><div class="n">03</div><div><h3 style="margin-top:0"><a href="03-scheduling.html">Scheduling: predict where every pod lands</a></h3>
     <p>Filter → score, requests vs capacity, nodeSelector, node affinity (required / preferred), pod affinity and anti-affinity, taints and tolerations (NoSchedule / NoExecute), topology spread, cordon / drain / uncordon, Pending pods and how to read why.</p>
