@@ -275,6 +275,24 @@ Service ──selector──► Pods                      (finds pods: DNS name 
     <li><code>kubectl kustomize &lt;dir&gt;</code> shows the combined YAML without applying.</li>
   </ul>
 
+  <h2>Self-healing</h2>
+  <pre data-title="who fixes what"><code>CONTAINER fails  → kubelet restarts it INSIDE the same pod     (same name, RESTARTS +1)
+POD disappears   → ReplicaSet creates a NEW pod                (new name, new IP)
+BAD RELEASE      → rollout stops; you roll back                (old pods keep serving)</code></pre>
+  <ul>
+    <li>Bad image → <code>ErrImagePull</code> ⇄ <code>ImagePullBackOff</code>, retried forever (back-off up to 5 min). Never auto-rolled back.</li>
+    <li>After <code>progressDeadlineSeconds</code> (default 600) the rollout is marked failed (<code>ProgressDeadlineExceeded</code>); <code>rollout status</code> exits with an error. Still no automatic undo.</li>
+    <li><code>maxUnavailable: 0</code> → old pods keep serving during a broken rollout.</li>
+    <li><code>rollout undo</code> scales the old ReplicaSet back up (same hash). Its revision gets a <b>new number</b>: 1 → 3. The old number disappears.</li>
+  </ul>
+  <pre data-title="commands"><code>kubectl set image deploy/menu-api menu-api=&lt;image:tag&gt; -n quickbite
+kubectl annotate deploy/menu-api kubernetes.io/change-cause="..." --overwrite
+kubectl rollout status  deploy/menu-api --timeout=60s
+kubectl rollout history deploy/menu-api
+kubectl rollout undo    deploy/menu-api                 <span class="c"># previous revision</span>
+kubectl rollout undo    deploy/menu-api --to-revision=N
+kubectl get rs -l app.kubernetes.io/name=menu-api       <span class="c"># old vs new ReplicaSet</span></code></pre>
+
   <h2>Debugging</h2>
   <pre data-title="test from inside the cluster (ClusterIP is unreachable from outside)"><code>kubectl run tmp --rm -it --restart=Never --image=curlimages/curl -n quickbite --   sh -c 'curl -s menu-api:8000/menu'
 
