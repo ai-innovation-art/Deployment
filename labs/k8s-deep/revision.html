@@ -24,6 +24,7 @@
   <main><article class="content">
 
   <h1>Revision: topics covered</h1>
+  <p>Notes: <a href="yaml-method.html">Ch 00–01 (YAML)</a> · <a href="request-trace.html">networking</a> · <a href="notes-02-rollouts.html">Ch 02</a></p>
 
   <h2>Chapter 00 · Setup</h2>
   <p class="t"><b>Docker Compose</b>depends_on conditions (started / healthy / completed), parallel start, profiles.</p>
@@ -80,6 +81,9 @@
   <p class="t"><b>Immutable fields</b>Selector, clusterIP → delete and recreate.</p>
   <p class="t"><b>Industry standard</b>YAML in git → PR → CI/CD or GitOps. Rollback = git revert. Immutable tags, never :latest.</p>
   <p class="t"><b>revisionHistoryLimit</b>Old RS = few KB, no pods. Keep 3–10, never 0.</p>
+  <p class="t"><b>Recreate downtime</b>All pods stop together (Completed = clean SIGTERM exit), new ones start together. Seen as empty responses.</p>
+  <p class="t"><b>rollout restart</b>restartedAt annotation in template → new RS, zero downtime. Use after ConfigMap/Secret change.</p>
+  <p class="t"><b>Drift</b>Live edits are overwritten by the next apply. apply manages only fields in the file.</p>
 
   </article></main>
 </div>

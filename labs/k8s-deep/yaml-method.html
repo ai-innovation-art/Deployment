@@ -275,62 +275,6 @@ Service ──selector──► Pods                      (finds pods: DNS name 
     <li><code>kubectl kustomize &lt;dir&gt;</code> shows the combined YAML without applying.</li>
   </ul>
 
-  <h2>What creates a new ReplicaSet</h2>
-  <div class="callout note"><span class="label">Rule</span><p>Change <b>anything inside <code>spec.template</code></b> (image, env, probes, resources, pod labels, annotations) → a <b>new ReplicaSet</b> + rolling update. The existing RS is never edited.<br>
-  Change anything <b>outside</b> the template (<code>replicas</code>, <code>strategy</code>, <code>minReadySeconds</code>, Deployment labels/annotations) → applied in place, no new RS, no new pods.<br>
-  Go back to an <b>old template</b> → its old RS is <b>reused</b> (same hash), and its revision gets a new number.</p></div>
-
-  <h2>Release strategies and practice</h2>
-  <div class="table-wrap"><table>
-    <thead><tr><th></th><th>RollingUpdate (default)</th><th>Recreate</th></tr></thead>
-    <tbody>
-      <tr><td>How</td><td>Add new / remove old a few at a time</td><td>Kill <b>all</b> old, then start all new</td></tr>
-      <tr><td>Downtime</td><td>None</td><td><b>Yes</b> (0 endpoints in between)</td></tr>
-      <tr><td>Old + new together</td><td>Yes, briefly: keep them compatible</td><td>Never</td></tr>
-      <tr><td>Pod ages after</td><td>Staggered</td><td>All identical</td></tr>
-      <tr><td>Use when</td><td>Normal apps</td><td>Incompatible schema, exclusive lock, single RWO disk</td></tr>
-    </tbody>
-  </table></div>
-  <pre data-title="switch strategy (rollingUpdate block must be removed)"><code>kubectl patch deploy/menu-api -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'</code></pre>
-  <ul>
-    <li><b>Inside the template</b> = WHAT one pod is → change replaces pods (new RS). <b>Outside</b> = HOW MANY and HOW to manage → applied in place (<code>replicas</code> just adds/removes pods in the current RS; that's why autoscaling is cheap).</li>
-    <li><code>rollout pause</code> → stack several template changes → <code>resume</code> = one RS, one rollout, one revision. <code>undo</code> is refused while paused.</li>
-    <li>Selector is immutable because it defines ownership. Changing it = delete and recreate the Deployment (brief downtime).</li>
-  </ul>
-  <div class="callout note"><span class="label">Industry standard</span><p>YAML in git is the source of truth: edit → pull request → review → CI/CD or GitOps (Argo CD / Flux) applies. Rollback = <code>git revert</code> to the previous image tag. Use immutable tags (<code>1.1</code>, git SHA), never <code>:latest</code>. <code>kubectl set image</code> / <code>rollout undo</code> are for learning and emergencies; fix git afterwards or the next apply undoes your fix (drift).</p></div>
-  <ul>
-    <li>Old ReplicaSets at 0 replicas cost only a few KB in etcd (no pods). Keep <code>revisionHistoryLimit</code> 3–10, never 0.</li>
-  </ul>
-
-  <h2>Self-healing</h2>
-  <pre data-title="who fixes what"><code>CONTAINER fails  → kubelet restarts it INSIDE the same pod     (same name, RESTARTS +1)
-POD disappears   → ReplicaSet creates a NEW pod                (new name, new IP)
-BAD RELEASE      → rollout stops; you roll back                (old pods keep serving)</code></pre>
-  <ul>
-    <li>Bad image → <code>ErrImagePull</code> ⇄ <code>ImagePullBackOff</code>, retried forever (back-off up to 5 min). Never auto-rolled back.</li>
-    <li>After <code>progressDeadlineSeconds</code> (default 600) the rollout is marked failed (<code>ProgressDeadlineExceeded</code>); <code>rollout status</code> exits with an error. Still no automatic undo.</li>
-    <li><code>maxUnavailable: 0</code> → old pods keep serving during a broken rollout.</li>
-    <li><code>rollout undo</code> scales the old ReplicaSet back up (same hash). Its revision gets a <b>new number</b>: 1 → 3. The old number disappears.</li>
-    <li>Rollback after a stuck rollout is near-instant: the old pods never stopped, only the broken pod is removed.</li>
-    <li>Two kinds of bad release: image missing → <code>ImagePullBackOff</code> · app broken → <code>Running 0/1</code> (readiness fails, liveness passes, RESTARTS 0). Both: users unaffected with <code>maxUnavailable: 0</code>.</li>
-    <li>Not-Ready pods <b>are listed</b> in the EndpointSlice with <code>ready=false</code>. kube-proxy sends traffic only to <code>ready=true</code>.</li>
-    <li>Without a readiness probe, a broken pod counts as Ready and the rollout replaces <b>all</b> good pods.</li>
-    <li>Update <code>change-cause</code> with every change. <code>undo</code> also restores the old annotation, so stale causes make the history lie.</li>
-  </ul>
-  <div class="callout warn"><span class="label">The undo trap</span><p><code>undo</code> = "go to the previous revision". After one undo, the previous revision <b>is the broken one</b>, so a second undo rolls forward into it.<br>
-  In an incident: <code>rollout history</code> → pick the number → <code>rollout undo --to-revision=N</code>. Never chain undos.</p></div>
-  <pre data-title="inspect revisions"><code>kubectl rollout history deploy/menu-api --revision=N            <span class="c"># template of one revision</span>
-diff &lt;(kubectl rollout history deploy/menu-api --revision=4)      &lt;(kubectl rollout history deploy/menu-api --revision=5)      <span class="c"># what differs</span>
-kubectl get deploy menu-api -o jsonpath='{.status.conditions[?(@.type=="Progressing")].reason}'
-<span class="c"># ReplicaSetUpdated → still trying · ProgressDeadlineExceeded → failed (600 s)</span></code></pre>
-  <pre data-title="commands"><code>kubectl set image deploy/menu-api menu-api=&lt;image:tag&gt; -n quickbite
-kubectl annotate deploy/menu-api kubernetes.io/change-cause="..." --overwrite
-kubectl rollout status  deploy/menu-api --timeout=60s
-kubectl rollout history deploy/menu-api
-kubectl rollout undo    deploy/menu-api                 <span class="c"># previous revision</span>
-kubectl rollout undo    deploy/menu-api --to-revision=N
-kubectl get rs -l app.kubernetes.io/name=menu-api       <span class="c"># old vs new ReplicaSet</span></code></pre>
-
   <h2>Debugging</h2>
   <pre data-title="test from inside the cluster (ClusterIP is unreachable from outside)"><code>kubectl run tmp --rm -it --restart=Never --image=curlimages/curl -n quickbite --   sh -c 'curl -s menu-api:8000/menu'
 
