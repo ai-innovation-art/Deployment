@@ -72,6 +72,7 @@ none left after FILTER → pod stays Pending, reason in Events</code></pre>
   <div class="callout note"><span class="label">Seen in the watch</span><p><code>Pending, NODE &lt;none&gt;</code> = waiting for the scheduler → <code>Pending, NODE worker</code> = bound (step 3 done) → <code>ContainerCreating</code> = kubelet's turn → <code>Running</code>.</p></div>
   <pre data-title="what the scheduler sees"><code>kubectl get nodes -o custom-columns=NODE:.metadata.name,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory
 kubectl describe node quickbite-worker | grep -A8 "Allocated resources"</code></pre>
+  <p>Free for new pods = <b>allocatable − requested</b> (e.g. 2000m − 390m = 1610m). Limits may exceed 100% (overcommit); requests can't.</p>
   <div class="callout warn"><span class="label">kind caveat</span><p>Every kind node reports the <b>whole Codespace</b> (2 CPU) as its own. The cluster looks like 6 CPU but really shares 2. Scheduling maths still works; real performance doesn't.</p></div>
 
   <details class="q"><summary>Predict: with 3 replicas, how will the demo pods spread over worker and worker2?</summary><div class="a">
