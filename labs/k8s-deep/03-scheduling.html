@@ -104,6 +104,7 @@ kubectl get nodes -L disk                       <span class="c"># -L shows a lab
   <details class="q"><summary>Predict: where do the 3 pods go? Then change it to <code>disk: nvme</code>. What happens?</summary><div class="a">
     <p><code>disk: ssd</code> → all 3 on worker2. <code>disk: nvme</code> → no node matches → new pods <b>Pending</b> (<code>didn't match Pod's node affinity/selector</code>), old pods keep running because of maxUnavailable.</p>
   </div></details>
+  <div class="callout note"><span class="label">Seen</span><p>"3 Preemption is not helpful": evicting pods can't create a missing label. <code>nodeSelector</code> and <code>containers</code> are siblings under <code>template.spec</code>.</p></div>
   <p>Remove the <code>nodeSelector</code> block and apply.</p>
 
   <!-- ============================================================ -->
