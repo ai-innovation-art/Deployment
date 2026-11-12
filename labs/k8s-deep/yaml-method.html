@@ -280,6 +280,28 @@ Service ──selector──► Pods                      (finds pods: DNS name 
   Change anything <b>outside</b> the template (<code>replicas</code>, <code>strategy</code>, <code>minReadySeconds</code>, Deployment labels/annotations) → applied in place, no new RS, no new pods.<br>
   Go back to an <b>old template</b> → its old RS is <b>reused</b> (same hash), and its revision gets a new number.</p></div>
 
+  <h2>Release strategies and practice</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>RollingUpdate (default)</th><th>Recreate</th></tr></thead>
+    <tbody>
+      <tr><td>How</td><td>Add new / remove old a few at a time</td><td>Kill <b>all</b> old, then start all new</td></tr>
+      <tr><td>Downtime</td><td>None</td><td><b>Yes</b> (0 endpoints in between)</td></tr>
+      <tr><td>Old + new together</td><td>Yes, briefly: keep them compatible</td><td>Never</td></tr>
+      <tr><td>Pod ages after</td><td>Staggered</td><td>All identical</td></tr>
+      <tr><td>Use when</td><td>Normal apps</td><td>Incompatible schema, exclusive lock, single RWO disk</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="switch strategy (rollingUpdate block must be removed)"><code>kubectl patch deploy/menu-api -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'</code></pre>
+  <ul>
+    <li><b>Inside the template</b> = WHAT one pod is → change replaces pods (new RS). <b>Outside</b> = HOW MANY and HOW to manage → applied in place (<code>replicas</code> just adds/removes pods in the current RS; that's why autoscaling is cheap).</li>
+    <li><code>rollout pause</code> → stack several template changes → <code>resume</code> = one RS, one rollout, one revision. <code>undo</code> is refused while paused.</li>
+    <li>Selector is immutable because it defines ownership. Changing it = delete and recreate the Deployment (brief downtime).</li>
+  </ul>
+  <div class="callout note"><span class="label">Industry standard</span><p>YAML in git is the source of truth: edit → pull request → review → CI/CD or GitOps (Argo CD / Flux) applies. Rollback = <code>git revert</code> to the previous image tag. Use immutable tags (<code>1.1</code>, git SHA), never <code>:latest</code>. <code>kubectl set image</code> / <code>rollout undo</code> are for learning and emergencies; fix git afterwards or the next apply undoes your fix (drift).</p></div>
+  <ul>
+    <li>Old ReplicaSets at 0 replicas cost only a few KB in etcd (no pods). Keep <code>revisionHistoryLimit</code> 3–10, never 0.</li>
+  </ul>
+
   <h2>Self-healing</h2>
   <pre data-title="who fixes what"><code>CONTAINER fails  → kubelet restarts it INSIDE the same pod     (same name, RESTARTS +1)
 POD disappears   → ReplicaSet creates a NEW pod                (new name, new IP)
