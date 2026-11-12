@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revision · K8s Deep Dive</title>
+<link rel="stylesheet" href="../../notes-animated/assets/style.css">
+<script src="../../notes-animated/assets/notes.js"></script>
+<style>
+  .t { margin: 0 0 10px; }
+  .t b { display:block; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../../index.html">DevOps Lab</a>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Revision</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+  <h1>Revision: topics covered</h1>
+
+  <h2>Chapter 00 · Setup</h2>
+  <p class="t"><b>Docker Compose</b>depends_on conditions (started / healthy / completed), parallel start, profiles.</p>
+  <p class="t"><b>Volumes</b>Named, bind, anonymous, tmpfs.</p>
+  <p class="t"><b>Dockerfile</b>Multi-stage, layer cache (COPY onward rebuilds), ARG vs ENV, non-root user, exec-form CMD (PID 1 gets SIGTERM), <code>--host 0.0.0.0</code>.</p>
+  <p class="t"><b>Registry</b>Registry / repository / tag / digest. Push with an access token. Build once, cluster pulls.</p>
+  <p class="t"><b>kind</b>Kubernetes in Docker: each node is a container. 1 control plane + 2 workers. kubectl within ±1 minor of the cluster.</p>
+  <p class="t"><b>Inside a node</b>containerd, crictl, static pods in <code>/etc/kubernetes/manifests</code>, DaemonSets (kube-proxy, kindnet).</p>
+  <p class="t"><b>YAML method</b>api-resources → generate template → explain → dry-run=server → diff/apply.</p>
+  <p class="t"><b>Object skeleton</b>apiVersion, kind, metadata, spec, status. Exceptions: ConfigMap/Secret use data.</p>
+
+  <h2>Chapter 01 · Deploy and trace</h2>
+  <p class="t"><b>Namespace</b>Logical folder: names, permissions, quotas. Not network isolation.</p>
+  <p class="t"><b>ConfigMap</b>Plain settings, values are strings. Change ≠ pod restart.</p>
+  <p class="t"><b>Secret</b>stringData plain → stored base64. Encoding, not encryption. Types: generic, tls, docker-registry.</p>
+  <p class="t"><b>Labels and selectors</b>5 places: tags on objects (A, C), searches (B, D), badge on pods (E). D≠E rejected, B≠E silent.</p>
+  <p class="t"><b>Labels vs annotations</b>Search by it → label. Information → annotation.</p>
+  <p class="t"><b>Service types</b>ClusterIP · headless (None) · NodePort · LoadBalancer. Needed only if something connects in.</p>
+  <p class="t"><b>port / targetPort / nodePort</b>Service port · container port (can be a name) · port on every node (30000–32767).</p>
+  <p class="t"><b>StatefulSet</b>Fixed name + own disk, ordered start. Not a fixed IP. Needs headless Service + serviceName.</p>
+  <p class="t"><b>Deployment</b>Random names via ReplicaSet. Stateless apps.</p>
+  <p class="t"><b>Storage</b>PVC (request) → PV (disk) ← StorageClass. RWO/ROX/RWX/RWOP. PVC survives pod delete.</p>
+  <p class="t"><b>env</b>value · configMapKeyRef · secretKeyRef · fieldRef (Downward API).</p>
+  <p class="t"><b>Downward API</b>Pod facts (node, IP, name) passed into the container.</p>
+  <p class="t"><b>Probes</b>Readiness = traffic, liveness = restart, startup = slow start. Liveness never checks dependencies.</p>
+  <p class="t"><b>Resources</b>Requests = scheduler, limits = runtime cap. Memory over → OOMKilled. QoS: Guaranteed / Burstable / BestEffort.</p>
+  <p class="t"><b>Taints and tolerations</b>NoSchedule / PreferNoSchedule / NoExecute. Control plane tainted. Toleration = pass, not invitation.</p>
+  <p class="t"><b>Init containers</b>Run first, must exit 0, run on every pod start → idempotent.</p>
+  <p class="t"><b>command / args</b>= Docker ENTRYPOINT / CMD.</p>
+  <p class="t"><b>Job and CronJob</b>Run to completion. Cron + timeZone, concurrencyPolicy, backoffLimit, ttl. restartPolicy Never / OnFailure.</p>
+  <p class="t"><b>Kustomize</b><code>apply -k</code> applies all listed files. Safe to repeat.</p>
+  <p class="t"><b>Defaults</b>Fields you don't write get defaults; see them with <code>-o yaml</code>.</p>
+  <p class="t"><b>Request trace</b>Host port → nodePort → iptables (KUBE-SVC → KUBE-SEP → DNAT) → pod. No proxy in the path.</p>
+  <p class="t"><b>iptables load balancing</b>Random probability rules: 3 pods = 0.333 → 0.5 → rest.</p>
+  <p class="t"><b>DNS</b>CoreDNS 10.96.0.10, search list makes short names work. Normal → ClusterIP, headless → pod IP.</p>
+  <p class="t"><b>IP ranges</b>10.96.x.x Services · 10.244.N.x pods (one range per node).</p>
+  <p class="t"><b>Debugging</b>Throwaway curl pod inside the cluster. Pod status → cause table. <code>kubectl wait</code>.</p>
+  <p class="t"><b>Self-healing</b>Container fails → kubelet restarts in same pod. Pod gone → ReplicaSet makes a new one. Bad release → rollback.</p>
+
+  <h2>Chapter 02 · Rollouts</h2>
+  <p class="t"><b>Deployment → ReplicaSet → Pod</b>pod-template-hash = template fingerprint. Deployment only scales ReplicaSets.</p>
+  <p class="t"><b>What triggers a rollout</b>Change inside template → new RS. Outside (replicas, strategy) → in place. Old template → old RS reused.</p>
+  <p class="t"><b>Rolling update maths</b>max = replicas + maxSurge, min = replicas − maxUnavailable. Surge rounds up, unavailable down.</p>
+  <p class="t"><b>minReadySeconds</b>Ready for N s before counted available. Slows rollouts.</p>
+  <p class="t"><b>Ship a release</b>set image + change-cause. Old and new serve together briefly → keep compatible.</p>
+  <p class="t"><b>Broken release</b>Missing image → ImagePullBackOff. Broken app → Running 0/1. Both: users safe with maxUnavailable 0.</p>
+  <p class="t"><b>EndpointSlice ready flag</b>Not-Ready pods listed with ready=false, get no traffic.</p>
+  <p class="t"><b>progressDeadlineSeconds</b>600 s → ProgressDeadlineExceeded. Never auto-rollback.</p>
+  <p class="t"><b>Rollback</b>undo reuses old RS, near-instant. Revision renumbered.</p>
+  <p class="t"><b>Undo trap</b>Second undo returns to the broken one. Use <code>--to-revision=N</code>.</p>
+  <p class="t"><b>Revision history</b><code>--revision=N</code>, diff two revisions. change-cause can lie → git is the real history.</p>
+  <p class="t"><b>Pause / resume</b>Stack changes → one RS, one rollout. undo refused while paused.</p>
+  <p class="t"><b>Recreate</b>Kill all, then start all. Downtime. Use when old and new can't coexist.</p>
+  <p class="t"><b>Immutable fields</b>Selector, clusterIP → delete and recreate.</p>
+  <p class="t"><b>Industry standard</b>YAML in git → PR → CI/CD or GitOps. Rollback = git revert. Immutable tags, never :latest.</p>
+  <p class="t"><b>revisionHistoryLimit</b>Old RS = few KB, no pods. Keep 3–10, never 0.</p>
+
+  </article></main>
+</div>
+</body>
+</html>
