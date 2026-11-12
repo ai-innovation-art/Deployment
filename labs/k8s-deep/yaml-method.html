@@ -275,6 +275,11 @@ Service ──selector──► Pods                      (finds pods: DNS name 
     <li><code>kubectl kustomize &lt;dir&gt;</code> shows the combined YAML without applying.</li>
   </ul>
 
+  <h2>What creates a new ReplicaSet</h2>
+  <div class="callout note"><span class="label">Rule</span><p>Change <b>anything inside <code>spec.template</code></b> (image, env, probes, resources, pod labels, annotations) → a <b>new ReplicaSet</b> + rolling update. The existing RS is never edited.<br>
+  Change anything <b>outside</b> the template (<code>replicas</code>, <code>strategy</code>, <code>minReadySeconds</code>, Deployment labels/annotations) → applied in place, no new RS, no new pods.<br>
+  Go back to an <b>old template</b> → its old RS is <b>reused</b> (same hash), and its revision gets a new number.</p></div>
+
   <h2>Self-healing</h2>
   <pre data-title="who fixes what"><code>CONTAINER fails  → kubelet restarts it INSIDE the same pod     (same name, RESTARTS +1)
 POD disappears   → ReplicaSet creates a NEW pod                (new name, new IP)
