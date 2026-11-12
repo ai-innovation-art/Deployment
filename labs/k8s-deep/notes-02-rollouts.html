@@ -85,6 +85,10 @@ kubectl get rs -l app.kubernetes.io/name=menu-api       <span class="c"># old vs
   </ul>
 
   <h2>Drift: live changes vs the YAML</h2>
+  <div class="callout warn"><span class="label">Drift: the two rules</span><p>
+  1. Live change to a field <b>in the file</b> → <b>overwritten</b> by the next <code>apply</code>.<br>
+  2. Live change to a field <b>not in the file</b> → <b>silently stays</b>, and nobody knows it's there.<br>
+  Fix: change git, not the cluster. GitOps tools (Argo CD) detect and report both.</p></div>
   <pre data-title="commands"><code>kubectl diff -f k8s/base/30-menu-api.yaml     <span class="c"># live vs file</span>
 kubectl apply -f k8s/base/30-menu-api.yaml    <span class="c"># back to the file</span></code></pre>
   <ul>

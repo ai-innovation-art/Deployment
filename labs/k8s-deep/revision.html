@@ -83,7 +83,7 @@
   <p class="t"><b>revisionHistoryLimit</b>Old RS = few KB, no pods. Keep 3–10, never 0.</p>
   <p class="t"><b>Recreate downtime</b>All pods stop together (Completed = clean SIGTERM exit), new ones start together. Seen as empty responses.</p>
   <p class="t"><b>rollout restart</b>restartedAt annotation in template → new RS, zero downtime. Use after ConfigMap/Secret change.</p>
-  <p class="t"><b>Drift</b>Live edits are overwritten by the next apply. apply manages only fields in the file.</p>
+  <p class="t"><b>Drift</b>Live change to a field in the file → overwritten by next apply. Field not in the file → silently stays. Change git, not the cluster.</p>
 
   </article></main>
 </div>
