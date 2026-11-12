@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ch 02 Notes · K8s Deep Dive</title>
+<title>Rollouts Notes · K8s Deep Dive</title>
 <link rel="stylesheet" href="../../notes-animated/assets/style.css">
 <script src="../../notes-animated/assets/notes.js"></script>
 </head>
 <body>
 <div class="topbar">
   <a class="brand" href="../../index.html">DevOps Lab</a>
-  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Notes · Chapter 02</span>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Notes · Rollouts</span>
   <span class="spacer"></span>
   <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
 </div>
@@ -19,7 +19,7 @@
   <nav class="toc"><h4>On this page</h4><ol></ol></nav>
   <main><article class="content">
 
-  <h1>Chapter 02 notes: rollouts</h1>
+  <h1>Rollouts</h1>
 
   <h2>What creates a new ReplicaSet</h2>
   <div class="callout note"><span class="label">Rule</span><p>Change <b>anything inside <code>spec.template</code></b> (image, env, probes, resources, pod labels, annotations) → a <b>new ReplicaSet</b> + rolling update. The existing RS is never edited.<br>

@@ -74,10 +74,11 @@
 
   <div class="chap"><div class="n">02</div><div><h3 style="margin-top:0"><a href="02-rollouts.html">Workloads and releases: ship 1.1, ship a broken 1.2, roll back</a></h3>
     <p>Pod → ReplicaSet → Deployment from the inside. Rolling update maths (maxSurge / maxUnavailable), watching two ReplicaSets trade pods, a rollout that never finishes, <code>rollout history / undo / pause / resume</code>, and change-cause.</p>
-    <span class="tag ok">ready</span><a class="tag" href="notes-02-rollouts.html">notes</a><span class="tag">rollout</span><span class="tag">rollback</span></div></div>
+    <span class="tag ok">ready</span><a class="tag" href="notes-rollouts.html">notes</a><span class="tag">rollout</span><span class="tag">rollback</span></div></div>
 
-  <div class="chap todo"><div class="n">03</div><div><h3 style="margin-top:0">Scheduling: predict where every pod lands</h3>
-    <p>Filter → score, requests vs capacity, nodeSelector, node affinity (required / preferred), pod affinity and anti-affinity, taints and tolerations (NoSchedule / NoExecute), topology spread, cordon / drain / uncordon, Pending pods and how to read why.</p></div></div>
+  <div class="chap"><div class="n">03</div><div><h3 style="margin-top:0"><a href="03-scheduling.html">Scheduling: predict where every pod lands</a></h3>
+    <p>Filter → score, requests vs capacity, nodeSelector, node affinity (required / preferred), pod affinity and anti-affinity, taints and tolerations (NoSchedule / NoExecute), topology spread, cordon / drain / uncordon, Pending pods and how to read why.</p>
+    <span class="tag ok">ready</span><span class="tag">scheduler</span><span class="tag">affinity</span><span class="tag">drain</span></div></div>
 
   <div class="chap todo"><div class="n">04</div><div><h3 style="margin-top:0">Health and resources: probes, QoS, OOMKill, eviction</h3>
     <p>Liveness vs readiness vs startup on QuickBite services, what happens when Postgres dies, CPU throttling vs memory kill, Guaranteed / Burstable / BestEffort, LimitRange and ResourceQuota.</p></div></div>

@@ -214,7 +214,7 @@ kq patch deploy/menu-api -p '{"spec":{"minReadySeconds":0}}'</code></pre>
   <details class="q"><summary>4. You changed a ConfigMap value. Why didn't the pods pick it up, and what's the fix?</summary><div class="a"><p>Env vars are read once at container start, and a ConfigMap is outside the pod template, so no rollout happened. Run <code>kubectl rollout restart</code>.</p></div></details>
   <details class="q"><summary>5. <code>revisionHistoryLimit: 0</code>. What breaks?</summary><div class="a"><p>Old ReplicaSets are deleted right away, so <code>rollout undo</code> has nothing to go back to.</p></div></details>
 
-  <div class="pager"><a href="01-deploy-and-trace.html">← Chapter 01: Deploy and trace</a><a href="index.html">Roadmap →</a></div>
+  <div class="pager"><a href="01-deploy-and-trace.html">← Chapter 01: Deploy and trace</a><a href="03-scheduling.html">Chapter 03: Scheduling →</a></div>
 
   </article></main>
 </div>

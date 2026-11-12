@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 03 · Scheduling · K8s Deep Dive</title>
+<link rel="stylesheet" href="../../notes-animated/assets/style.css">
+<script src="../../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../../index.html">DevOps Lab</a>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Chapter 03 · Scheduling</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+  <h1>Chapter 03 · Scheduling: predict where every pod lands</h1>
+  <p class="lede">The scheduler decides which node runs each pod. By the end you'll predict placement before applying, steer pods with labels, affinity, taints and spread rules, empty a node for maintenance, and read any <code>Pending</code> message.</p>
+  <div class="meta">
+    <span class="pill accent">Checkpoint at start: <code>make resume</code></span>
+    <span class="pill">Experiments run in a scratch namespace <code>sched</code></span>
+    <span class="pill">≈ 2 h</span>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>3.0 Setup</h2>
+  <p>QuickBite stays untouched. We experiment with a small nginx Deployment in its own namespace, and you'll <b>edit its YAML</b> in every section.</p>
+  <pre data-title="Terminal 1"><code>cd /workspaces/Deployment/labs/quickbite && make resume
+kubectl create namespace sched
+mkdir -p ~/sched && cd ~/sched
+cat &gt; demo.yaml &lt;&lt;'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo
+  namespace: sched
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: demo }
+  template:
+    metadata:
+      labels: { app: demo }
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27-alpine
+          resources:
+            requests: { cpu: 50m, memory: 16Mi }
+EOF
+kubectl apply -f demo.yaml</code></pre>
+  <pre data-title="Terminal 2: where does each pod land?"><code>kubectl get pods -n sched -o wide -w</code></pre>
+
+  <!-- ============================================================ -->
+  <h2>3.1 How the scheduler decides</h2>
+  <pre data-title="for every new pod with no node yet"><code>1. FILTER   remove nodes that CAN'T run it
+            not enough free requests · taint not tolerated · nodeSelector/affinity mismatch
+            · volume on another node · port conflict
+2. SCORE    rank the nodes that are left (0–100 per plugin)
+            least allocated · spread pods of the same app · image already present · preferred affinity
+3. BIND     write spec.nodeName = winner  →  that node's kubelet starts the pod
+none left after FILTER → pod stays Pending, reason in Events</code></pre>
+  <ul>
+    <li>The scheduler only looks at <b>requests</b>, never actual usage. A node at 5% real CPU can still be "full".</li>
+    <li>Placement happens <b>once</b>. A running pod is never moved by the scheduler; it's replaced (delete, drain, eviction).</li>
+  </ul>
+  <pre data-title="what the scheduler sees"><code>kubectl get nodes -o custom-columns=NODE:.metadata.name,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory
+kubectl describe node quickbite-worker | grep -A8 "Allocated resources"</code></pre>
+  <div class="callout warn"><span class="label">kind caveat</span><p>Every kind node reports the <b>whole Codespace</b> (2 CPU) as its own. The cluster looks like 6 CPU but really shares 2. Scheduling maths still works; real performance doesn't.</p></div>
+
+  <details class="q"><summary>Predict: with 3 replicas, how will the demo pods spread over worker and worker2?</summary><div class="a">
+    <p>2 + 1 (or 1 + 2), none on the control plane. The control plane is filtered out by its taint, and the default spread scoring prefers putting pods of the same Deployment on different nodes.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>3.2 Requests vs capacity: make a pod Pending</h2>
+  <p>Edit <code>demo.yaml</code>: change the request to <code>cpu: 1500m</code>, then apply.</p>
+  <pre data-title="Terminal 1"><code>kubectl apply -f demo.yaml
+kubectl get pods -n sched -o wide
+kubectl describe pod -n sched $(kubectl get pod -n sched --field-selector=status.phase=Pending -o name | head -1) | tail -5</code></pre>
+  <details class="q"><summary>Predict: how many pods run, how many are Pending, and what does the message say?</summary><div class="a">
+    <p>Each worker has 2 CPU minus what QuickBite already requests, so <b>one 1500m pod fits per worker</b>. With maxSurge the rollout tries a 3rd/4th: those stay <b>Pending</b>.</p>
+    <pre><code><span class="o">Warning  FailedScheduling  0/3 nodes are available: 1 node(s) had untolerated taint
+{node-role.kubernetes.io/control-plane: }, 2 Insufficient cpu. preemption: ...</span></code></pre>
+    <p>Read it as a list of reasons, one per node: 1 node rejected for its taint, 2 for CPU.</p>
+  </div></details>
+  <p>Set the request back to <code>50m</code> and apply.</p>
+
+  <!-- ============================================================ -->
+  <h2>3.3 nodeSelector: "only nodes with this label"</h2>
+  <pre data-title="Terminal 1: label a node"><code>kubectl label node quickbite-worker2 disk=ssd
+kubectl get nodes -L disk                       <span class="c"># -L shows a label as a column</span></code></pre>
+  <p>Add to <code>demo.yaml</code> under <code>template.spec</code>, then apply:</p>
+  <pre data-title="demo.yaml"><code>      nodeSelector:
+        disk: ssd</code></pre>
+  <details class="q"><summary>Predict: where do the 3 pods go? Then change it to <code>disk: nvme</code>. What happens?</summary><div class="a">
+    <p><code>disk: ssd</code> → all 3 on worker2. <code>disk: nvme</code> → no node matches → new pods <b>Pending</b> (<code>didn't match Pod's node affinity/selector</code>), old pods keep running because of maxUnavailable.</p>
+  </div></details>
+  <p>Remove the <code>nodeSelector</code> block and apply.</p>
+
+  <!-- ============================================================ -->
+  <h2>3.4 Node affinity: richer rules</h2>
+  <pre data-title="demo.yaml: replace nodeSelector with"><code>      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:     <span class="c"># hard rule (filter)</span>
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: kubernetes.io/os, operator: In, values: [linux] }
+          preferredDuringSchedulingIgnoredDuringExecution:    <span class="c"># soft rule (score)</span>
+            - weight: 80
+              preference:
+                matchExpressions:
+                  - { key: disk, operator: In, values: [ssd] }</code></pre>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Part</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>required...</code></td><td>Must match, else Pending (like nodeSelector)</td></tr>
+      <tr><td><code>preferred...</code> + <code>weight</code> 1–100</td><td>Try to match; adds score, never blocks</td></tr>
+      <tr><td><code>IgnoredDuringExecution</code></td><td>Remove the label later → running pods stay</td></tr>
+      <tr><td>operators</td><td><code>In</code> · <code>NotIn</code> · <code>Exists</code> · <code>DoesNotExist</code> · <code>Gt</code> · <code>Lt</code></td></tr>
+      <tr><td>several <code>nodeSelectorTerms</code></td><td>OR. Several expressions inside one term: AND</td></tr>
+    </tbody>
+  </table></div>
+  <details class="q"><summary>Predict: where do the pods go now? Then <code>kubectl label node quickbite-worker2 disk-</code>. Do they move?</summary><div class="a">
+    <p>Mostly worker2 (preferred weight 80), but not guaranteed: spread scoring may still put one on worker. Removing the label <b>doesn't move anything</b> (IgnoredDuringExecution). Only new pods see the change.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>3.5 Pod affinity and anti-affinity: placement relative to other pods</h2>
+  <p>Node affinity looks at <b>node labels</b>. Pod (anti-)affinity looks at <b>which pods are already on a node</b>.</p>
+  <pre data-title="demo.yaml: replace affinity with (one pod per node, hard)"><code>      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: { app: demo }
+              topologyKey: kubernetes.io/hostname    <span class="c"># "same node" = same hostname label</span></code></pre>
+  <details class="q"><summary>Predict: 3 replicas, 2 schedulable nodes. Result?</summary><div class="a">
+    <p>2 Running (one per worker), <b>1 Pending</b>: <code>didn't match pod anti-affinity rules</code>. Switch to <code>preferredDuringScheduling...</code> (with <code>weight</code> + <code>podAffinityTerm</code>) and all 3 run, spread as well as possible.</p>
+  </div></details>
+  <ul>
+    <li><code>topologyKey</code> = what counts as "the same place": <code>kubernetes.io/hostname</code> (node), <code>topology.kubernetes.io/zone</code> (zone).</li>
+    <li><code>podAffinity</code> = "put me <b>near</b> pods with label X" (e.g. notifier next to redis, less network).</li>
+    <li>Use anti-affinity so replicas don't share a node: one node dying shouldn't take all copies.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2>3.6 Taints and tolerations in practice</h2>
+  <pre data-title="Terminal 1"><code>kubectl taint node quickbite-worker2 team=payments:NoSchedule
+kubectl rollout restart deploy/demo -n sched
+kubectl get pods -n sched -o wide</code></pre>
+  <details class="q"><summary>Predict: where do the restarted pods go? What about QuickBite pods already on worker2?</summary><div class="a">
+    <p>All new demo pods go to worker (worker2 filtered out). QuickBite pods already on worker2 <b>stay</b>: NoSchedule only affects new placement.</p>
+  </div></details>
+  <p>Add a toleration to <code>demo.yaml</code> and apply:</p>
+  <pre data-title="demo.yaml"><code>      tolerations:
+        - { key: team, operator: Equal, value: payments, effect: NoSchedule }</code></pre>
+  <details class="q"><summary>Predict: do the pods now go to worker2?</summary><div class="a">
+    <p>They <b>may</b>. A toleration only removes the block; it doesn't attract. To dedicate a node to a team: taint it <b>and</b> give the team's pods a toleration <b>plus</b> node affinity.</p>
+  </div></details>
+  <pre data-title="NoExecute: evict running pods"><code>kubectl taint node quickbite-worker2 team=payments:NoSchedule-     <span class="c"># remove</span>
+kubectl taint node quickbite-worker2 maintenance=true:NoExecute
+kubectl get pods -A -o wide | grep worker2                          <span class="c"># what's left?</span>
+kubectl taint node quickbite-worker2 maintenance=true:NoExecute-</code></pre>
+  <details class="q"><summary>Predict: which pods survive the NoExecute taint?</summary><div class="a">
+    <p>Only pods that tolerate everything: DaemonSet pods (kube-proxy, kindnet). Deployment pods are evicted and recreated on worker. <b>postgres-0 is evicted too and stays Pending</b>: its disk lives on worker2 (<code>volume node affinity conflict</code>). It comes back once the taint is removed. <code>tolerationSeconds</code> lets a pod stay N seconds before eviction.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>3.7 Topology spread constraints</h2>
+  <pre data-title="demo.yaml: replace affinity with (set replicas: 4)"><code>      topologySpreadConstraints:
+        - maxSkew: 1                               <span class="c"># max difference between nodes</span>
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule         <span class="c"># or ScheduleAnyway (soft)</span>
+          labelSelector:
+            matchLabels: { app: demo }</code></pre>
+  <details class="q"><summary>Predict: 4 replicas over 2 workers?</summary><div class="a">
+    <p>2 + 2. With 5 replicas: 3 + 2 (skew 1 allowed). Spread constraints are the modern, flexible replacement for "anti-affinity to spread": they allow several per node, but evenly.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>3.8 Cordon, drain, uncordon: node maintenance</h2>
+  <pre data-title="Terminal 1"><code>kubectl cordon quickbite-worker                     <span class="c"># no NEW pods; running pods stay</span>
+kubectl get nodes                                   <span class="c"># Ready,SchedulingDisabled</span>
+kubectl drain quickbite-worker --ignore-daemonsets --delete-emptydir-data
+kubectl get pods -A -o wide | grep -v kube-system
+kubectl uncordon quickbite-worker</code></pre>
+  <details class="q"><summary>Predict: after drain, where is everything? Do pods move back after uncordon?</summary><div class="a">
+    <p>Every Deployment pod is evicted and recreated on worker2 (cordon adds a <code>unschedulable</code> taint). DaemonSet pods stay (<code>--ignore-daemonsets</code>). After uncordon, <b>nothing moves back</b>; only new pods use worker again. Rebalance with <code>kubectl rollout restart</code>.</p>
+    <p>Draining worker2 instead would leave <b>postgres-0 Pending</b> (disk on worker2): local disks tie stateful pods to a node. A PodDisruptionBudget (Chapter 08) makes drain wait instead of breaking an app.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>3.9 Reading Pending</h2>
+  <pre data-title="find the reason"><code>kubectl get pods -A --field-selector=status.phase=Pending
+kubectl describe pod &lt;pod&gt; -n &lt;ns&gt; | grep -A3 Events
+kubectl get events -n &lt;ns&gt; --field-selector reason=FailedScheduling</code></pre>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Message fragment</th><th>Cause → fix</th></tr></thead>
+    <tbody>
+      <tr><td><code>Insufficient cpu / memory</code></td><td>Requests too big or nodes full → lower requests / add nodes</td></tr>
+      <tr><td><code>had untolerated taint {…}</code></td><td>Taint without toleration → add toleration / remove taint</td></tr>
+      <tr><td><code>didn't match Pod's node affinity/selector</code></td><td>No node has the label → fix label or selector</td></tr>
+      <tr><td><code>didn't match pod anti-affinity rules</code></td><td>Hard anti-affinity, not enough nodes → preferred / more nodes</td></tr>
+      <tr><td><code>didn't match pod topology spread constraints</code></td><td>DoNotSchedule can't keep skew → ScheduleAnyway</td></tr>
+      <tr><td><code>volume node affinity conflict</code></td><td>Its disk is on another node → free that node</td></tr>
+      <tr><td><code>node(s) were unschedulable</code></td><td>Cordoned → uncordon</td></tr>
+      <tr><td><code>unbound immediate PersistentVolumeClaims</code></td><td>PVC can't get a disk → check StorageClass</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>3.10 Clean up</h2>
+  <pre data-title="Terminal 1"><code>kubectl delete namespace sched
+kubectl label node quickbite-worker2 disk- 2&gt;/dev/null
+kubectl get nodes                                    <span class="c"># all Ready, none SchedulingDisabled</span>
+kubectl describe nodes | grep Taints                 <span class="c"># only the control-plane taint</span></code></pre>
+
+  <h2>3.11 Review questions</h2>
+  <details class="q"><summary>1. A node shows 10% real CPU usage, yet a pod is Pending with "Insufficient cpu". How?</summary><div class="a"><p>The scheduler counts <b>requests</b>, not usage. The node's requests are already near its allocatable.</p></div></details>
+  <details class="q"><summary>2. nodeSelector vs required node affinity vs preferred node affinity?</summary><div class="a"><p>nodeSelector: exact label match, hard. Required affinity: hard with operators and OR. Preferred: soft, only adds score.</p></div></details>
+  <details class="q"><summary>3. You removed a node label used by required affinity. Are pods evicted?</summary><div class="a"><p>No. IgnoredDuringExecution: only scheduling checks it.</p></div></details>
+  <details class="q"><summary>4. Taint vs toleration vs affinity, in one line each?</summary><div class="a"><p>Taint: node repels pods. Toleration: pod may ignore a taint. Affinity: pod is attracted to nodes or pods.</p></div></details>
+  <details class="q"><summary>5. Why does draining the node with postgres-0 break it on kind?</summary><div class="a"><p>Its local-path PV is tied to that node; the replacement pod can't schedule anywhere else.</p></div></details>
+
+  <div class="pager"><a href="02-rollouts.html">← Chapter 02: Rollouts</a><a href="index.html">Roadmap →</a></div>
+
+  </article></main>
+</div>
+</body>
+</html>
