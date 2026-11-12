@@ -89,6 +89,7 @@
   <p class="t"><b>Scheduler steps</b>Filter (can't run) → score (best) → bind (sets spec.nodeName). None left → Pending.</p>
   <p class="t"><b>Requests, not usage</b>Scheduler counts requests only. Placement is once; pods move only by replacement.</p>
   <p class="t"><b>Allocatable vs allocated</b>Free = allocatable − sum of requests. Limits can be overcommitted, requests can't.</p>
+  <p class="t"><b>FailedScheduling message</b>"0/3 nodes: 1 taint, 2 Insufficient cpu" = one reason per node. Preemption = evicting lower-priority pods.</p>
   <p class="t"><b>Pending → bound</b>Pending with NODE &lt;none&gt; = unscheduled; NODE set = bound; then ContainerCreating = kubelet.</p>
 
   </article></main>

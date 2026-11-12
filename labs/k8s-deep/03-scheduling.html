@@ -91,6 +91,7 @@ kubectl describe pod -n sched $(kubectl get pod -n sched --field-selector=status
 {node-role.kubernetes.io/control-plane: }, 2 Insufficient cpu. preemption: ...</span></code></pre>
     <p>Read it as a list of reasons, one per node: 1 node rejected for its taint, 2 for CPU.</p>
   </div></details>
+  <div class="callout note"><span class="label">Seen</span><p>2 new pods Running (one per worker), 1 Pending, 1 old 50m pod kept: the rollout stalls, capacity never drops. "preemption: no victims" = no lower-<b>priority</b> pod could be evicted to make room (PriorityClass).</p></div>
   <p>Set the request back to <code>50m</code> and apply.</p>
 
   <!-- ============================================================ -->
