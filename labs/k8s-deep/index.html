@@ -71,9 +71,9 @@
     <p>Deploy service by service in dependency order. Follow <code>kubectl apply</code> through the API server, etcd, controllers, scheduler and kubelet, then follow one browser click through NodePort, kube-proxy, DNS and three services.</p>
     <span class="tag ok">ready</span><span class="tag">control plane</span><span class="tag">request path</span><span class="tag">self-healing</span></div></div>
 
-  <div class="chap todo"><div class="n">02</div><div><h3 style="margin-top:0">Workloads and releases: ship 1.1, ship a broken 1.2, roll back</h3>
+  <div class="chap"><div class="n">02</div><div><h3 style="margin-top:0"><a href="02-rollouts.html">Workloads and releases: ship 1.1, ship a broken 1.2, roll back</a></h3>
     <p>Pod → ReplicaSet → Deployment from the inside. Rolling update maths (maxSurge / maxUnavailable), watching two ReplicaSets trade pods, a rollout that never finishes, <code>rollout history / undo / pause / resume</code>, and change-cause.</p>
-    <span class="tag">next</span></div></div>
+    <span class="tag ok">ready</span><span class="tag">rollout</span><span class="tag">rollback</span></div></div>
 
   <div class="chap todo"><div class="n">03</div><div><h3 style="margin-top:0">Scheduling: predict where every pod lands</h3>
     <p>Filter → score, requests vs capacity, nodeSelector, node affinity (required / preferred), pod affinity and anti-affinity, taints and tolerations (NoSchedule / NoExecute), topology spread, cordon / drain / uncordon, Pending pods and how to read why.</p></div></div>

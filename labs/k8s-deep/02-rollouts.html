@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 02 · Rollouts · K8s Deep Dive</title>
+<link rel="stylesheet" href="../../notes-animated/assets/style.css">
+<script src="../../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../../index.html">DevOps Lab</a>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Chapter 02 · Workloads and releases</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+  <h1>Chapter 02 · Ship 1.1, ship a broken 1.2, roll back</h1>
+  <p class="lede">QuickBite wants to add a new dish without any downtime, and when a release is bad, get back to safety in seconds. You'll watch two ReplicaSets trade pods while live traffic flows, see a release that runs but never becomes Ready, and learn every rollout command.</p>
+  <div class="meta">
+    <span class="pill accent">Checkpoint at start: <code>make resume</code></span>
+    <span class="pill">Images already on Docker Hub: 1.0 · 1.1 · 1.2-broken</span>
+    <span class="pill">≈ 1.5 h</span>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>2.0 Setup: three terminals</h2>
+  <pre data-title="Terminal 1: commands"><code>cd /workspaces/Deployment/labs/quickbite
+make resume
+alias kq='kubectl -n quickbite'</code></pre>
+  <pre data-title="Terminal 2: watch the ReplicaSets"><code>kubectl -n quickbite get rs -l app.kubernetes.io/name=menu-api -w</code></pre>
+  <pre data-title="Terminal 3: live traffic, 2 requests per second"><code>kubectl run loop --rm -it --restart=Never --image=curlimages/curl -n quickbite -- \
+  sh -c 'while true; do curl -s -m 1 menu-api:8000/version; echo; sleep 0.5; done'</code></pre>
+  <p>Terminal 3 shows <code>version</code> and <code>pod</code> for every request. During a rollout you'll see 1.0 and 1.1 answer side by side. If a line is empty, a request failed: that's downtime.</p>
+
+  <!-- ============================================================ -->
+  <h2>2.1 Deployment → ReplicaSet → Pod</h2>
+  <pre data-title="who owns what"><code>Deployment menu-api            "3 pods of THIS template, updated like THIS"
+  ├── ReplicaSet menu-api-645d8c8f4b   template 1.0   replicas 3
+  └── ReplicaSet menu-api-7cc6c8f77c   template 9.9   replicas 0   ← kept for rollback
+        └── Pods menu-api-645d8c8f4b-xxxxx   label pod-template-hash=645d8c8f4b</code></pre>
+  <ul>
+    <li>The hash is a fingerprint of <code>spec.template</code>. Same template → same hash → same ReplicaSet is reused.</li>
+    <li>The Deployment never touches pods. It only changes the <b>replica counts</b> of its ReplicaSets.</li>
+    <li><b>Only a change inside <code>spec.template</code> starts a rollout.</b></li>
+  </ul>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Change</th><th>In template?</th><th>Rollout?</th></tr></thead>
+    <tbody>
+      <tr><td><code>image</code>, env, probes, resources, pod labels</td><td>Yes</td><td><b>Yes</b></td></tr>
+      <tr><td><code>kubectl rollout restart</code> (adds a <code>restartedAt</code> annotation to the template)</td><td>Yes</td><td><b>Yes</b></td></tr>
+      <tr><td><code>replicas</code> / <code>kubectl scale</code></td><td>No</td><td>No: the current RS grows or shrinks</td></tr>
+      <tr><td><code>strategy</code>, <code>minReadySeconds</code>, <code>revisionHistoryLimit</code></td><td>No</td><td>No</td></tr>
+      <tr><td>Deployment's own labels / annotations (<code>change-cause</code>)</td><td>No</td><td>No</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="test it"><code>kq get pods -l app.kubernetes.io/name=menu-api --show-labels   <span class="c"># find pod-template-hash</span>
+
+kq scale deploy/menu-api --replicas=4 ; kq get rs -l app.kubernetes.io/name=menu-api
+kq scale deploy/menu-api --replicas=3
+
+kq patch deploy/menu-api -p '{"spec":{"minReadySeconds":10}}' ; kq get rs -l app.kubernetes.io/name=menu-api
+
+kq set env deploy/menu-api LOG_LEVEL=debug ; kq get rs -l app.kubernetes.io/name=menu-api
+kq set env deploy/menu-api LOG_LEVEL-                          <span class="c"># trailing - removes it</span></code></pre>
+  <details class="q"><summary>Predict: which of the three creates a new ReplicaSet?</summary><div class="a">
+    <p><b>Only <code>set env</code>.</b> Scale changes the existing RS's count. <code>minReadySeconds</code> is outside the template. The env var is inside the template → new hash → new RS → rolling update. Removing it brings the template back to the 1.0 hash, so the <b>old RS is reused</b> (no third RS).</p>
+    <p>We keep <code>minReadySeconds: 10</code> on purpose: a new pod must stay Ready 10 s before it counts as available, which slows rollouts down so you can watch them.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>2.2 Rolling update maths</h2>
+  <pre data-title="formulas"><code>max pods at once   = replicas + maxSurge
+min available pods = replicas − maxUnavailable
+percentages: maxSurge rounds UP, maxUnavailable rounds DOWN
+both 0 → rejected (the rollout could never move)</code></pre>
+  <div class="table-wrap"><table>
+    <thead><tr><th>replicas 3 with…</th><th>Max pods</th><th>Min available</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><b>maxSurge 1, maxUnavailable 0</b> (ours)</td><td>4</td><td>3</td><td>Add 1 new, wait for Ready, remove 1 old. Safest, needs spare room</td></tr>
+      <tr><td>maxSurge 0, maxUnavailable 1</td><td>3</td><td>2</td><td>Remove 1 old first, then add. No extra room needed, capacity dips</td></tr>
+      <tr><td>maxSurge 3, maxUnavailable 0</td><td>6</td><td>3</td><td>Start all new at once (blue/green-like), then drop the old</td></tr>
+      <tr><td>default 25% / 25%</td><td>4 (0.75→1)</td><td>3 (0.75→0)</td><td>Same as ours at 3 replicas</td></tr>
+      <tr><td><code>Recreate</code></td><td>3</td><td><b>0</b></td><td>Kill all, then start all. Downtime</td></tr>
+    </tbody>
+  </table></div>
+  <details class="q"><summary>Predict: replicas 10, maxSurge 25%, maxUnavailable 25%. Max pods and min available?</summary><div class="a">
+    <p>maxSurge = 2.5 → rounds up to <b>3</b> → max 13 pods. maxUnavailable = 2.5 → rounds down to <b>2</b> → at least 8 available.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>2.3 Ship 1.1 (the good release)</h2>
+  <pre data-title="Terminal 1"><code>kq set image deploy/menu-api menu-api=kumawatsunil/quickbite-menu-api:1.1
+kq annotate deploy/menu-api kubernetes.io/change-cause="1.1: add Spicy Paneer Wrap" --overwrite
+kq rollout status deploy/menu-api</code></pre>
+  <pre data-title="Terminal 2: what you'll see (hashes differ)"><code><span class="o">NAME                  DESIRED   CURRENT   READY
+menu-api-645d8c8f4b   3         3         3      ← 1.0
+menu-api-58b7d9c6f    1         1         0      ← 1.1 created (surge +1)
+menu-api-58b7d9c6f    1         1         1      ← Ready, waits minReadySeconds 10 s
+menu-api-645d8c8f4b   2         2         2      ← one 1.0 removed
+menu-api-58b7d9c6f    2         2         1
+...
+menu-api-58b7d9c6f    3         3         3
+menu-api-645d8c8f4b   0         0         0      ← kept, empty</span></code></pre>
+  <details class="q"><summary>Predict: in Terminal 3, do you ever see an empty line? Do 1.0 and 1.1 answer at the same time?</summary><div class="a">
+    <p>No empty lines (maxUnavailable 0, readiness gates traffic). Yes, for about 30–40 s you'll see a mix of <code>"version":"1.0"</code> and <code>"version":"1.1"</code>. <b>During a rolling update, old and new versions serve users together</b>, so new code must be compatible with old code (APIs, DB schema).</p>
+  </div></details>
+  <p>Open the UI (port 8080): the menu now shows <b>Spicy Paneer Wrap (NEW in 1.1)</b>.</p>
+  <pre data-title="inspect"><code>kq rollout history deploy/menu-api
+kq rollout history deploy/menu-api --revision=&lt;N&gt;     <span class="c"># the template of one revision</span>
+kq describe deploy/menu-api | grep -A12 Events         <span class="c"># "Scaled up replica set ... to 1" etc.</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2>2.4 Ship 1.2-broken (runs, never Ready)</h2>
+  <p>Different from 9.9 in Chapter 01: this image <b>exists and starts</b>. Its <code>/ready</code> returns 503 (BROKEN=true). This is the realistic failure: bad config, a missing dependency.</p>
+  <pre data-title="Terminal 1"><code>kq set image deploy/menu-api menu-api=kumawatsunil/quickbite-menu-api:1.2-broken
+kq annotate deploy/menu-api kubernetes.io/change-cause="1.2: broken build" --overwrite
+kq rollout status deploy/menu-api --timeout=60s</code></pre>
+  <details class="q"><summary>Predict: STATUS and READY of the new pod? Does it get traffic? Does rollout status finish?</summary><div class="a">
+    <pre><code><span class="o">menu-api-58b7d9c6f-aaaaa   1/1   Running   0   ← 1.1 ×3, untouched
+menu-api-6c4f7b8d9-zzzzz   0/1   Running   0   ← 1.2: Running but NOT Ready</span></code></pre>
+    <p><code>Running 0/1</code>, no restarts (liveness <code>/health</code> passes). It's <b>not in the endpoints</b>, so Terminal 3 shows only 1.1. <code>rollout status</code> times out: <code>error: timed out waiting for the condition</code>.</p>
+  </div></details>
+  <pre data-title="diagnose"><code>kq get endpointslices -l kubernetes.io/service-name=menu-api   <span class="c"># 3 IPs only</span>
+kq describe pod -l pod-template-hash=&lt;new-hash&gt; | grep -A3 Readiness
+<span class="c"># Warning  Unhealthy  Readiness probe failed: HTTP probe failed with statuscode: 503</span>
+kq logs -l pod-template-hash=&lt;new-hash&gt;
+kq get deploy menu-api -o jsonpath='{.status.conditions[?(@.type=="Progressing")]}'; echo</code></pre>
+  <ul>
+    <li>After <code>progressDeadlineSeconds</code> (default 600 s) <code>Progressing</code> becomes <code>False / ProgressDeadlineExceeded</code>. Kubernetes still does <b>not</b> roll back.</li>
+    <li>Readiness + <code>maxUnavailable: 0</code> = a broken release can't hurt users. Without a readiness probe, the 503 pod would be "Ready" and the rollout would replace all good pods.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2>2.5 Roll back</h2>
+  <pre data-title="Terminal 1"><code>kq rollout history deploy/menu-api
+kq rollout undo deploy/menu-api                     <span class="c"># to the previous revision (1.1)</span>
+kq rollout status deploy/menu-api
+kq rollout history deploy/menu-api</code></pre>
+  <details class="q"><summary>Predict: are new 1.1 pods created? What happens to the revision numbers?</summary><div class="a">
+    <p>No new 1.1 pods: the three 1.1 pods never stopped. Undo sets the 1.1 RS back as current and scales the 1.2 RS to 0 (one pod deleted). The 1.1 revision is <b>renumbered</b> to the newest number; its old number disappears.</p>
+  </div></details>
+  <div class="callout warn"><span class="label">The undo trap</span><p>A second <code>undo</code> goes to the previous revision, which is now <b>1.2-broken</b>. In an incident, read <code>rollout history</code> and use <code>--to-revision=N</code>.</p></div>
+  <pre data-title="jump to a specific revision"><code>kq rollout history deploy/menu-api
+kq rollout undo deploy/menu-api --to-revision=&lt;the 1.0 revision&gt;
+kq rollout undo deploy/menu-api --to-revision=&lt;the 1.1 revision&gt;   <span class="c"># back to 1.1</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2>2.6 Pause and resume: batch several changes</h2>
+  <p>Each template change starts a rollout. To change image <b>and</b> resources as one release:</p>
+  <pre data-title="Terminal 1"><code>kq rollout pause deploy/menu-api
+kq set image deploy/menu-api menu-api=kumawatsunil/quickbite-menu-api:1.0
+kq set resources deploy/menu-api -c menu-api --requests=cpu=60m,memory=64Mi
+kq get rs -l app.kubernetes.io/name=menu-api        <span class="c"># nothing happened yet</span>
+kq rollout resume deploy/menu-api
+kq rollout status deploy/menu-api</code></pre>
+  <details class="q"><summary>Predict: how many new ReplicaSets after resume?</summary><div class="a">
+    <p><b>One.</b> Both changes land in a single template, one hash, one rollout, one revision. While paused, <code>rollout undo</code> is refused too.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>2.7 Recreate: see downtime</h2>
+  <pre data-title="Terminal 1"><code>kq patch deploy/menu-api -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'
+kq set image deploy/menu-api menu-api=kumawatsunil/quickbite-menu-api:1.1</code></pre>
+  <details class="q"><summary>Predict: what does Terminal 3 show?</summary><div class="a">
+    <p>Several <b>empty lines</b> (failed requests): all 1.0 pods are terminated first, the Service has 0 endpoints until 1.1 pods are Ready. Use Recreate only when old and new must never run together.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>2.8 rollout restart</h2>
+  <p>Same image, fresh pods: after a ConfigMap/Secret change (env vars are read only at start), or to clear a stuck process.</p>
+  <pre data-title="Terminal 1"><code>kq rollout restart deploy/menu-api
+kq get deploy menu-api -o jsonpath='{.spec.template.metadata.annotations}'; echo
+<span class="c"># {"kubectl.kubernetes.io/restartedAt":"2026-..."}  ← template changed → new RS → rolling</span></code></pre>
+
+  <!-- ============================================================ -->
+  <h2>2.9 Imperative vs declarative: back to the files</h2>
+  <p><code>set image</code>, <code>patch</code>, <code>scale</code> change the live cluster only. The YAML in git still says 1.0, RollingUpdate, no <code>minReadySeconds</code>.</p>
+  <pre data-title="Terminal 1"><code>kubectl diff -f k8s/base/30-menu-api.yaml        <span class="c"># what apply would change</span>
+kubectl apply -f k8s/base/30-menu-api.yaml
+kq patch deploy/menu-api -p '{"spec":{"minReadySeconds":0}}'</code></pre>
+  <details class="q"><summary>Predict: what does the apply do?</summary><div class="a">
+    <p>It brings back the file's state: image 1.0, RollingUpdate 1/0, resources from the file. That's a template change → <b>a rollout back to 1.0</b>. <code>minReadySeconds</code> isn't in the file, and apply only manages fields it wrote before, so we reset it by hand.</p>
+    <p>Real teams change the <b>YAML in git</b> and apply it (or let Argo CD do it). Live edits are for experiments and emergencies, and are overwritten by the next apply ("drift").</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>2.10 Commands</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Does</th></tr></thead>
+    <tbody>
+      <tr><td><code>kubectl set image deploy/X c=img:tag</code></td><td>Change image → rollout</td></tr>
+      <tr><td><code>kubectl set env deploy/X K=V</code> / <code>K-</code></td><td>Add / remove env → rollout</td></tr>
+      <tr><td><code>kubectl set resources deploy/X -c c --requests=...</code></td><td>Change resources → rollout</td></tr>
+      <tr><td><code>kubectl scale deploy/X --replicas=N</code></td><td>Resize, no rollout</td></tr>
+      <tr><td><code>kubectl rollout status deploy/X [--timeout=60s]</code></td><td>Wait until done (or fail)</td></tr>
+      <tr><td><code>kubectl rollout history deploy/X [--revision=N]</code></td><td>List revisions / show one</td></tr>
+      <tr><td><code>kubectl rollout undo deploy/X [--to-revision=N]</code></td><td>Roll back</td></tr>
+      <tr><td><code>kubectl rollout pause / resume deploy/X</code></td><td>Batch changes into one rollout</td></tr>
+      <tr><td><code>kubectl rollout restart deploy/X</code></td><td>New pods, same spec</td></tr>
+      <tr><td><code>kubectl get rs -l ...</code></td><td>See old vs new ReplicaSets</td></tr>
+      <tr><td><code>kubectl diff -f file</code></td><td>Live vs file</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>2.11 Review questions</h2>
+  <details class="q"><summary>1. You changed only <code>replicas</code> from 3 to 5. How many ReplicaSets now?</summary><div class="a"><p>The same number. Replicas is outside the template; the current RS just scales to 5.</p></div></details>
+  <details class="q"><summary>2. A new release crashes on start (CrashLoopBackOff). With maxSurge 1 / maxUnavailable 0, how many users are affected?</summary><div class="a"><p>None. Only one surge pod is created, it never becomes Ready, no old pod is removed.</p></div></details>
+  <details class="q"><summary>3. Why might two <code>rollout undo</code> commands in a row be dangerous?</summary><div class="a"><p>The second undo goes back to the revision you just escaped from (e.g. the broken one). Use <code>--to-revision</code>.</p></div></details>
+  <details class="q"><summary>4. You changed a ConfigMap value. Why didn't the pods pick it up, and what's the fix?</summary><div class="a"><p>Env vars are read once at container start, and a ConfigMap is outside the pod template, so no rollout happened. Run <code>kubectl rollout restart</code>.</p></div></details>
+  <details class="q"><summary>5. <code>revisionHistoryLimit: 0</code>. What breaks?</summary><div class="a"><p>Old ReplicaSets are deleted right away, so <code>rollout undo</code> has nothing to go back to.</p></div></details>
+
+  <div class="pager"><a href="01-deploy-and-trace.html">← Chapter 01: Deploy and trace</a><a href="index.html">Roadmap →</a></div>
+
+  </article></main>
+</div>
+</body>
+</html>
