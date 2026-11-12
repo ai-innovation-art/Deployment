@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request Trace · K8s Deep Dive</title>
+<link rel="stylesheet" href="../../notes-animated/assets/style.css">
+<script src="../../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../../index.html">DevOps Lab</a>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Reference · Request trace</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+  <h1>Request trace: iptables and DNS</h1>
+
+  <h2>The path of one click</h2>
+  <pre data-title="browser → menu-api"><code>browser → Codespace:8080 → [Docker port map] → node:30080
+ → iptables KUBE-NODEPORTS → KUBE-SVC(web) → 50/50 → DNAT → web pod:8080
+ → nginx proxy_pass menu-api:8000 → resolv.conf search → CoreDNS → 10.96.x.x
+ → iptables KUBE-SVC(menu-api) → 1/3 each → DNAT → menu-api pod:8000
+ → redis:6379 (cache, 30 s TTL)</code></pre>
+  <div class="callout note"><span class="label">Key idea</span><p>No Kubernetes component sits in the traffic path. kube-proxy <b>writes</b> iptables rules ahead of time, CoreDNS <b>answers</b> names, and the <b>kernel</b> forwards packets pod to pod. A Service is a set of rewrite rules on every node.</p></div>
+
+  <h2>Commands, one per hop</h2>
+  <pre data-title="prove each hop"><code><span class="c"># ① host port → node</span>
+docker ps --filter name=quickbite-control-plane --format '{{.Names}}  {{.Ports}}'
+
+<span class="c"># ② NodePort rule</span>
+docker exec quickbite-control-plane iptables-save | grep 30080
+
+<span class="c"># ③ Service → pods (load balancing)</span>
+docker exec quickbite-control-plane iptables-save | grep "quickbite/web:http"
+kubectl get endpointslices -n quickbite -l kubernetes.io/service-name=web
+
+<span class="c"># ④ DNS</span>
+kubectl exec deploy/web -n quickbite -- cat /etc/resolv.conf
+kubectl run dns --rm -it --restart=Never --image=busybox:1.36 -n quickbite -- \
+  nslookup menu-api.quickbite.svc.cluster.local
+
+<span class="c"># ⑥ cache</span>
+kubectl exec deploy/redis -n quickbite -- redis-cli TTL menu:1.0</code></pre>
+
+  <h2>iptables</h2>
+  <ul>
+    <li>The Linux kernel's packet rulebook. <code>iptables-save</code> prints all rules. Rules live <b>on each node</b> (kind: <code>docker exec &lt;node&gt;</code>; real server: <code>sudo iptables-save</code>).</li>
+    <li>kube-proxy (on every node) watches Services + EndpointSlices and rewrites the rules. Every node has the same rules, so any node can reach any pod.</li>
+    <li>Read a rule: <code>-A &lt;chain&gt;</code> append · <code>--comment "ns/svc:port"</code> which Service · <code>-j &lt;chain&gt;</code> jump.</li>
+  </ul>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Chain</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>KUBE-NODEPORTS</code></td><td>Which NodePort was hit</td></tr>
+      <tr><td><code>KUBE-EXT-&lt;hash&gt;</code></td><td>External traffic for a Service</td></tr>
+      <tr><td><code>KUBE-SVC-&lt;hash&gt;</code></td><td>The Service: picks an endpoint (same hash links the chains)</td></tr>
+      <tr><td><code>KUBE-SEP-&lt;hash&gt;</code></td><td>One per pod (Service EndPoint)</td></tr>
+      <tr><td><code>DNAT --to-destination</code></td><td>Rewrite destination to podIP:targetPort</td></tr>
+      <tr><td><code>KUBE-MARK-MASQ</code></td><td>Also rewrite the source (e.g. pod calling itself via its Service)</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="probabilities: rules are checked in order"><code>2 pods:  0.5 → rest
+3 pods:  0.333 → 0.5 → rest       = 1/3 each
+4 pods:  0.25 → 0.333 → 0.5 → rest
+rule k gets 1/(pods remaining). The last rule has no probability.</code></pre>
+
+  <h2>DNS</h2>
+  <pre data-title="/etc/resolv.conf in every pod (written by kubelet)"><code>search quickbite.svc.cluster.local svc.cluster.local cluster.local
+nameserver 10.96.0.10      <span class="c"># CoreDNS (kube-dns Service)</span>
+options ndots:5            <span class="c"># &lt; 5 dots → try the search list first</span></code></pre>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Name</th><th>Works from</th></tr></thead>
+    <tbody>
+      <tr><td><code>menu-api</code></td><td>Same namespace</td></tr>
+      <tr><td><code>menu-api.quickbite</code></td><td>Any namespace</td></tr>
+      <tr><td><code>menu-api.quickbite.svc.cluster.local</code></td><td>Anywhere (full name, no search needed)</td></tr>
+      <tr><td><code>postgres-0.postgres.quickbite.svc.cluster.local</code></td><td>One StatefulSet pod (headless)</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li>Normal Service → returns the ClusterIP (10.96.x.x). Headless → returns pod IPs (10.244.x.x).</li>
+    <li>busybox <code>nslookup</code> prints NXDOMAIN for every search suffix it tries. That's noise; read the <code>Address:</code> line. Use the full name to avoid it.</li>
+  </ul>
+
+  <h2>IP ranges</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Range</th><th>What</th></tr></thead>
+    <tbody>
+      <tr><td><code>10.96.x.x</code></td><td>Service ClusterIPs (virtual, exist only in iptables)</td></tr>
+      <tr><td><code>10.244.0.x / 1.x / 2.x</code></td><td>Pod IPs, one /24 per node (control-plane / worker2 / worker here)</td></tr>
+      <tr><td><code>10.96.0.10</code></td><td>CoreDNS</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>Redis TTL</h2>
+  <p><code>TTL key</code> → N = seconds left · <code>-1</code> = no expiry · <code>-2</code> = key doesn't exist (expired or never set).</p>
+
+  </article></main>
+</div>
+</body>
+</html>
