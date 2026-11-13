@@ -164,6 +164,7 @@ kubectl get pods -n sched -o wide</code></pre>
   <details class="q"><summary>Predict: where do the restarted pods go? What about QuickBite pods already on worker2?</summary><div class="a">
     <p>All new demo pods go to worker (worker2 filtered out). QuickBite pods already on worker2 <b>stay</b>: NoSchedule only affects new placement.</p>
   </div></details>
+  <div class="callout note"><span class="label">Seen</span><p>All 3 demo pods on worker. QuickBite pods on worker2 kept running (same names, old ages). Taint format: <code>key=value:effect</code>; remove with a trailing <code>-</code>.</p></div>
   <p>Add a toleration to <code>demo.yaml</code> and apply:</p>
   <pre data-title="demo.yaml"><code>      tolerations:
         - { key: team, operator: Equal, value: payments, effect: NoSchedule }</code></pre>

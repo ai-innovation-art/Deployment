@@ -95,6 +95,7 @@
   <p class="t"><b>Node affinity</b>required = hard filter, preferred + weight = score only. IgnoredDuringExecution: label changes don't move running pods.</p>
   <p class="t"><b>Pod anti-affinity</b>Keep away from nodes running matching pods (topologyKey = node/zone). Hard rule also counts old pods → rollout can deadlock.</p>
   <p class="t"><b>YAML error "did not find expected key"</b>Indentation wrong at that line. Check with <code>--dry-run=server</code>.</p>
+  <p class="t"><b>Taint NoSchedule</b>New pods avoid the node; pods already there stay. <code>kubectl taint node N key=value:Effect</code> (add) / <code>...Effect-</code> (remove).</p>
   <p class="t"><b>Pending → bound</b>Pending with NODE &lt;none&gt; = unscheduled; NODE set = bound; then ContainerCreating = kubelet.</p>
 
   </article></main>
