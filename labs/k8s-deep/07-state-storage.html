@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 07 · State and Storage · K8s Deep Dive</title>
+<link rel="stylesheet" href="../../notes-animated/assets/style.css">
+<script src="../../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../../index.html">DevOps Lab</a>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Chapter 07 · State and storage</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+  <h1>Chapter 07 · State: volumes, PV/PVC, StatefulSets</h1>
+  <p class="lede">Where a pod's data physically lives, when a disk is created, what happens to the data when a claim is deleted, why two database pods must never share a disk, and how to back up Postgres.</p>
+  <div class="meta">
+    <span class="pill accent">Checkpoint at start: <code>make resume</code></span>
+    <span class="pill">Scratch namespace <code>state</code></span>
+    <span class="pill">≈ 1.5 h</span>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>7.0 Setup</h2>
+  <pre data-title="Terminal 1"><code>cd /workspaces/Deployment && git pull && cd labs/quickbite
+kubectl get nodes                         <span class="c"># not all Ready → make resume</span>
+kubectl create namespace state
+mkdir -p ~/state && cd ~/state</code></pre>
+  <pre data-title="the three objects (recap)"><code>PVC           "I need 1Gi, RWO"            the app's request      (namespaced)
+PV            the actual disk               created or pre-made    (cluster-wide)
+StorageClass  how to make disks             provisioner + rules    (cluster-wide)</code></pre>
+
+  <!-- ============================================================ -->
+  <h2>7.1 The StorageClass</h2>
+  <pre data-title="Terminal 1"><code>kubectl get storageclass
+kubectl get storageclass standard -o yaml | grep -E "provisioner|reclaimPolicy|volumeBindingMode|allowVolumeExpansion|is-default"</code></pre>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Field</th><th>kind's value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>provisioner</code></td><td><code>rancher.io/local-path</code></td><td>Who creates disks (cloud: <code>ebs.csi.aws.com</code>, <code>pd.csi.storage.gke.io</code>)</td></tr>
+      <tr><td><code>reclaimPolicy</code></td><td><code>Delete</code></td><td>Delete PVC → disk and data deleted (other: <code>Retain</code>)</td></tr>
+      <tr><td><code>volumeBindingMode</code></td><td><code>WaitForFirstConsumer</code></td><td>Create the disk only when a pod using it is scheduled (other: <code>Immediate</code>)</td></tr>
+      <tr><td><code>allowVolumeExpansion</code></td><td>not set (false)</td><td>Can a PVC be grown later</td></tr>
+      <tr><td>annotation <code>is-default-class</code></td><td>true</td><td>Used when a PVC names no class</td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- ============================================================ -->
+  <h2>7.2 Dynamic provisioning: a disk appears on demand</h2>
+  <pre data-title="pvc.yaml"><code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: notes, namespace: state }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 100Mi } }</code></pre>
+  <pre data-title="writer.yaml"><code>apiVersion: v1
+kind: Pod
+metadata: { name: writer, namespace: state }
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "date &gt;&gt; /data/log.txt; sleep 3600"]
+      volumeMounts: [ { name: d, mountPath: /data } ]
+  volumes:
+    - name: d
+      persistentVolumeClaim: { claimName: notes }</code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f pvc.yaml
+kubectl get pvc,pv -n state
+kubectl describe pvc notes -n state | tail -3
+kubectl apply -f writer.yaml
+kubectl wait -n state --for=condition=Ready pod/writer
+kubectl get pvc -n state ; kubectl get pv</code></pre>
+  <details class="q"><summary>Predict: PVC status before and after the pod? When does the PV appear?</summary><div class="a">
+    <p>Before: <b>Pending</b>, event <code>waiting for first consumer to be created before binding</code>, no PV. After the pod is scheduled: the provisioner creates a PV <b>on that pod's node</b> and the PVC becomes <b>Bound</b>. WaitForFirstConsumer exists so the disk is made where the pod lands (with Immediate, a zonal cloud disk could end up in a zone the pod can't reach).</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>7.3 Where the data physically is</h2>
+  <pre data-title="Terminal 1"><code>PV=$(kubectl get pvc notes -n state -o jsonpath='{.spec.volumeName}')
+kubectl get pv $PV -o yaml | grep -A8 -E "hostPath|local:|nodeAffinity"
+NODE=$(kubectl get pod writer -n state -o jsonpath='{.spec.nodeName}')
+docker exec $NODE ls /var/local-path-provisioner/
+docker exec $NODE sh -c 'cat /var/local-path-provisioner/*notes*/log.txt'</code></pre>
+  <details class="q"><summary>Predict: what is the "disk" in kind?</summary><div class="a">
+    <p>A plain folder on the node, <code>/var/local-path-provisioner/pvc-…_state_notes/</code>, and the PV has a <b>nodeAffinity</b> for that node. That's why postgres-0 is pinned to worker2. In the cloud it's a network disk that can detach and re-attach to another node (in the same zone).</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>7.4 Reclaim policy: what deleting a PVC does</h2>
+  <pre data-title="Terminal 1: Delete (kind default)"><code>kubectl delete pod writer -n state
+kubectl get pvc,pv -n state ; kubectl get pv            <span class="c"># still there?</span>
+kubectl delete pvc notes -n state
+kubectl get pv ; docker exec $NODE ls /var/local-path-provisioner/</code></pre>
+  <details class="q"><summary>Predict: after deleting the pod? After deleting the PVC?</summary><div class="a">
+    <p>Pod deleted → PVC and PV stay, data safe. PVC deleted → with <code>reclaimPolicy: Delete</code> the PV <b>and the folder</b> are removed. The data is gone.</p>
+  </div></details>
+  <pre data-title="retain-sc.yaml: same provisioner, Retain"><code>apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: { name: keep }
+provisioner: rancher.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer</code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f retain-sc.yaml
+sed -i 's/  accessModes:/  storageClassName: keep\n  accessModes:/' pvc.yaml
+kubectl apply -f pvc.yaml -f writer.yaml
+kubectl wait -n state --for=condition=Ready pod/writer
+kubectl delete pod writer -n state ; kubectl delete pvc notes -n state
+kubectl get pv</code></pre>
+  <details class="q"><summary>Predict: PV status after deleting the PVC with Retain?</summary><div class="a">
+    <p>The PV stays, status <b>Released</b>, data still on disk. It isn't reused automatically (it still remembers its old claim in <code>spec.claimRef</code>). An admin recovers the data, or removes the claimRef to make it <code>Available</code>, or deletes the PV by hand. Production databases: Retain.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>7.5 Why a database is not a Deployment</h2>
+  <pre data-title="shared.yaml"><code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: shared, namespace: state }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 100Mi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: fakedb, namespace: state }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: fakedb } }
+  template:
+    metadata: { labels: { app: fakedb } }
+    spec:
+      containers:
+        - name: db
+          image: busybox:1.36
+          command: ["sh", "-c", "while true; do echo $(hostname) &gt;&gt; /data/owner.txt; sleep 2; done"]
+          volumeMounts: [ { name: d, mountPath: /data } ]
+      volumes:
+        - name: d
+          persistentVolumeClaim: { claimName: shared }</code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f shared.yaml
+kubectl get pods -n state -l app=fakedb -o wide
+kubectl exec -n state deploy/fakedb -- sh -c 'tail -6 /data/owner.txt'</code></pre>
+  <details class="q"><summary>Predict: where do both pods run, and what's in owner.txt?</summary><div class="a">
+    <p>Both on the <b>same node</b> (the PV's nodeAffinity), both writing <b>one file</b>: lines from two hostnames interleaved. RWO means one <b>node</b>, not one pod. Two Postgres processes on one data folder = corrupted database. On cloud disks the 2nd pod on another node would hang in <code>ContainerCreating</code> (<code>Multi-Attach error</code>).</p>
+  </div></details>
+  <pre data-title="the StatefulSet way: one disk per pod"><code>apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: realdb, namespace: state }
+spec:
+  serviceName: realdb
+  replicas: 2
+  selector: { matchLabels: { app: realdb } }
+  template:
+    metadata: { labels: { app: realdb } }
+    spec:
+      containers:
+        - name: db
+          image: busybox:1.36
+          command: ["sh", "-c", "echo $(hostname) &gt;&gt; /data/owner.txt; sleep 3600"]
+          volumeMounts: [ { name: data, mountPath: /data } ]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 100Mi } }</code></pre>
+  <pre data-title="Terminal 1: save as sts.yaml"><code>kubectl apply -f sts.yaml
+kubectl get pods,pvc -n state -l app=realdb
+for i in 0 1; do kubectl exec -n state realdb-$i -- cat /data/owner.txt; done
+kubectl scale sts realdb -n state --replicas=1 ; kubectl get pvc -n state
+kubectl scale sts realdb -n state --replicas=2
+kubectl wait -n state --for=condition=Ready pod/realdb-1
+kubectl exec -n state realdb-1 -- cat /data/owner.txt</code></pre>
+  <details class="q"><summary>Predict: after scaling to 1 and back to 2, what does realdb-1's file contain?</summary><div class="a">
+    <p>Two lines <code>realdb-1</code>: scale-down deletes the pod but <b>keeps</b> <code>data-realdb-1</code>; scale-up re-attaches the same PVC. Each replica has its own data forever (unless <code>persistentVolumeClaimRetentionPolicy</code> says Delete).</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>7.6 Back up QuickBite's Postgres</h2>
+  <pre data-title="Terminal 1"><code>kubectl exec -n quickbite postgres-0 -- pg_dump -U quickbite quickbite &gt; ~/state/quickbite.sql
+grep -c "INSERT\|COPY" ~/state/quickbite.sql ; head -20 ~/state/quickbite.sql
+<span class="c"># restore (into an empty DB): kubectl exec -i -n quickbite postgres-0 -- psql -U quickbite quickbite &lt; ~/state/quickbite.sql</span></code></pre>
+  <ul>
+    <li>A PV is not a backup: deleting the PVC, a bad migration or a corrupted disk loses everything. Back up the <b>data</b> (pg_dump, CronJob to object storage) or the <b>disk</b> (VolumeSnapshot with a CSI driver).</li>
+    <li>Production Postgres on Kubernetes usually runs through an operator (CloudNativePG): replicas, failover, scheduled backups.</li>
+  </ul>
+
+  <h2>7.7 Clean up</h2>
+  <pre data-title="Terminal 1"><code>kubectl delete namespace state
+kubectl get pv                                   <span class="c"># Retain PVs survive the namespace</span>
+kubectl delete pv $(kubectl get pv -o jsonpath='{.items[?(@.spec.storageClassName=="keep")].metadata.name}')
+kubectl delete storageclass keep</code></pre>
+
+  <h2>7.8 Review questions</h2>
+  <details class="q"><summary>1. A PVC sits in Pending with "waiting for first consumer". Problem?</summary><div class="a"><p>No. WaitForFirstConsumer: the disk is created when a pod using the PVC is scheduled.</p></div></details>
+  <details class="q"><summary>2. Delete vs Retain reclaim policy?</summary><div class="a"><p>Delete: removing the PVC removes the disk and data. Retain: the PV stays Released with the data; an admin decides.</p></div></details>
+  <details class="q"><summary>3. Does ReadWriteOnce mean only one pod can mount it?</summary><div class="a"><p>No, one node. Pods on that node can share it. ReadWriteOncePod is the one-pod mode.</p></div></details>
+  <details class="q"><summary>4. Why does a StatefulSet scale-down keep PVCs?</summary><div class="a"><p>To protect data: scaling back up re-attaches the same disk to the same pod name.</p></div></details>
+  <details class="q"><summary>5. Is a PersistentVolume a backup?</summary><div class="a"><p>No. It's the live data. Backups are separate copies (pg_dump, snapshots) stored elsewhere.</p></div></details>
+
+  <div class="pager"><a href="06-config-secrets.html">← Chapter 06: Config and secrets</a><a href="index.html">Roadmap →</a></div>
+
+  </article></main>
+</div>
+</body>
+</html>
