@@ -128,7 +128,10 @@
 
   <p class="t"><b>ExternalName</b>DNS alias (CNAME) only: no IP, no ports, no iptables. Stable local name for an outside host or another namespace.</p>
 
+  <p class="t"><b>Selectorless lesson</b>Only for fixed IPs outside the cluster. For pods, always a selector so Kubernetes keeps endpoints current.</p>
   <p class="t"><b>Service without selector</b>Real ClusterIP + iptables, endpoints written by you (EndpointSlice label kubernetes.io/service-name). For fixed outside IPs, never pods.</p>
+
+  <p class="t"><b>Session affinity</b>ClientIP: first request random, then the same pod per client IP for 3 h. Behind NAT/proxy, everyone shares one IP.</p>
 
   </article></main>
 </div>

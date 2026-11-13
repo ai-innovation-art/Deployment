@@ -90,7 +90,7 @@ kubectl exec -n net client -- sh -c 'nc -zv -w 2 legacy-db 5432'</code></pre>
     <p>It connects (<code>open</code>). After a restart it breaks: nobody updates a hand-written EndpointSlice. That's fine for an outside server with a fixed IP, never for pods.</p>
   </div></details>
 
-  <div class="callout note"><span class="label">Seen</span><p>legacy-db got a ClusterIP (10.96.44.240) and our hand-written EndpointSlice; <code>nc</code> → open. Nothing watches it: a pod IP change breaks it.</p></div>
+  <div class="callout note"><span class="label">Seen</span><p>legacy-db got a ClusterIP (10.96.44.240) and our hand-written EndpointSlice; <code>nc</code> → open. postgres-0 restarted with a new IP → <code>Operation timed out</code>.<br><b>Lesson:</b> use selectorless Services only for fixed IPs outside the cluster. For pods, always use a selector so Kubernetes keeps the endpoints current.</p></div>
 
   <!-- ============================================================ -->
   <h2>5.4 Session affinity: sticky clients</h2>
@@ -102,6 +102,8 @@ kubectl patch svc menu-api -n quickbite -p '{"spec":{"sessionAffinity":"None"}}'
   <details class="q"><summary>Predict: the pod names before and after the patch?</summary><div class="a">
     <p>Before: mixed pods. After: the <b>same pod</b> every time. kube-proxy adds an iptables <code>recent</code> rule that remembers each client IP for 3 hours (<code>timeoutSeconds: 10800</code>). Use only when an app keeps per-user state in memory; better apps keep state in Redis/DB.</p>
   </div></details>
+
+  <div class="callout note"><span class="label">Seen</span><p>Before: mixed pods. ClientIP: all 6 to one pod. Client A's first request picks a pod at random, then A sticks to it (3 h); client B picks independently. "Client" = source IP: users behind one NAT or proxy all stick to the same pod.</p></div>
 
   <!-- ============================================================ -->
   <h2>5.5 Ingress: one entry point for HTTP</h2>
