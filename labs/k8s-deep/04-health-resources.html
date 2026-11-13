@@ -179,6 +179,10 @@ done</code></pre>
   <details class="q"><summary>Predict: the oom_score_adj values?</summary><div class="a">
     <p>Guaranteed <b>-997</b>, BestEffort <b>1000</b>, Burstable in between (based on its request vs node memory). The kernel kills the process with the highest score first. The kubelet sets these numbers from the QoS class: that's how "who dies first" is actually enforced.</p>
   </div></details>
+  <pre data-title="how the class is decided (you never set it)"><code>requests = limits (CPU + memory, every container)  →  Guaranteed
+something set, but not equal                        →  Burstable
+nothing set                                         →  BestEffort
+requests/limits → class (label) → kubelet sets oom_score_adj → kernel adds real usage → kills highest</code></pre>
   <div class="callout note"><span class="label">Seen</span><p>-997 / 996 / 1000. Burstable = <code>1000 − 1000 × memory request / node memory</code> (32Mi of ~7.9Gi → 996): a bigger memory request = safer. <code>slow</code> (probes only, no resources) = BestEffort.</p></div>
   <ul>
     <li><b>Node-pressure eviction:</b> when a node runs low (e.g. <code>memory.available &lt; 100Mi</code>), the kubelet evicts pods (status <code>Evicted</code>), BestEffort first, then Burstable using the most over their request. Guaranteed last.</li>
