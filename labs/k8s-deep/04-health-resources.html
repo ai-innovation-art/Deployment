@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 04 · Health and Resources · K8s Deep Dive</title>
+<link rel="stylesheet" href="../../notes-animated/assets/style.css">
+<script src="../../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../../index.html">DevOps Lab</a>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Chapter 04 · Health and resources</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+  <h1>Chapter 04 · Health and resources: probes, QoS, OOMKill, quotas</h1>
+  <p class="lede">A slow-starting app killed by its own liveness probe, a CPU-hungry pod that gets slowed but never killed, a memory leak that gets OOMKilled, three QoS classes and who dies first, and how a namespace gets default and maximum resources.</p>
+  <div class="meta">
+    <span class="pill accent">Checkpoint at start: <code>make resume</code></span>
+    <span class="pill">Experiments in scratch namespace <code>health</code></span>
+    <span class="pill">≈ 2 h</span>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>4.0 Setup: metrics-server and a scratch namespace</h2>
+  <p><code>kubectl top</code> shows <b>real usage</b>. It needs metrics-server, which kind doesn't install. The repo has a kind-ready copy (with <code>--kubelet-insecure-tls</code>).</p>
+  <pre data-title="Terminal 1"><code>cd /workspaces/Deployment/labs/quickbite && make resume
+kubectl apply -f ../k8s-observability/01-metrics-server.yaml
+kubectl -n kube-system rollout status deploy/metrics-server
+kubectl top nodes                       <span class="c"># may take ~60 s for the first numbers</span>
+kubectl top pods -n quickbite
+kubectl create namespace health
+mkdir -p ~/health && cd ~/health</code></pre>
+  <pre data-title="Terminal 2"><code>kubectl get pods -n health -w</code></pre>
+  <details class="q"><summary>Predict: compare <code>kubectl top pods -n quickbite</code> with the requests in the YAML. Are the requests close?</summary><div class="a">
+    <p>menu-api requests 64Mi and uses ~40–50Mi; CPU usage is a few <code>m</code> against 50m requested. Requests should sit near typical usage: too high wastes nodes (scheduler counts them), too low overloads nodes.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>4.1 Startup probe: protect slow starters</h2>
+  <p>An app that needs 30 s to start, with a liveness probe that gives up after 15 s, is killed before it ever starts: a restart loop.</p>
+  <pre data-title="slow.yaml"><code>apiVersion: v1
+kind: Pod
+metadata: { name: slow, namespace: health }
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 30; nc -lk -p 8080 -e echo ok"]   <span class="c"># listens only after 30 s</span>
+      livenessProbe:
+        tcpSocket: { port: 8080 }
+        periodSeconds: 5
+        failureThreshold: 3            <span class="c"># 3 × 5 s = killed after ~15 s</span></code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f slow.yaml
+kubectl describe pod slow -n health | grep -A3 -E "Liveness|Last State" ; kubectl get events -n health --field-selector involvedObject.name=slow</code></pre>
+  <details class="q"><summary>Predict: does the app ever start?</summary><div class="a">
+    <p>Never. Liveness fails at ~15 s → container killed → restarted → same again → <code>CrashLoopBackOff</code>. Events: <code>Liveness probe failed ... connection refused</code> then <code>Container app failed liveness probe, will be restarted</code>.</p>
+  </div></details>
+  <p>Fix: add a startup probe. Liveness and readiness don't run until it passes once.</p>
+  <pre data-title="slow.yaml: add under the container"><code>      startupProbe:
+        tcpSocket: { port: 8080 }
+        periodSeconds: 5
+        failureThreshold: 12           <span class="c"># up to 60 s to start</span></code></pre>
+  <pre data-title="Terminal 1"><code>kubectl delete pod slow -n health
+kubectl apply -f slow.yaml</code></pre>
+  <details class="q"><summary>Predict: RESTARTS and READY now?</summary><div class="a">
+    <p>~30 s at <code>0/1 Running</code> with 0 restarts, then <code>1/1</code>. After startup succeeds, liveness takes over with its fast settings. Better than a big <code>initialDelaySeconds</code>: fast detection after start, plenty of time during start.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>4.2 CPU limit: throttled, never killed</h2>
+  <pre data-title="cpu.yaml"><code>apiVersion: v1
+kind: Pod
+metadata: { name: cpu-hog, namespace: health }
+spec:
+  containers:
+    - name: app
+      image: python:3.12-alpine
+      command: ["python", "-c", "while True: pass"]       <span class="c"># wants 100% of a core</span>
+      resources:
+        requests: { cpu: 100m, memory: 32Mi }
+        limits:   { cpu: 200m, memory: 64Mi }</code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f cpu.yaml
+sleep 60; kubectl top pod cpu-hog -n health</code></pre>
+  <details class="q"><summary>Predict: CPU usage shown, and is the pod restarted?</summary><div class="a">
+    <p>~200m, never more, and RESTARTS 0. CPU is <b>compressible</b>: over the limit the kernel just pauses the process (CFS throttling). The app gets slower, nothing dies.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>4.3 Memory limit: OOMKilled</h2>
+  <pre data-title="mem.yaml"><code>apiVersion: v1
+kind: Pod
+metadata: { name: mem-hog, namespace: health }
+spec:
+  containers:
+    - name: app
+      image: python:3.12-alpine
+      command: ["python", "-c", "import time; x = b'x' * (200*1024*1024); time.sleep(3600)"]
+      resources:
+        requests: { memory: 64Mi }
+        limits:   { memory: 100Mi }     <span class="c"># wants 200Mi</span></code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f mem.yaml
+kubectl get pod mem-hog -n health
+kubectl describe pod mem-hog -n health | grep -A5 "Last State"</code></pre>
+  <details class="q"><summary>Predict: STATUS, exit code, and what happens next?</summary><div class="a">
+    <pre><code><span class="o">mem-hog   0/1   OOMKilled          1   ...
+mem-hog   0/1   CrashLoopBackOff   2   ...
+    Last State:  Terminated
+      Reason:    OOMKilled
+      Exit Code: 137          ← 128 + 9 (SIGKILL)</span></code></pre>
+    <p>Memory is <b>incompressible</b>: it can't be paused, so the kernel's OOM killer kills the process the moment it crosses the limit. Restarted, killed again → CrashLoopBackOff. Fix: raise the limit or fix the leak.</p>
+  </div></details>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>CPU over limit</th><th>Memory over limit</th></tr></thead>
+    <tbody>
+      <tr><td>Resource type</td><td>Compressible</td><td>Incompressible</td></tr>
+      <tr><td>Result</td><td>Throttled (slower)</td><td><b>OOMKilled</b>, exit 137</td></tr>
+      <tr><td>Restart</td><td>No</td><td>Yes → CrashLoopBackOff</td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- ============================================================ -->
+  <h2>4.4 QoS classes: who dies first</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Class</th><th>Rule</th><th>Killed under node memory pressure</th></tr></thead>
+    <tbody>
+      <tr><td><b>Guaranteed</b></td><td>Every container: requests = limits, for CPU <b>and</b> memory</td><td>Last</td></tr>
+      <tr><td><b>Burstable</b></td><td>Some requests/limits set, not Guaranteed</td><td>Middle (by usage over request)</td></tr>
+      <tr><td><b>BestEffort</b></td><td>No requests or limits at all</td><td>First</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="qos.yaml"><code>apiVersion: v1
+kind: Pod
+metadata: { name: qos-guaranteed, namespace: health }
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+      resources:
+        requests: { cpu: 50m, memory: 32Mi }
+        limits:   { cpu: 50m, memory: 32Mi }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: qos-burstable, namespace: health }
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sleep", "3600"]
+      resources:
+        requests: { memory: 32Mi }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: qos-besteffort, namespace: health }
+spec:
+  containers:
+    - { name: app, image: busybox:1.36, command: ["sleep", "3600"] }</code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f qos.yaml
+kubectl get pods -n health -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass
+for p in qos-guaranteed qos-burstable qos-besteffort; do
+  echo -n "$p: "; kubectl exec -n health $p -- cat /proc/1/oom_score_adj
+done</code></pre>
+  <details class="q"><summary>Predict: the oom_score_adj values?</summary><div class="a">
+    <p>Guaranteed <b>-997</b>, BestEffort <b>1000</b>, Burstable in between (based on its request vs node memory). The kernel kills the process with the highest score first. The kubelet sets these numbers from the QoS class: that's how "who dies first" is actually enforced.</p>
+  </div></details>
+  <ul>
+    <li><b>Node-pressure eviction:</b> when a node runs low (e.g. <code>memory.available &lt; 100Mi</code>), the kubelet evicts pods (status <code>Evicted</code>), BestEffort first, then Burstable using the most over their request. Guaranteed last.</li>
+    <li>Critical apps (databases): Guaranteed. Most apps: Burstable with honest requests. BestEffort: only throwaway work.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2>4.5 LimitRange: defaults and maximums per namespace</h2>
+  <pre data-title="limits.yaml"><code>apiVersion: v1
+kind: LimitRange
+metadata: { name: defaults, namespace: health }
+spec:
+  limits:
+    - type: Container
+      defaultRequest: { cpu: 50m, memory: 32Mi }   <span class="c"># added when a container sets no request</span>
+      default:        { cpu: 200m, memory: 128Mi } <span class="c"># added when it sets no limit</span>
+      max:            { cpu: 500m, memory: 256Mi } <span class="c"># reject anything bigger</span></code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f limits.yaml
+kubectl run plain -n health --image=busybox:1.36 -- sleep 3600
+kubectl get pod plain -n health -o jsonpath='{.spec.containers[0].resources}'; echo
+kubectl run big -n health --image=busybox:1.36 --overrides='{"spec":{"containers":[{"name":"big","image":"busybox:1.36","command":["sleep","3600"],"resources":{"limits":{"memory":"1Gi"}}}]}}'</code></pre>
+  <details class="q"><summary>Predict: what resources does <code>plain</code> get? Is <code>big</code> created?</summary><div class="a">
+    <p><code>plain</code> gets requests 50m/32Mi and limits 200m/128Mi, filled in by the LimitRange at <b>creation</b> (admission). <code>big</code> is <b>rejected</b> by the API server: <code>maximum memory usage per Container is 256Mi, but limit is 1Gi</code>. Existing pods are never changed.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>4.6 ResourceQuota: a budget for the whole namespace</h2>
+  <pre data-title="quota.yaml"><code>apiVersion: v1
+kind: ResourceQuota
+metadata: { name: budget, namespace: health }
+spec:
+  hard:
+    pods: "8"
+    requests.cpu: "400m"
+    requests.memory: 512Mi
+    limits.memory: 1Gi</code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f quota.yaml
+kubectl describe quota budget -n health
+kubectl create deployment many -n health --image=busybox:1.36 --replicas=10 -- sleep 3600
+kubectl get deploy many -n health
+kubectl describe rs -n health -l app=many | grep -A2 -i "forbidden\|exceeded" | head -6</code></pre>
+  <details class="q"><summary>Predict: how many of the 10 pods are created, and where is the error shown?</summary><div class="a">
+    <p>Only as many as the remaining budget allows (pods count or <code>requests.cpu</code>, whichever runs out first, counting the pods already there). The rest are <b>never created</b>, so there's no Pending pod to describe: the error is on the <b>ReplicaSet</b>: <code>exceeded quota: budget, requested: requests.cpu=50m, used: ..., limited: 400m</code>.</p>
+    <p>When a quota covers requests/limits, every pod <b>must</b> set them, or it's rejected. The LimitRange defaults solve that.</p>
+  </div></details>
+  <div class="table-wrap"><table>
+    <thead><tr><th></th><th>LimitRange</th><th>ResourceQuota</th></tr></thead>
+    <tbody>
+      <tr><td>Scope</td><td>Each container / pod</td><td>Whole namespace total</td></tr>
+      <tr><td>Does</td><td>Defaults + min/max</td><td>Hard budget (cpu, memory, pod count, objects)</td></tr>
+      <tr><td>Violation</td><td>Pod rejected at create</td><td>Pod rejected; Deployment shows fewer ready</td></tr>
+    </tbody>
+  </table></div>
+
+  <!-- ============================================================ -->
+  <h2>4.7 Back to QuickBite</h2>
+  <pre data-title="right-size"><code>kubectl top pods -n quickbite
+kubectl get pods -n quickbite -o custom-columns=NAME:.metadata.name,QOS:.status.qosClass</code></pre>
+  <ul>
+    <li>All QuickBite pods are <b>Burstable</b> (requests, memory limit, no CPU limit). For production, Postgres is a candidate for Guaranteed.</li>
+    <li>Real teams set requests from observed usage (p90–p95 over days), not guesses.</li>
+  </ul>
+
+  <h2>4.8 Clean up</h2>
+  <pre data-title="Terminal 1"><code>kubectl delete namespace health
+<span class="c"># keep metrics-server: Chapter 08 (HPA) and later chapters use kubectl top</span></code></pre>
+
+  <h2>4.9 Review questions</h2>
+  <details class="q"><summary>1. Why not just use a large <code>initialDelaySeconds</code> instead of a startup probe?</summary><div class="a"><p>It delays failure detection forever after start too, and still breaks if startup ever takes longer. A startup probe allows a long start and fast liveness afterwards.</p></div></details>
+  <details class="q"><summary>2. A pod is slow but never restarts; another restarts with exit 137. Which limit is each hitting?</summary><div class="a"><p>Slow: CPU limit (throttling). Exit 137 + OOMKilled: memory limit.</p></div></details>
+  <details class="q"><summary>3. What makes a pod Guaranteed?</summary><div class="a"><p>Every container sets CPU and memory requests equal to limits.</p></div></details>
+  <details class="q"><summary>4. A Deployment shows 3/10 ready, no Pending pods. Where do you look?</summary><div class="a"><p>The ReplicaSet events: likely a ResourceQuota is exceeded, so pods were never created.</p></div></details>
+  <details class="q"><summary>5. LimitRange added today: do yesterday's pods get the defaults?</summary><div class="a"><p>No. LimitRange is applied only when a pod is created.</p></div></details>
+
+  <div class="pager"><a href="03-scheduling.html">← Chapter 03: Scheduling</a><a href="index.html">Roadmap →</a></div>
+
+  </article></main>
+</div>
+</body>
+</html>

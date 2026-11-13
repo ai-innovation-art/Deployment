@@ -263,7 +263,7 @@ kubectl describe nodes | grep Taints                 <span class="c"># only the 
   <details class="q"><summary>4. Taint vs toleration vs affinity, in one line each?</summary><div class="a"><p>Taint: node repels pods. Toleration: pod may ignore a taint. Affinity: pod is attracted to nodes or pods.</p></div></details>
   <details class="q"><summary>5. Why does draining the node with postgres-0 break it on kind?</summary><div class="a"><p>Its local-path PV is tied to that node; the replacement pod can't schedule anywhere else.</p></div></details>
 
-  <div class="pager"><a href="02-rollouts.html">← Chapter 02: Rollouts</a><a href="index.html">Roadmap →</a></div>
+  <div class="pager"><a href="02-rollouts.html">← Chapter 02: Rollouts</a><a href="04-health-resources.html">Chapter 04: Health and resources →</a></div>
 
   </article></main>
 </div>
