@@ -52,7 +52,7 @@ spec:
   containers:
     - name: app
       image: busybox:1.36
-      command: ["sh", "-c", "sleep 30; nc -lk -p 8080 -e echo ok"]   <span class="c"># listens only after 30 s</span>
+      command: ["sh", "-c", "sleep 30; httpd -f -p 8080"]   <span class="c"># listens only after 30 s</span>
       livenessProbe:
         tcpSocket: { port: 8080 }
         periodSeconds: 5
