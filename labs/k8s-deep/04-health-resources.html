@@ -253,7 +253,24 @@ kubectl get pods -n quickbite -o custom-columns=NAME:.metadata.name,QOS:.status.
   <pre data-title="Terminal 1"><code>kubectl delete namespace health
 <span class="c"># keep metrics-server: Chapter 08 (HPA) and later chapters use kubectl top</span></code></pre>
 
-  <h2>4.9 Review questions</h2>
+  <h2>4.9 What we saw</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Topic</th><th>What we saw</th></tr></thead>
+    <tbody>
+      <tr><td>metrics-server</td><td>"Metrics API not available" until the APIService existed (git pull)</td></tr>
+      <tr><td>Liveness on a slow starter</td><td>Killed at 15 s, never started, restart loop</td></tr>
+      <tr><td>Startup probe</td><td>A few "Startup probe failed", no kill, RESTARTS 0</td></tr>
+      <tr><td>Pod immutability</td><td>apply Forbidden → delete and recreate</td></tr>
+      <tr><td>CPU limit</td><td>Wanted 1000m, got 200m, never restarted</td></tr>
+      <tr><td>Memory limit</td><td>OOMKilled instantly, exit 137, CrashLoopBackOff</td></tr>
+      <tr><td>QoS</td><td>oom_score_adj −997 / 996 / 1000</td></tr>
+      <tr><td>LimitRange</td><td>No resources → defaults (Burstable); 1Gi → Forbidden</td></tr>
+      <tr><td>ResourceQuota</td><td>7 of 10 created, error on the ReplicaSet</td></tr>
+      <tr><td>QuickBite</td><td>All Burstable; usage well below requests</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>4.10 Review questions</h2>
   <details class="q"><summary>1. Why not just use a large <code>initialDelaySeconds</code> instead of a startup probe?</summary><div class="a"><p>It delays failure detection forever after start too, and still breaks if startup ever takes longer. A startup probe allows a long start and fast liveness afterwards.</p></div></details>
   <details class="q"><summary>2. A pod is slow but never restarts; another restarts with exit 137. Which limit is each hitting?</summary><div class="a"><p>Slow: CPU limit (throttling). Exit 137 + OOMKilled: memory limit.</p></div></details>
   <details class="q"><summary>3. What makes a pod Guaranteed?</summary><div class="a"><p>Every container sets CPU and memory requests equal to limits.</p></div></details>
