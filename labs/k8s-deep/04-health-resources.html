@@ -208,6 +208,8 @@ kubectl run big -n health --image=busybox:1.36 --overrides='{"spec":{"containers
     <p><code>plain</code> gets requests 50m/32Mi and limits 200m/128Mi, filled in by the LimitRange at <b>creation</b> (admission). <code>big</code> is <b>rejected</b> by the API server: <code>maximum memory usage per Container is 256Mi, but limit is 1Gi</code>. Existing pods are never changed.</p>
   </div></details>
 
+  <div class="callout note"><span class="label">Seen</span><p><code>plain</code> got 50m/32Mi requests + 200m/128Mi limits → Burstable (not BestEffort). <code>big</code>: <code>Forbidden ... maximum memory usage per Container is 256Mi</code>, rejected by the API server's admission step.</p></div>
+
   <!-- ============================================================ -->
   <h2>4.6 ResourceQuota: a budget for the whole namespace</h2>
   <pre data-title="quota.yaml"><code>apiVersion: v1

@@ -119,6 +119,8 @@
   <p class="t"><b>QoS class is derived</b>req = lim → Guaranteed · some set → Burstable · none → BestEffort. Class → oom_score_adj (from request); kernel adds real usage.</p>
   <p class="t"><b>QoS classes</b>Guaranteed (req = lim, CPU+mem) −997 · Burstable 2–999 (bigger mem request = safer) · BestEffort 1000, killed first. Value = oom_score_adj.</p>
 
+  <p class="t"><b>LimitRange</b>Per container in a namespace: defaultRequest → requests, default → limits, max/min → reject (Forbidden). Applied at creation only.</p>
+
   </article></main>
 </div>
 </body>
