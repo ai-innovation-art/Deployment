@@ -109,6 +109,9 @@
 
   <p class="t"><b>Liveness kills slow starters</b>Liveness fails before the app is up → killed → restart loop. tcpSocket probe = "port open?".</p>
 
+  <p class="t"><b>Startup probe</b>Blocks liveness/readiness until the app has started (failureThreshold × period = start budget). Better than a big initialDelaySeconds.</p>
+  <p class="t"><b>Pod spec is immutable</b>Only image, new tolerations, activeDeadlineSeconds can change. Otherwise delete and recreate (Deployments do it for you).</p>
+
   </article></main>
 </div>
 </body>

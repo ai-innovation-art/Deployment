@@ -75,6 +75,8 @@ kubectl apply -f slow.yaml</code></pre>
     <p>~30 s at <code>0/1 Running</code> with 0 restarts, then <code>1/1</code>. After startup succeeds, liveness takes over with its fast settings. Better than a big <code>initialDelaySeconds</code>: fast detection after start, plenty of time during start.</p>
   </div></details>
 
+  <div class="callout note"><span class="label">Seen</span><p>A Pod's spec <b>can't be changed in place</b> (only image, tolerations additions, activeDeadlineSeconds): apply is Forbidden → delete and recreate. Deployments avoid this by making a new pod. With the startup probe: a few <code>Startup probe failed</code> warnings, no Killing, RESTARTS 0. Events of a deleted pod with the same name stay visible (~1 h).</p></div>
+
   <!-- ============================================================ -->
   <h2>4.2 CPU limit: throttled, never killed</h2>
   <pre data-title="cpu.yaml"><code>apiVersion: v1
