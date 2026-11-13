@@ -121,6 +121,8 @@
 
   <p class="t"><b>LimitRange</b>Per container in a namespace: defaultRequest → requests, default → limits, max/min → reject (Forbidden). Applied at creation only.</p>
 
+  <p class="t"><b>ResourceQuota</b>Namespace total (pods, requests, limits). Over budget → pod never created (no Pending); error on the ReplicaSet: <code>exceeded quota</code>. Deployment shows N/10 ready.</p>
+
   </article></main>
 </div>
 </body>

@@ -230,6 +230,7 @@ kubectl describe rs -n health -l app=many | grep -A2 -i "forbidden\|exceeded" | 
     <p>Only as many as the remaining budget allows (pods count or <code>requests.cpu</code>, whichever runs out first, counting the pods already there). The rest are <b>never created</b>, so there's no Pending pod to describe: the error is on the <b>ReplicaSet</b>: <code>exceeded quota: budget, requested: requests.cpu=50m, used: ..., limited: 400m</code>.</p>
     <p>When a quota covers requests/limits, every pod <b>must</b> set them, or it's rejected. The LimitRange defaults solve that.</p>
   </div></details>
+  <div class="callout note"><span class="label">Seen</span><p>plain + 7 of 10 = 8 pods. Three limits hit at once: pods 8/8, requests.cpu 400m (8×50m), limits.memory 1Gi (8×128Mi). The error lists requested / used / limited.</p></div>
   <div class="table-wrap"><table>
     <thead><tr><th></th><th>LimitRange</th><th>ResourceQuota</th></tr></thead>
     <tbody>
