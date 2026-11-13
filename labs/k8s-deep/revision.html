@@ -107,6 +107,8 @@
   <p class="t"><b>metrics-server</b>A pod in kube-system scraping kubelets; APIService plugs it into the API server as metrics.k8s.io. Powers <code>kubectl top</code> and HPA.</p>
   <p class="t"><b>kubectl top</b>Real usage (vs requests the scheduler uses). Requests should sit near typical usage.</p>
 
+  <p class="t"><b>Liveness kills slow starters</b>Liveness fails before the app is up → killed → restart loop. tcpSocket probe = "port open?".</p>
+
   </article></main>
 </div>
 </body>

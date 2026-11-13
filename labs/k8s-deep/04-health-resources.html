@@ -63,6 +63,7 @@ kubectl describe pod slow -n health | grep -A3 -E "Liveness|Last State" ; kubect
   <details class="q"><summary>Predict: does the app ever start?</summary><div class="a">
     <p>Never. Liveness fails at ~15 s → container killed → restarted → same again → <code>CrashLoopBackOff</code>. Events: <code>Liveness probe failed ... connection refused</code> then <code>Container app failed liveness probe, will be restarted</code>.</p>
   </div></details>
+  <div class="callout note"><span class="label">Seen</span><p>Started → 15 s later <code>Liveness probe failed: connection refused</code> → <code>Killing</code> → restart ~20–30 s later: PID 1 is <code>sh</code>, which ignores SIGTERM, so the kubelet waits the grace period (30 s) then SIGKILLs.</p></div>
   <p>Fix: add a startup probe. Liveness and readiness don't run until it passes once.</p>
   <pre data-title="slow.yaml: add under the container"><code>      startupProbe:
         tcpSocket: { port: 8080 }
