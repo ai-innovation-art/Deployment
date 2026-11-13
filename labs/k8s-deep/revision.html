@@ -112,6 +112,8 @@
   <p class="t"><b>Startup probe</b>Blocks liveness/readiness until the app has started (failureThreshold × period = start budget). Better than a big initialDelaySeconds.</p>
   <p class="t"><b>Pod spec is immutable</b>Only image, new tolerations, activeDeadlineSeconds can change. Otherwise delete and recreate (Deployments do it for you).</p>
 
+  <p class="t"><b>CPU limit</b>Compressible: over the limit → throttled (slower), never killed. See nr_throttled in /sys/fs/cgroup/cpu.stat.</p>
+
   </article></main>
 </div>
 </body>

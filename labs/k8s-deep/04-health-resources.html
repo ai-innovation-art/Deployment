@@ -96,6 +96,8 @@ sleep 60; kubectl top pod cpu-hog -n health</code></pre>
     <p>~200m, never more, and RESTARTS 0. CPU is <b>compressible</b>: over the limit the kernel just pauses the process (CFS throttling). The app gets slower, nothing dies.</p>
   </div></details>
 
+  <div class="callout note"><span class="label">Seen</span><p><code>top</code>: 200–201m, RESTARTS 0. Proof of throttling: <code>kubectl exec cpu-hog -n health -- cat /sys/fs/cgroup/cpu.stat</code> → <code>nr_throttled</code> keeps rising. First <code>top</code> right after create = NotFound (no scrape yet).</p></div>
+
   <!-- ============================================================ -->
   <h2>4.3 Memory limit: OOMKilled</h2>
   <pre data-title="mem.yaml"><code>apiVersion: v1
