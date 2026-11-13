@@ -196,6 +196,14 @@ kubectl taint node quickbite-worker2 maintenance=true:NoExecute-</code></pre>
 
   <!-- ============================================================ -->
   <h2>3.8 Cordon, drain, uncordon: node maintenance</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Command</th><th>Definition</th></tr></thead>
+    <tbody>
+      <tr><td><code>cordon</code></td><td>Mark the node unschedulable: no new pods, running pods stay</td></tr>
+      <tr><td><code>drain</code></td><td>Cordon + evict every pod (except DaemonSets) so it's recreated on other nodes</td></tr>
+      <tr><td><code>uncordon</code></td><td>Allow scheduling again; nothing moves back by itself</td></tr>
+    </tbody>
+  </table></div>
   <pre data-title="Terminal 1"><code>kubectl cordon quickbite-worker                     <span class="c"># no NEW pods; running pods stay</span>
 kubectl get nodes                                   <span class="c"># Ready,SchedulingDisabled</span>
 kubectl drain quickbite-worker --ignore-daemonsets --delete-emptydir-data
@@ -233,7 +241,22 @@ kubectl label node quickbite-worker2 disk- 2&gt;/dev/null
 kubectl get nodes                                    <span class="c"># all Ready, none SchedulingDisabled</span>
 kubectl describe nodes | grep Taints                 <span class="c"># only the control-plane taint</span></code></pre>
 
-  <h2>3.11 Review questions</h2>
+  <h2>3.11 What we saw</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Topic</th><th>What we saw</th></tr></thead>
+    <tbody>
+      <tr><td>Scheduler steps</td><td>Pending + NODE &lt;none&gt; → node filled (bound) → ContainerCreating (kubelet)</td></tr>
+      <tr><td>Requests vs capacity</td><td>1500m requests: 2 Running, 1 Pending, <code>Insufficient cpu</code></td></tr>
+      <tr><td>nodeSelector</td><td>Pinned to worker2; a label no node has → Pending</td></tr>
+      <tr><td>Node affinity</td><td>Weight 80 pulled all 3 onto one node; removing the label moved nothing</td></tr>
+      <tr><td>Pod anti-affinity</td><td>Hard rule deadlocked the rollout (old pods counted); soft rule fixed it</td></tr>
+      <tr><td>Taints</td><td>NoSchedule left running pods alone; NoExecute evicted them, postgres stuck, orders down</td></tr>
+      <tr><td>Topology spread</td><td>Tainted control plane counted as an empty domain; <code>nodeTaintsPolicy: Honor</code> fixed it</td></tr>
+      <tr><td>Cordon / drain</td><td>Whole cluster on one node; uncordon moved nothing back; a re-cordon kept pods away</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>3.12 Review questions</h2>
   <details class="q"><summary>1. A node shows 10% real CPU usage, yet a pod is Pending with "Insufficient cpu". How?</summary><div class="a"><p>The scheduler counts <b>requests</b>, not usage. The node's requests are already near its allocatable.</p></div></details>
   <details class="q"><summary>2. nodeSelector vs required node affinity vs preferred node affinity?</summary><div class="a"><p>nodeSelector: exact label match, hard. Required affinity: hard with operators and OR. Preferred: soft, only adds score.</p></div></details>
   <details class="q"><summary>3. You removed a node label used by required affinity. Are pods evicted?</summary><div class="a"><p>No. IgnoredDuringExecution: only scheduling checks it.</p></div></details>
