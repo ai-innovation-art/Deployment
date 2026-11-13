@@ -37,6 +37,7 @@ kubectl top nodes                       <span class="c"># may take ~60 s for the
 kubectl top pods -n quickbite
 kubectl create namespace health
 mkdir -p ~/health && cd ~/health</code></pre>
+  <div class="callout note"><span class="label">What metrics-server is</span><p>One pod (Deployment) in <code>kube-system</code>, not a node or cluster. It scrapes every kubelet every ~15 s, keeps the numbers in memory, and the <b>APIService</b> registers it with the API server as <code>metrics.k8s.io</code>. No APIService → "Metrics API not available". Run <code>git pull</code> in the Codespace first.</p></div>
   <pre data-title="Terminal 2"><code>kubectl get pods -n health -w</code></pre>
   <details class="q"><summary>Predict: compare <code>kubectl top pods -n quickbite</code> with the requests in the YAML. Are the requests close?</summary><div class="a">
     <p>menu-api requests 64Mi and uses ~40–50Mi; CPU usage is a few <code>m</code> against 50m requested. Requests should sit near typical usage: too high wastes nodes (scheduler counts them), too low overloads nodes.</p>

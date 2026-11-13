@@ -103,6 +103,10 @@
   <p class="t"><b>Cordon / drain / uncordon</b>Cordon = no new pods (running stay, crashes restart in place). Drain = cordon + evict (not DaemonSets). Uncordon moves nothing back.</p>
   <p class="t"><b>Pending → bound</b>Pending with NODE &lt;none&gt; = unscheduled; NODE set = bound; then ContainerCreating = kubelet.</p>
 
+  <h2>Chapter 04 · Health and resources</h2>
+  <p class="t"><b>metrics-server</b>A pod in kube-system scraping kubelets; APIService plugs it into the API server as metrics.k8s.io. Powers <code>kubectl top</code> and HPA.</p>
+  <p class="t"><b>kubectl top</b>Real usage (vs requests the scheduler uses). Requests should sit near typical usage.</p>
+
   </article></main>
 </div>
 </body>
