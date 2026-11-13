@@ -149,6 +149,8 @@
   <p class="t"><b>optional: true</b>Missing key → variable not set at all; app default applies. Not optional → CreateContainerConfigError.</p>
   <p class="t"><b>Secret as files</b>tmpfs (RAM), read-only, defaultMode (256 = 0400). Every pod gets the ServiceAccount token folder.</p>
 
+  <p class="t"><b>Immutable ConfigMap/Secret</b>Edits Forbidden; change = new name (frozen-v2) + update the reference → rollout. Less kubelet watch load.</p>
+
   </article></main>
 </div>
 </body>
