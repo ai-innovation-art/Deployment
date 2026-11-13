@@ -134,6 +134,8 @@ kubectl get nodes -L disk                       <span class="c"># -L shows a lab
     <p>Mostly worker2 (preferred weight 80), but not guaranteed: spread scoring may still put one on worker. Removing the label <b>doesn't move anything</b> (IgnoredDuringExecution). Only new pods see the change.</p>
   </div></details>
 
+  <div class="callout note"><span class="label">Seen</span><p>Weight 80 beat the default spread: all 3 on worker2. Label removed → pods stayed. <code>rollout restart</code> → new pods spread normally again.</p></div>
+
   <!-- ============================================================ -->
   <h2>3.5 Pod affinity and anti-affinity: placement relative to other pods</h2>
   <p>Node affinity looks at <b>node labels</b>. Pod (anti-)affinity looks at <b>which pods are already on a node</b>.</p>
