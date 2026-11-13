@@ -151,6 +151,9 @@
 
   <p class="t"><b>Immutable ConfigMap/Secret</b>Edits Forbidden; change = new name (frozen-v2) + update the reference → rollout. Less kubelet watch load.</p>
 
+  <p class="t"><b>Hash trick</b>configMapGenerator: content → hash in name → reference changes → automatic rollout.</p>
+  <p class="t"><b>Rollback and config</b>undo restores the ConfigMap name, not its content. Versioned names + keep old ones = real config rollback.</p>
+
   </article></main>
 </div>
 </body>
