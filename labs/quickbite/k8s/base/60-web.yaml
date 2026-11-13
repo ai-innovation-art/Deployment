@@ -1,6 +1,6 @@
 # web: the only component users reach directly.
 # NodePort 30080 is mapped by kind to port 8080 of your Codespace (see kind-3node.yaml).
-# Chapter 6 replaces this with an Ingress.
+# Chapter 5 replaces this with an Ingress.
 apiVersion: v1
 kind: Service
 metadata:
