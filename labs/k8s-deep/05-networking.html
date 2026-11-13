@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ch 05 · Networking · K8s Deep Dive</title>
+<link rel="stylesheet" href="../../notes-animated/assets/style.css">
+<script src="../../notes-animated/assets/notes.js"></script>
+</head>
+<body>
+<div class="topbar">
+  <a class="brand" href="../../index.html">DevOps Lab</a>
+  <span class="crumb"><a href="index.html">K8s Deep Dive</a> · Chapter 05 · Networking</span>
+  <span class="spacer"></span>
+  <button class="btn" onclick="toggleTheme()" aria-label="Toggle theme">◐</button>
+</div>
+
+<div class="layout">
+  <nav class="toc"><h4>On this page</h4><ol></ol></nav>
+  <main><article class="content">
+
+  <h1>Chapter 05 · Networking: Services, DNS, Ingress</h1>
+  <p class="lede">Chapter 01 traced one click through iptables and DNS (<a href="01-request-trace-notes.html">request trace notes</a>). This chapter adds what that trace didn't cover: calling across namespaces, Services that point outside the cluster, sticky sessions, and replacing NodePort with an Ingress that routes by path and host.</p>
+  <div class="meta">
+    <span class="pill accent">Checkpoint at start: <code>make resume</code></span>
+    <span class="pill">Scratch namespace <code>net</code></span>
+    <span class="pill">≈ 2 h</span>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>5.0 Setup</h2>
+  <pre data-title="Terminal 1"><code>cd /workspaces/Deployment && git pull
+cd labs/quickbite && kubectl get nodes          <span class="c"># not all Ready → make resume</span>
+kubectl create namespace net
+kubectl run client -n net --image=curlimages/curl -- sleep infinity
+kubectl wait -n net --for=condition=Ready pod/client</code></pre>
+  <p>The <code>client</code> pod is a long-lived shell inside the cluster, in a <b>different namespace</b> from QuickBite.</p>
+
+  <!-- ============================================================ -->
+  <h2>5.1 Calling across namespaces</h2>
+  <pre data-title="Terminal 1"><code>kubectl exec -n net client -- curl -s -m 3 menu-api:8000/version; echo
+kubectl exec -n net client -- curl -s -m 3 menu-api.quickbite:8000/version; echo
+kubectl exec -n net client -- curl -s -m 3 menu-api.quickbite.svc.cluster.local:8000/version; echo
+kubectl exec -n net client -- cat /etc/resolv.conf</code></pre>
+  <details class="q"><summary>Predict: which of the three calls work?</summary><div class="a">
+    <p>1st fails (<code>Could not resolve host</code>): the search list starts with <code>net.svc.cluster.local</code>, so <code>menu-api</code> becomes <code>menu-api.net.svc...</code>, which doesn't exist. 2nd and 3rd work. Rule: same namespace → <code>name</code>; other namespace → <code>name.namespace</code>.</p>
+    <p>Namespaces separate <b>names</b>, not <b>traffic</b>: the call is allowed. Blocking it needs a NetworkPolicy (Chapter 09).</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>5.2 ExternalName: a DNS alias</h2>
+  <p>A Service with no pods that just answers "this name = that other name". Used to give an outside dependency (managed DB, SaaS API) a stable in-cluster name, or to alias across namespaces.</p>
+  <pre data-title="Terminal 1"><code>kubectl create service externalname menu -n net --external-name menu-api.quickbite.svc.cluster.local
+kubectl get svc menu -n net
+kubectl exec -n net client -- curl -s -m 3 menu:8000/version; echo
+kubectl exec -n net client -- nslookup menu.net.svc.cluster.local</code></pre>
+  <details class="q"><summary>Predict: does <code>menu:8000</code> work from the <code>net</code> namespace? What does nslookup return?</summary><div class="a">
+    <p>Yes. CoreDNS answers with a <b>CNAME</b> to <code>menu-api.quickbite.svc.cluster.local</code>, then that name's ClusterIP. No ClusterIP of its own, no iptables rules, no port mapping: only DNS.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>5.3 A Service without a selector</h2>
+  <p>A normal Service fills its EndpointSlice from the selector. Leave the selector out and <b>you</b> write the endpoints: useful for pointing a stable name at a fixed IP outside the cluster.</p>
+  <pre data-title="external.yaml"><code>apiVersion: v1
+kind: Service
+metadata: { name: legacy-db, namespace: net }
+spec:
+  ports: [{ port: 5432 }]                 <span class="c"># no selector</span>
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: legacy-db-1
+  namespace: net
+  labels: { kubernetes.io/service-name: legacy-db }   <span class="c"># links it to the Service</span>
+addressType: IPv4
+ports: [{ port: 5432 }]
+endpoints:
+  - addresses: ["10.244.1.21"]             <span class="c"># put the postgres-0 pod IP here</span></code></pre>
+  <pre data-title="Terminal 1"><code>kubectl get pod postgres-0 -n quickbite -o jsonpath='{.status.podIP}'; echo
+<span class="c"># edit the IP in external.yaml, then:</span>
+kubectl apply -f external.yaml
+kubectl get svc,endpointslices -n net
+kubectl exec -n net client -- sh -c 'nc -zv -w 2 legacy-db 5432'</code></pre>
+  <details class="q"><summary>Predict: does it connect? What happens when postgres-0 restarts with a new IP?</summary><div class="a">
+    <p>It connects (<code>open</code>). After a restart it breaks: nobody updates a hand-written EndpointSlice. That's fine for an outside server with a fixed IP, never for pods.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>5.4 Session affinity: sticky clients</h2>
+  <pre data-title="Terminal 1"><code>loop='for i in 1 2 3 4 5 6; do curl -s menu-api.quickbite:8000/version | cut -c1-60; echo; done'
+kubectl exec -n net client -- sh -c "$loop"
+kubectl patch svc menu-api -n quickbite -p '{"spec":{"sessionAffinity":"ClientIP"}}'
+kubectl exec -n net client -- sh -c "$loop"
+kubectl patch svc menu-api -n quickbite -p '{"spec":{"sessionAffinity":"None"}}'</code></pre>
+  <details class="q"><summary>Predict: the pod names before and after the patch?</summary><div class="a">
+    <p>Before: mixed pods. After: the <b>same pod</b> every time. kube-proxy adds an iptables <code>recent</code> rule that remembers each client IP for 3 hours (<code>timeoutSeconds: 10800</code>). Use only when an app keeps per-user state in memory; better apps keep state in Redis/DB.</p>
+  </div></details>
+
+  <!-- ============================================================ -->
+  <h2>5.5 Ingress: one entry point for HTTP</h2>
+  <pre data-title="NodePort vs Ingress"><code>NodePort:  one port per Service (30000–32767), no hostnames, no paths, no TLS
+Ingress:   one entry → routes by host and path → many Services, TLS in one place
+           Ingress (rules, a YAML object)  +  Ingress controller (a pod that applies them: nginx)</code></pre>
+  <p>An Ingress object does nothing alone: a <b>controller</b> must be installed. We use ingress-nginx and give it NodePort <b>30080</b>, the only port kind maps to your Codespace (8080). web becomes a plain ClusterIP.</p>
+  <pre data-title="Terminal 1: install the controller"><code>kubectl label node quickbite-control-plane ingress-ready=true
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/kind/deploy.yaml
+kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
+kubectl get pods,svc -n ingress-nginx -o wide</code></pre>
+  <pre data-title="Terminal 1: free 30080, give it to the controller"><code>kubectl patch svc web -n quickbite --type=json \
+  -p '[{"op":"replace","path":"/spec/type","value":"ClusterIP"},{"op":"remove","path":"/spec/ports/0/nodePort"}]'
+kubectl patch svc ingress-nginx-controller -n ingress-nginx --type=json \
+  -p '[{"op":"replace","path":"/spec/ports/0/nodePort","value":30080}]'
+kubectl get svc web -n quickbite ; kubectl get svc ingress-nginx-controller -n ingress-nginx</code></pre>
+  <pre data-title="ingress.yaml"><code>apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: quickbite, namespace: quickbite }
+spec:
+  ingressClassName: nginx                   <span class="c"># which controller handles it</span>
+  rules:
+    - http:                                 <span class="c"># any host</span>
+        paths:
+          - { path: /version, pathType: Prefix, backend: { service: { name: menu-api, port: { number: 8000 } } } }
+          - { path: /,        pathType: Prefix, backend: { service: { name: web,      port: { number: 80 } } } }
+    - host: menu.localhost                  <span class="c"># only this Host header</span>
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: menu-api, port: { number: 8000 } } } }</code></pre>
+  <pre data-title="Terminal 1"><code>kubectl apply -f ingress.yaml
+kubectl get ingress -n quickbite
+curl -s localhost:8080/ | head -5                   <span class="c"># web</span>
+curl -s localhost:8080/version; echo                <span class="c"># menu-api directly</span>
+curl -s -H 'Host: menu.localhost' localhost:8080/menu | cut -c1-80; echo</code></pre>
+  <details class="q"><summary>Predict: which Service answers each curl? Does the browser UI still work?</summary><div class="a">
+    <p><code>/</code> → web. <code>/version</code> → menu-api (longest matching prefix wins). Host <code>menu.localhost</code> → menu-api for every path. The UI still works: web serves the page and proxies <code>/api/*</code> itself.</p>
+  </div></details>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>ingressClassName</code></td><td>Which controller (nginx, traefik, cloud LB…)</td></tr>
+      <tr><td><code>host</code></td><td>Match the HTTP Host header; omitted = any</td></tr>
+      <tr><td><code>pathType</code></td><td><code>Prefix</code> (path and below) · <code>Exact</code> · <code>ImplementationSpecific</code></td></tr>
+      <tr><td><code>backend.service</code></td><td>Service name + port (ClusterIP is enough)</td></tr>
+      <tr><td><code>tls</code></td><td>Hosts + a <code>kubernetes.io/tls</code> Secret: HTTPS ends at the controller</td></tr>
+    </tbody>
+  </table></div>
+  <pre data-title="see how the controller applies it"><code>kubectl -n ingress-nginx exec deploy/ingress-nginx-controller -- cat /etc/nginx/nginx.conf | grep -A3 "location /version"
+kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=5</code></pre>
+  <ul>
+    <li>The controller watches Ingress objects and rewrites its nginx config; traffic goes controller → pod IPs directly (it reads EndpointSlices).</li>
+    <li>In the cloud the controller's Service is <code>LoadBalancer</code>: one public IP for every app. The newer <b>Gateway API</b> is Ingress's successor, with the same idea.</li>
+  </ul>
+
+  <!-- ============================================================ -->
+  <h2>5.6 Clean up and restore NodePort</h2>
+  <p>We changed <code>web</code> live (drift). <code>make resume</code> re-applies <code>k8s/base</code>, which wants NodePort 30080 back, so remove the controller first.</p>
+  <pre data-title="Terminal 1"><code>kubectl delete namespace net
+kubectl delete -f ingress.yaml
+kubectl delete -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/kind/deploy.yaml
+kubectl label node quickbite-control-plane ingress-ready-
+kubectl apply -f /workspaces/Deployment/labs/quickbite/k8s/base/60-web.yaml
+kubectl get svc web -n quickbite                 <span class="c"># NodePort 80:30080 again</span></code></pre>
+
+  <h2>5.7 Review questions</h2>
+  <details class="q"><summary>1. A pod in namespace <code>shop</code> calls <code>redis:6379</code> but Redis is in <code>cache</code>. Fix?</summary><div class="a"><p>Call <code>redis.cache:6379</code> (or the full <code>redis.cache.svc.cluster.local</code>).</p></div></details>
+  <details class="q"><summary>2. ExternalName vs a Service without a selector?</summary><div class="a"><p>ExternalName: DNS alias to a hostname, no IP, no ports. No-selector Service: a real ClusterIP and iptables rules, endpoints you maintain by hand (fixed IPs).</p></div></details>
+  <details class="q"><summary>3. Why is an Ingress object alone not enough?</summary><div class="a"><p>It's only rules. An Ingress controller (a pod) must read them and route traffic.</p></div></details>
+  <details class="q"><summary>4. Paths <code>/</code> and <code>/version</code> both match <code>/version/x</code>. Which wins?</summary><div class="a"><p>The longest matching prefix: <code>/version</code>.</p></div></details>
+  <details class="q"><summary>5. When is <code>sessionAffinity: ClientIP</code> appropriate?</summary><div class="a"><p>When an app keeps per-user state in its own memory. Better design: keep state in a shared store so any pod can serve any user.</p></div></details>
+
+  <div class="pager"><a href="04-health-resources.html">← Chapter 04: Health and resources</a><a href="index.html">Roadmap →</a></div>
+
+  </article></main>
+</div>
+</body>
+</html>

@@ -277,7 +277,7 @@ kubectl get pods -n quickbite -o custom-columns=NAME:.metadata.name,QOS:.status.
   <details class="q"><summary>4. A Deployment shows 3/10 ready, no Pending pods. Where do you look?</summary><div class="a"><p>The ReplicaSet events: likely a ResourceQuota is exceeded, so pods were never created.</p></div></details>
   <details class="q"><summary>5. LimitRange added today: do yesterday's pods get the defaults?</summary><div class="a"><p>No. LimitRange is applied only when a pod is created.</p></div></details>
 
-  <div class="pager"><a href="03-scheduling.html">← Chapter 03: Scheduling</a><a href="index.html">Roadmap →</a></div>
+  <div class="pager"><a href="03-scheduling.html">← Chapter 03: Scheduling</a><a href="05-networking.html">Chapter 05: Networking →</a></div>
 
   </article></main>
 </div>
