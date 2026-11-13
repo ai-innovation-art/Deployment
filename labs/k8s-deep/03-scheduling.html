@@ -189,6 +189,7 @@ kubectl taint node quickbite-worker2 maintenance=true:NoExecute-</code></pre>
           whenUnsatisfiable: DoNotSchedule         <span class="c"># or ScheduleAnyway (soft)</span>
           labelSelector:
             matchLabels: { app: demo }</code></pre>
+  <div class="callout note"><span class="label">Seen</span><p>Pending at 1 + 2! The tainted <b>control plane counts as a domain with 0 pods</b> (default <code>nodeTaintsPolicy: Ignore</code>), so any node reaching 2 = skew 2. Fix: <code>nodeTaintsPolicy: Honor</code>. Old pods with the same label are counted too.</p></div>
   <details class="q"><summary>Predict: 4 replicas over 2 workers?</summary><div class="a">
     <p>2 + 2. With 5 replicas: 3 + 2 (skew 1 allowed). Spread constraints are the modern, flexible replacement for "anti-affinity to spread": they allow several per node, but evenly.</p>
   </div></details>
