@@ -142,6 +142,8 @@
   <h2>Chapter 06 · Config and secrets</h2>
   <p class="t"><b>ConfigMap as files</b>Each key = a file; files are symlinks → ..data → timestamped folder, so the kubelet swaps all files at once.</p>
 
+  <p class="t"><b>ConfigMap change</b>Env vars never update (read at start). Mounted files update in ~1 min (new folder, ..data re-pointed). subPath mounts never update.</p>
+
   </article></main>
 </div>
 </body>
