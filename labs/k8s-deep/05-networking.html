@@ -122,6 +122,17 @@ kubectl get pods,svc -n ingress-nginx -o wide</code></pre>
 kubectl patch svc ingress-nginx-controller -n ingress-nginx --type=json \
   -p '[{"op":"replace","path":"/spec/ports/0/nodePort","value":30080}]'
 kubectl get svc web -n quickbite ; kubectl get svc ingress-nginx-controller -n ingress-nginx</code></pre>
+  <div class="callout note"><span class="label">What the two patches did</span><p>1. web: NodePort → ClusterIP, which frees 30080 (web is now internal only). 2. Controller: its port 80 NodePort → 30080, so browser :8080 now reaches the controller. With no rules yet it answers <b>404</b>.</p></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Ingress controller's job</th><th></th></tr></thead>
+    <tbody>
+      <tr><td>Watch</td><td>Ingress objects + EndpointSlices via the API server</td></tr>
+      <tr><td>Translate</td><td>Rules → its own nginx config, reloaded automatically</td></tr>
+      <tr><td>Route</td><td>Match Host + path → send to the backend's pod IPs directly</td></tr>
+      <tr><td>Terminate TLS</td><td>HTTPS ends here using a <code>kubernetes.io/tls</code> Secret</td></tr>
+      <tr><td>Default</td><td>No matching rule → 404 (default backend)</td></tr>
+    </tbody>
+  </table></div>
   <pre data-title="ingress.yaml"><code>apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata: { name: quickbite, namespace: quickbite }
