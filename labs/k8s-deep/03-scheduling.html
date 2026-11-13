@@ -206,6 +206,8 @@ kubectl uncordon quickbite-worker</code></pre>
     <p>Draining worker2 instead would leave <b>postgres-0 Pending</b> (disk on worker2): local disks tie stateful pods to a node. A PodDisruptionBudget (Chapter 08) makes drain wait instead of breaking an app.</p>
   </div></details>
 
+  <div class="callout note"><span class="label">Seen</span><p>Cordon only blocks <b>new placement</b>. A container crashing on a cordoned node is restarted <b>in place</b> by the kubelet; only a replaced pod goes elsewhere. Uncordon moved nothing back. Cordon = taint <code>node.kubernetes.io/unschedulable</code>, so <code>nodeTaintsPolicy: Honor</code> spread put all 5 demo pods on worker2.</p></div>
+
   <!-- ============================================================ -->
   <h2>3.9 Reading Pending</h2>
   <pre data-title="find the reason"><code>kubectl get pods -A --field-selector=status.phase=Pending

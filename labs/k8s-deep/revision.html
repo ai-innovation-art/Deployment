@@ -100,6 +100,7 @@
   <p class="t"><b>Taint NoExecute</b>Evicts running pods without a matching toleration (DaemonSets survive). Pod tied to a local disk → Pending until the node is back.</p>
   <p class="t"><b>Recovery after a taint</b>Pending pods schedule by themselves; moved pods never move back. Init container failing → Init:Error → Init:CrashLoopBackOff.</p>
   <p class="t"><b>Topology spread</b>maxSkew = max pod-count difference between domains. Tainted nodes count as empty domains unless <code>nodeTaintsPolicy: Honor</code>.</p>
+  <p class="t"><b>Cordon / drain / uncordon</b>Cordon = no new pods (running stay, crashes restart in place). Drain = cordon + evict (not DaemonSets). Uncordon moves nothing back.</p>
   <p class="t"><b>Pending → bound</b>Pending with NODE &lt;none&gt; = unscheduled; NODE set = bound; then ContainerCreating = kubelet.</p>
 
   </article></main>
