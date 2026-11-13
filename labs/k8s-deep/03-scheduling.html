@@ -149,6 +149,7 @@ kubectl get nodes -L disk                       <span class="c"># -L shows a lab
     <p>2 Running (one per worker), <b>1 Pending</b>: <code>didn't match pod anti-affinity rules</code>. Switch to <code>preferredDuringScheduling...</code> (with <code>weight</code> + <code>podAffinityTerm</code>) and all 3 run, spread as well as possible.</p>
   </div></details>
   <div class="callout note"><span class="label">Seen</span><p>Even the <b>first</b> new pod went Pending: the selector <code>app=demo</code> also matches the <b>old</b> pods, which sit on both workers. Hard anti-affinity + rolling update can deadlock. Scale to 0 and back (or use preferred).</p></div>
+  <p>Soft version (needs <code>weight</code> + a <code>podAffinityTerm</code> wrapper): the rollout continued, ending 2 + 1. Soft rules never deadlock.</p>
   <ul>
     <li><code>topologyKey</code> = what counts as "the same place": <code>kubernetes.io/hostname</code> (node), <code>topology.kubernetes.io/zone</code> (zone).</li>
     <li><code>podAffinity</code> = "put me <b>near</b> pods with label X" (e.g. notifier next to redis, less network).</li>

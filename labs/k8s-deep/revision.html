@@ -94,6 +94,7 @@
   <p class="t"><b>nodeSelector</b>Hard filter on node labels. No match → Pending ("didn't match Pod's node affinity/selector"); old pods keep running.</p>
   <p class="t"><b>Node affinity</b>required = hard filter, preferred + weight = score only. IgnoredDuringExecution: label changes don't move running pods.</p>
   <p class="t"><b>Pod anti-affinity</b>Keep away from nodes running matching pods (topologyKey = node/zone). Hard rule also counts old pods → rollout can deadlock.</p>
+  <p class="t"><b>YAML error "did not find expected key"</b>Indentation wrong at that line. Check with <code>--dry-run=server</code>.</p>
   <p class="t"><b>Pending → bound</b>Pending with NODE &lt;none&gt; = unscheduled; NODE set = bound; then ContainerCreating = kubelet.</p>
 
   </article></main>
