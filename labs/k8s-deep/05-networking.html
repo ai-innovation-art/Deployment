@@ -47,6 +47,8 @@ kubectl exec -n net client -- cat /etc/resolv.conf</code></pre>
     <p>Namespaces separate <b>names</b>, not <b>traffic</b>: the call is allowed. Blocking it needs a NetworkPolicy (Chapter 09).</p>
   </div></details>
 
+  <div class="callout note"><span class="label">Seen</span><p>curl exit code 6 = couldn't resolve host. <code>name.namespace</code> works thanks to the 2nd search entry: <code>menu-api.quickbite</code> + <code>.svc.cluster.local</code>. "Unknown stream id" = harmless kubectl exec warning.</p></div>
+
   <!-- ============================================================ -->
   <h2>5.2 ExternalName: a DNS alias</h2>
   <p>A Service with no pods that just answers "this name = that other name". Used to give an outside dependency (managed DB, SaaS API) a stable in-cluster name, or to alias across namespaces.</p>
