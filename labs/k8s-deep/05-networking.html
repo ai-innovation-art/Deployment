@@ -183,7 +183,21 @@ kubectl label node quickbite-control-plane ingress-ready-
 kubectl apply -f /workspaces/Deployment/labs/quickbite/k8s/base/60-web.yaml
 kubectl get svc web -n quickbite                 <span class="c"># NodePort 80:30080 again</span></code></pre>
 
-  <h2>5.7 Review questions</h2>
+  <h2>5.7 What we saw</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Topic</th><th>What we saw</th></tr></thead>
+    <tbody>
+      <tr><td>Cross-namespace</td><td><code>menu-api</code> exit 6 from <code>net</code>; <code>menu-api.quickbite</code> works</td></tr>
+      <tr><td>ExternalName</td><td>No IP/ports; nslookup → CNAME → menu-api's ClusterIP</td></tr>
+      <tr><td>No-selector Service</td><td>ClusterIP + our EndpointSlice worked; pod IP changed → timed out</td></tr>
+      <tr><td>Session affinity</td><td>ClientIP → same pod 6/6; None → mixed</td></tr>
+      <tr><td>Ingress controller</td><td>On control plane; took NodePort 30080; no rules → 404</td></tr>
+      <tr><td>Ingress rules</td><td><code>/</code> → web, <code>/version</code> → menu-api, Host menu.localhost → menu-api; <code>/menu</code> 404 vs 200 by host</td></tr>
+      <tr><td>Under the hood</td><td>nginx.conf: <code>server_name _</code> (any host) + <code>server_name menu.localhost</code>; logs show the pod IP chosen</td></tr>
+    </tbody>
+  </table></div>
+
+  <h2>5.8 Review questions</h2>
   <details class="q"><summary>1. A pod in namespace <code>shop</code> calls <code>redis:6379</code> but Redis is in <code>cache</code>. Fix?</summary><div class="a"><p>Call <code>redis.cache:6379</code> (or the full <code>redis.cache.svc.cluster.local</code>).</p></div></details>
   <details class="q"><summary>2. ExternalName vs a Service without a selector?</summary><div class="a"><p>ExternalName: DNS alias to a hostname, no IP, no ports. No-selector Service: a real ClusterIP and iptables rules, endpoints you maintain by hand (fixed IPs).</p></div></details>
   <details class="q"><summary>3. Why is an Ingress object alone not enough?</summary><div class="a"><p>It's only rules. An Ingress controller (a pod) must read them and route traffic.</p></div></details>
