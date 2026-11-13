@@ -146,6 +146,9 @@
 
   <p class="t"><b>Env config change</b>Patch ConfigMap → pods keep old env → <code>rollout restart</code> → new value. Restore from git afterwards.</p>
 
+  <p class="t"><b>optional: true</b>Missing key → variable not set at all; app default applies. Not optional → CreateContainerConfigError.</p>
+  <p class="t"><b>Secret as files</b>tmpfs (RAM), read-only, defaultMode (256 = 0400). Every pod gets the ServiceAccount token folder.</p>
+
   </article></main>
 </div>
 </body>
