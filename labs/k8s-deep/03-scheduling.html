@@ -179,7 +179,7 @@ kubectl taint node quickbite-worker2 maintenance=true:NoExecute-</code></pre>
     <p>Only pods that tolerate everything: DaemonSet pods (kube-proxy, kindnet). Deployment pods are evicted and recreated on worker. <b>postgres-0 is evicted too and stays Pending</b>: its disk lives on worker2 (<code>volume node affinity conflict</code>). It comes back once the taint is removed. <code>tolerationSeconds</code> lets a pod stay N seconds before eviction.</p>
   </div></details>
 
-  <div class="callout note"><span class="label">Seen</span><p>Only kindnet + kube-proxy survived. postgres-0 Pending → orders-api 0/1 (readiness) and new orders-api stuck <code>Init:0/1</code> (migration waits): one node taint became an outage for orders. Menu kept working.</p></div>
+  <div class="callout note"><span class="label">Seen</span><p>Only kindnet + kube-proxy survived. postgres-0 Pending → orders-api 0/1 (readiness) and new orders-api stuck <code>Init:0/1</code> (migration waits): one node taint became an outage for orders. Menu kept working. Taint removed → postgres-0 rescheduled on worker2 by itself; others did not move back. A failed init container shows <code>Init:Error</code> → <code>Init:CrashLoopBackOff</code>.</p></div>
 
   <!-- ============================================================ -->
   <h2>3.7 Topology spread constraints</h2>
