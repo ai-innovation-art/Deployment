@@ -60,6 +60,8 @@ kubectl exec -n net client -- nslookup menu.net.svc.cluster.local</code></pre>
     <p>Yes. CoreDNS answers with a <b>CNAME</b> to <code>menu-api.quickbite.svc.cluster.local</code>, then that name's ClusterIP. No ClusterIP of its own, no iptables rules, no port mapping: only DNS.</p>
   </div></details>
 
+  <div class="callout note"><span class="label">Seen</span><p>CLUSTER-IP <code>&lt;none&gt;</code>, PORT(S) <code>&lt;none&gt;</code>. nslookup: <code>canonical name = menu-api.quickbite...</code> → 10.96.236.213 (menu-api's ClusterIP). The alias only answers DNS; traffic uses the target Service.</p></div>
+
   <!-- ============================================================ -->
   <h2>5.3 A Service without a selector</h2>
   <p>A normal Service fills its EndpointSlice from the selector. Leave the selector out and <b>you</b> write the endpoints: useful for pointing a stable name at a fixed IP outside the cluster.</p>
