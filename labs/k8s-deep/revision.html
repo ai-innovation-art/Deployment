@@ -144,6 +144,8 @@
 
   <p class="t"><b>ConfigMap change</b>Env vars never update (read at start). Mounted files update in ~1 min (new folder, ..data re-pointed). subPath mounts never update.</p>
 
+  <p class="t"><b>Env config change</b>Patch ConfigMap → pods keep old env → <code>rollout restart</code> → new value. Restore from git afterwards.</p>
+
   </article></main>
 </div>
 </body>
