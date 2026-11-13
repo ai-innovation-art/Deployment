@@ -133,6 +133,8 @@
 
   <p class="t"><b>Session affinity</b>ClientIP: first request random, then the same pod per client IP for 3 h. Behind NAT/proxy, everyone shares one IP.</p>
 
+  <p class="t"><b>Ingress = rules + controller</b>Object alone does nothing; a controller pod (ingress-nginx) applies it. Only the controller is exposed (NodePort/LoadBalancer); apps stay ClusterIP.</p>
+
   </article></main>
 </div>
 </body>

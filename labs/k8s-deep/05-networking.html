@@ -103,7 +103,8 @@ kubectl patch svc menu-api -n quickbite -p '{"spec":{"sessionAffinity":"None"}}'
     <p>Before: mixed pods. After: the <b>same pod</b> every time. kube-proxy adds an iptables <code>recent</code> rule that remembers each client IP for 3 hours (<code>timeoutSeconds: 10800</code>). Use only when an app keeps per-user state in memory; better apps keep state in Redis/DB.</p>
   </div></details>
 
-  <div class="callout note"><span class="label">Seen</span><p>Before: mixed pods. ClientIP: all 6 to one pod. Client A's first request picks a pod at random, then A sticks to it (3 h); client B picks independently. "Client" = source IP: users behind one NAT or proxy all stick to the same pod.</p></div>
+  <div class="callout note"><span class="label">Seen</span><p>Before: mixed pods. ClientIP: all 6 to one pod. Client A's first request picks a pod at random, then A sticks to it (3 h); client B picks independently. </p></div>
+  <div class="callout warn"><span class="label">Trap</span><p>"Client" means <b>source IP</b>, not "user". If many users come through one NAT or proxy (an office network, or an Ingress controller in front), they all share one IP and all stick to the same pod, so the load is unbalanced. That's why real apps avoid in-memory sessions and keep session state in Redis, letting any pod serve any user.</p></div>
 
   <!-- ============================================================ -->
   <h2>5.5 Ingress: one entry point for HTTP</h2>
@@ -115,6 +116,7 @@ Ingress:   one entry → routes by host and path → many Services, TLS in one p
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/kind/deploy.yaml
 kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
 kubectl get pods,svc -n ingress-nginx -o wide</code></pre>
+  <div class="callout note"><span class="label">Seen</span><p>Controller on the control plane (label + toleration); its Service is NodePort with random ports (80:31560). Ingress doesn't remove NodePort: <b>one</b> NodePort (or LoadBalancer in the cloud) for the controller, every app becomes ClusterIP.</p></div>
   <pre data-title="Terminal 1: free 30080, give it to the controller"><code>kubectl patch svc web -n quickbite --type=json \
   -p '[{"op":"replace","path":"/spec/type","value":"ClusterIP"},{"op":"remove","path":"/spec/ports/0/nodePort"}]'
 kubectl patch svc ingress-nginx-controller -n ingress-nginx --type=json \
