@@ -165,6 +165,7 @@ curl -s -H 'Host: menu.localhost' localhost:8080/menu | cut -c1-80; echo</code><
       <tr><td><code>tls</code></td><td>Hosts + a <code>kubernetes.io/tls</code> Secret: HTTPS ends at the controller</td></tr>
     </tbody>
   </table></div>
+  <div class="callout note"><span class="label">Seen</span><p><code>/</code> → web HTML · <code>/version</code> → menu-api JSON (longest prefix wins) · <code>Host: menu.localhost</code> → menu-api for every path. ADDRESS empty is normal on kind (no cloud load balancer).</p></div>
   <pre data-title="see how the controller applies it"><code>kubectl -n ingress-nginx exec deploy/ingress-nginx-controller -- cat /etc/nginx/nginx.conf | grep -A3 "location /version"
 kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=5</code></pre>
   <ul>

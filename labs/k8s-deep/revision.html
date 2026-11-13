@@ -137,6 +137,8 @@
 
   <p class="t"><b>Ingress controller's job</b>Watch Ingress + EndpointSlices → write nginx config → route by host/path to pod IPs → terminate TLS. No match → 404.</p>
 
+  <p class="t"><b>Ingress routing</b>host (Host header, omitted = any) + path (Prefix/Exact; longest prefix wins) → Service:port. ingressClassName picks the controller.</p>
+
   </article></main>
 </div>
 </body>
