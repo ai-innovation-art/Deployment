@@ -122,6 +122,7 @@ mem-hog   0/1   CrashLoopBackOff   2   ...
       Exit Code: 137          ← 128 + 9 (SIGKILL)</span></code></pre>
     <p>Memory is <b>incompressible</b>: it can't be paused, so the kernel's OOM killer kills the process the moment it crosses the limit. Restarted, killed again → CrashLoopBackOff. Fix: raise the limit or fix the leak.</p>
   </div></details>
+  <div class="callout note"><span class="label">Seen</span><p>Started and Finished in the same second: killed instantly. Status alternates <code>OOMKilled</code> ⇄ <code>CrashLoopBackOff</code> while RESTARTS climbs. Exit code 137 = 128 + 9 (SIGKILL); 143 = 128 + 15 (SIGTERM, graceful).</p></div>
   <div class="table-wrap"><table>
     <thead><tr><th></th><th>CPU over limit</th><th>Memory over limit</th></tr></thead>
     <tbody>

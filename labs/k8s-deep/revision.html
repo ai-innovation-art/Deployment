@@ -114,6 +114,8 @@
 
   <p class="t"><b>CPU limit</b>Compressible: over the limit → throttled (slower), never killed. See nr_throttled in /sys/fs/cgroup/cpu.stat.</p>
 
+  <p class="t"><b>Memory limit</b>Incompressible: over the limit → OOMKilled at once, exit 137 (128+9), then CrashLoopBackOff. Fix: raise limit or fix the leak.</p>
+
   </article></main>
 </div>
 </body>
