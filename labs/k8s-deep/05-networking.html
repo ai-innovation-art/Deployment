@@ -90,6 +90,8 @@ kubectl exec -n net client -- sh -c 'nc -zv -w 2 legacy-db 5432'</code></pre>
     <p>It connects (<code>open</code>). After a restart it breaks: nobody updates a hand-written EndpointSlice. That's fine for an outside server with a fixed IP, never for pods.</p>
   </div></details>
 
+  <div class="callout note"><span class="label">Seen</span><p>legacy-db got a ClusterIP (10.96.44.240) and our hand-written EndpointSlice; <code>nc</code> → open. Nothing watches it: a pod IP change breaks it.</p></div>
+
   <!-- ============================================================ -->
   <h2>5.4 Session affinity: sticky clients</h2>
   <pre data-title="Terminal 1"><code>loop='for i in 1 2 3 4 5 6; do curl -s menu-api.quickbite:8000/version | cut -c1-60; echo; done'
